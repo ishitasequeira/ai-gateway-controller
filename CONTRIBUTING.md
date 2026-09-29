@@ -15,6 +15,7 @@ this file only covers process (PR/CI conventions), not design decisions.
   - [Pull request process](#pull-request-process)
   - [CI and checks](#ci-and-checks)
   - [Testing](#testing)
+    - [Test ownership boundaries: AIGO / AIGC / MaaS](#test-ownership-boundaries-aigo--aigc--maas)
   - [Repository layout](#repository-layout)
   - [Getting help](#getting-help)
 
@@ -96,6 +97,20 @@ New functionality should include tests. `pkg/render` is the reference for
 coverage expectations in this repo — its test suite runs against the real
 vendored `praxis-extproc` manifest, not just fixtures, so regressions in the
 vendored overlay's shape are caught here too.
+
+### Test ownership boundaries: AIGO / AIGC / MaaS
+
+AI Gateway now spans three repos: [ai-gateway-operator](https://github.com/opendatahub-io/ai-gateway-operator) (AIGO), this repo (AIGC), and [models-as-a-service](https://github.com/opendatahub-io/models-as-a-service) (MaaS). Where a test belongs depends on what it needs to observe, not which repo you happen to be changing:
+
+| Repo | Owns | What it tests | Test suite |
+|------|------|----------------|------------|
+| **AIGO** | Component setup & dependency management — deploy/status only | `AIGateway` CR reconciles to `Ready`; sibling controller Deployments become `Available`; aggregate status (`ModelsAsAServiceReady`, etc.) rolls up correctly. Never the request path. | `test/e2e/*_test.go` (Go — deploy prereqs, create CR, assert status) |
+| **AIGC** (this repo) | Deploying the Praxis-backed stack + AIGC's own control-plane logic | Its own reconciliation logic (`pkg/tenant`, `pkg/render`, `pkg/controller` for ExternalModel/ExternalProvider) via real fixtures — see [`test/kind-env/README.md`](test/kind-env/README.md) and [`test/openshift-env/README.md`](test/openshift-env/README.md). For MaaS-level/request-path behavior (subscription enforcement, auth, route matching, identity headers), this repo does **not** write new test content of its own — it fetches and re-runs **MaaS's own pytest suite** against its Praxis-backed deployment, pinned via `test/maas-e2e.lock` (see [`test/e2e/README.md`](test/e2e/README.md)). | `test/kind-env`, `test/openshift-env` + vendored `test/maas-e2e/` (MaaS pytest, fetched at a pinned commit) |
+| **MaaS** | The single source of truth for MaaS-level resource/request behavior | Subscription enforcement, auth policy, rate limiting, API-key lifecycle, and anything visible at the MaaS API/Gateway boundary — including OpenAI resource-API routing and identity-header propagation. Written once, run twice: in MaaS against IPP, and here via the vendored fetch against Praxis. | MaaS's `test/e2e/tests/*.py` (pytest) |
+
+**The upstream-first rule:** if MaaS-level behavior has a coverage gap, add the test in MaaS's `test/e2e/tests/` first (skip-gated with `pytest.mark.skipif` if genuinely Praxis-only), then bump this repo's `test/maas-e2e.lock` to pick it up. Prefer an upstream MaaS PR over a post-fetch patch in this repo — see the "Post-fetch test patches vs upstream MaaS PRs" table in [`test/e2e/README.md`](test/e2e/README.md). [`#37`](https://github.com/opendatahub-io/ai-gateway-controller/pull/37) is a worked example of the full lifecycle: a gap was fixed upstream in MaaS ([models-as-a-service#1508](https://github.com/opendatahub-io/models-as-a-service/pull/1508)); once it landed, this repo removed its own side-workarounds and re-pinned the lock.
+
+Don't add request-path Go tests (route matching, header forwarding) directly to AIGO, and don't accept a bespoke copy of MaaS-level test content here that duplicates what MaaS's pytest suite already covers or should cover.
 
 ## Repository layout
 
