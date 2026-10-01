@@ -157,10 +157,26 @@ qualification; if it does not, the behavior is recorded separately as
 canned response or synthetic MaaS service is used.
 
 This proves single-tenant MaaS authorization callback compatibility. It does
-not prove tenant-aware dispatch for multiple tenant-qualified MaaS APIs; that
-broader shared-URL behavior remains `NOT_DEMONSTRATED` and is a separate MaaS
-design issue affecting both the existing IPP path and ExtProc mode. Production
-manifests contain none of these Kind-only certificate or callback adaptations.
+not prove tenant-aware dispatch for multiple tenant-qualified MaaS APIs from
+this Kind harness alone; that broader scenario remains `NOT_DEMONSTRATED`
+*here* because Kind only provisions a single tenant.
+
+Multi-tenant callback dispatch itself — Authorino routing each tenant's
+`/internal/v1/api-keys/validate` and `/internal/v1/subscriptions/select`
+calls to that tenant's own `maas-api-{tenantID}` Service rather than the
+default tenant's or another tenant's — has been qualified separately,
+against a live OpenShift cluster running two ephemeral `AITenant`s side by
+side (`models-as-a-service` repo,
+`test/e2e/tests/test_per_tenant_ipp_isolation.py::TestPerTenantIPPRouting`).
+Real authenticated inference traffic sent through each tenant's own gateway
+confirmed the callback reached only that tenant's `maas-api`, including on a
+Praxis-capable `maas-controller` build. See
+[opendatahub-io/ai-gateway-controller#23](https://github.com/opendatahub-io/ai-gateway-controller/issues/23)
+for the evidence summary and the architecture decision: Option B
+(tenant-specific Authorino callback Services) is the implemented and
+qualified approach, for both the IPP and ExtProc/Praxis data planes.
+Production manifests contain none of these Kind-only certificate or callback
+adaptations.
 
 The Kind certificate and CA fixture can be removed when the Kind deployment
 provides the same trusted `maas-api` Service identity and CA relationship as
