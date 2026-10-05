@@ -572,7 +572,7 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace string) ([
 			return nil, fmt.Errorf("resolve ExtProc runtime credential for model %s provider %s: %w", route.Model, route.Provider, err)
 		}
 		candidate := envelope.Candidate{
-			Cluster: route.Cluster, StableID: "provider-" + route.Provider,
+			Cluster: route.Cluster, StableID: envelope.CandidateStableID(route.Model, route.Provider),
 			Kind: "inference_model", Name: route.ClientName, Fresh: true,
 		}
 		if strategy != "" {

@@ -24,8 +24,22 @@ func TestConfigureExternalModelExtProcProjectsReferencesAndTrustedHandoff(t *tes
 		}},
 	}
 	candidates := []envelope.Candidate{
-		{Cluster: "provider-provider-b", StableID: "provider-provider-b", Credential: &envelope.Credential{Strategy: "bearer_token", SecretRef: envelope.SecretRef{Name: "b-secret", Namespace: "tenant-a", Key: "api-key"}}},
-		{Cluster: "provider-provider-a", StableID: "provider-provider-a", Credential: &envelope.Credential{Strategy: "bearer_token", SecretRef: envelope.SecretRef{Name: "a-secret", Namespace: "tenant-a", Key: "api-key"}}},
+		{
+			Cluster:  "provider-provider-b",
+			StableID: envelope.CandidateStableID("model-b", "provider-b"),
+			Credential: &envelope.Credential{
+				Strategy:  "bearer_token",
+				SecretRef: envelope.SecretRef{Name: "b-secret", Namespace: "tenant-a", Key: "api-key"},
+			},
+		},
+		{
+			Cluster:  "provider-provider-a",
+			StableID: envelope.CandidateStableID("model-a", "provider-a"),
+			Credential: &envelope.Credential{
+				Strategy:  "bearer_token",
+				SecretRef: envelope.SecretRef{Name: "a-secret", Namespace: "tenant-a", Key: "api-key"},
+			},
+		},
 	}
 	if err := configureExternalModelExtProc(resources, "tenant-a", candidates); err != nil {
 		t.Fatal(err)
@@ -89,14 +103,26 @@ func TestExternalModelConfigOmitsCredentialFilterWithoutReferences(t *testing.T)
 }
 
 func TestExtprocCredentialsRejectCrossNamespaceProvider(t *testing.T) {
-	candidates := []envelope.Candidate{{StableID: "provider-provider", Credential: &envelope.Credential{Strategy: "bearer_token", SecretRef: envelope.SecretRef{Name: "secret", Namespace: "other", Key: "api-key"}}}}
+	candidates := []envelope.Candidate{{
+		StableID: envelope.CandidateStableID("model", "provider"),
+		Credential: &envelope.Credential{
+			Strategy:  "bearer_token",
+			SecretRef: envelope.SecretRef{Name: "secret", Namespace: "other", Key: "api-key"},
+		},
+	}}
 	if _, err := extprocCredentials("tenant-a", candidates); err == nil || !strings.Contains(err.Error(), "cross-namespace") {
 		t.Fatalf("expected cross-namespace rejection, got %v", err)
 	}
 }
 
 func TestExtprocCredentialsRejectsUnsupportedAuth(t *testing.T) {
-	candidates := []envelope.Candidate{{StableID: "provider-provider", Credential: &envelope.Credential{Strategy: "oauth2", SecretRef: envelope.SecretRef{Name: "secret", Namespace: "tenant-a", Key: "api-key"}}}}
+	candidates := []envelope.Candidate{{
+		StableID: envelope.CandidateStableID("model", "provider"),
+		Credential: &envelope.Credential{
+			Strategy:  "oauth2",
+			SecretRef: envelope.SecretRef{Name: "secret", Namespace: "tenant-a", Key: "api-key"},
+		},
+	}}
 	if _, err := extprocCredentials("tenant-a", candidates); err == nil || !strings.Contains(err.Error(), "unsupported ExtProc credential strategy") {
 		t.Fatalf("expected unsupported-auth rejection, got %v", err)
 	}

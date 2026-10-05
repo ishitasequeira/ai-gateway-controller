@@ -209,7 +209,7 @@ func TestModelHTTPRoutePreservesPathAndBodyRouting(t *testing.T) {
 	}
 	selectedMatches := nestedSlice(t, nestedMapAt(t, rules, 0), "matches")
 	selectedHeader := nestedMapAt(t, nestedSlice(t, nestedMapAt(t, selectedMatches, 0), "headers"), 0)
-	if nestedString(t, selectedHeader, "name") != "X-AI-Routing-Candidate" || nestedString(t, selectedHeader, "value") != "provider-openai" {
+	if nestedString(t, selectedHeader, "name") != "X-AI-Routing-Candidate" || nestedString(t, selectedHeader, "value") != envelope.CandidateStableID("model", "openai") {
 		t.Fatalf("trusted provider header = %q=%q", nestedString(t, selectedHeader, "name"), nestedString(t, selectedHeader, "value"))
 	}
 	pathMatches := nestedSlice(t, nestedMapAt(t, rules, 2), "matches")
@@ -250,19 +250,20 @@ func TestModelHTTPRouteHasOneTrustedRulePerProviderBeforeFallback(t *testing.T) 
 	if len(rules) != 6 {
 		t.Fatalf("rules = %d, want two trusted entry rules per provider plus path and body fallback", len(rules))
 	}
-	for i, provider := range []string{"provider-provider-b", "provider-provider-a"} {
+	for i, providerName := range []string{"provider-b", "provider-a"} {
+		wantStableID := envelope.CandidateStableID("model", providerName)
 		ruleIndex := i * 2
 		matches := nestedSlice(t, nestedMapAt(t, rules, ruleIndex), "matches")
 		header := nestedMapAt(t, nestedSlice(t, nestedMapAt(t, matches, 0), "headers"), 0)
 		if got := nestedString(t, header, "name"); got != selectedProviderHeader {
 			t.Fatalf("rule %d header name = %q, want %q", i, got, selectedProviderHeader)
 		}
-		if got := nestedString(t, header, "value"); got != provider {
-			t.Fatalf("rule %d header value = %q, want %q", i, got, provider)
+		if got := nestedString(t, header, "value"); got != wantStableID {
+			t.Fatalf("rule %d header value = %q, want %q", i, got, wantStableID)
 		}
 		backend := nestedMapAt(t, nestedSlice(t, nestedMapAt(t, rules, ruleIndex), "backendRefs"), 0)
-		if got := nestedString(t, backend, "name"); got != provider {
-			t.Fatalf("rule %d backend = %q, want %q", i, got, provider)
+		if got := nestedString(t, backend, "name"); got != providerServicePrefix+providerName {
+			t.Fatalf("rule %d backend = %q, want %q", i, got, providerServicePrefix+providerName)
 		}
 	}
 }
@@ -412,11 +413,69 @@ func TestCandidateIdentityUsesClientModelName(t *testing.T) {
 	if len(env.Overlay.Candidates) != 1 || env.Overlay.Candidates[0].Name != "client-visible-model" {
 		t.Fatalf("candidate identity = %#v, want client-visible-model", env.Overlay.Candidates)
 	}
+	wantStableID := envelope.CandidateStableID("external-model-name", "provider")
+	if env.Overlay.Candidates[0].StableID != wantStableID {
+		t.Fatalf("candidate StableID = %q, want %q", env.Overlay.Candidates[0].StableID, wantStableID)
+	}
 	obj := modelHTTPRoute(route, "tenant-a", "gateway", "tenant-a")
 	rules := nestedSlice(t, obj.Object, "spec", "rules")
 	path := nestedString(t, nestedMapAt(t, nestedSlice(t, nestedMapAt(t, rules, 2), "matches"), 0), "path", "value")
 	if path != "/tenant-a/client-visible-model" {
 		t.Fatalf("HTTPRoute path = %q, want client-visible-model path", path)
+	}
+}
+
+func TestTwoModelsSharedProviderProduceDistinctOverlayCandidates(t *testing.T) {
+	routeA := resolver.Route{
+		Model: "model-a", ClientName: "model-a", Namespace: "tenant-a",
+		Provider: "shared-provider", ProviderType: "openai",
+		Cluster: "provider-shared-provider", Endpoint: "api.example.com",
+		APIFormat: "openai-chat", AuthType: "apikey",
+		SecretName: "credentials", SecretKey: "api-key",
+	}
+	routeB := resolver.Route{
+		Model: "model-b", ClientName: "model-b", Namespace: "tenant-a",
+		Provider: "shared-provider", ProviderType: "openai",
+		Cluster: "provider-shared-provider", Endpoint: "api.example.com",
+		APIFormat: "openai-chat", AuthType: "apikey",
+		SecretName: "credentials", SecretKey: "api-key",
+	}
+	set := &resolver.ResolvedRouteSet{Models: []resolver.ModelRoutes{
+		{ModelRef: "tenant-a/model-a", Routes: []resolver.Route{routeA}},
+		{ModelRef: "tenant-a/model-b", Routes: []resolver.Route{routeB}},
+	}}
+	env, err := envelope.Render(set, envelope.Scope{
+		Network: "network", Gateway: "gateway", Namespace: "tenant-a", LocalSite: "local",
+	}, envelope.Revision{}, envelope.Options{KnownClusters: []string{"provider-shared-provider"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(env.Overlay.Candidates) != 2 {
+		t.Fatalf("candidates = %d, want 2", len(env.Overlay.Candidates))
+	}
+	idA := env.Overlay.Candidates[0].StableID
+	idB := env.Overlay.Candidates[1].StableID
+	if idA == idB {
+		t.Fatalf("two candidates sharing a provider have the same stable_id %q; Praxis will reject the overlay", idA)
+	}
+	if env.Overlay.Candidates[0].Cluster != env.Overlay.Candidates[1].Cluster {
+		t.Fatalf("candidates should share the same Cluster (transport); got %q and %q",
+			env.Overlay.Candidates[0].Cluster, env.Overlay.Candidates[1].Cluster)
+	}
+
+	// Verify HTTPRoute header matches use the model-scoped stable_id, not
+	// the bare provider name.
+	objA := modelHTTPRoute(routeA, "tenant-a", "gateway", "tenant-a")
+	rulesA := nestedSlice(t, objA.Object, "spec", "rules")
+	headerA := nestedMapAt(t, nestedSlice(t, nestedMapAt(t, nestedSlice(t, nestedMapAt(t, rulesA, 0), "matches"), 0), "headers"), 0)
+	if got := nestedString(t, headerA, "value"); got != idA {
+		t.Fatalf("model-a HTTPRoute header value = %q, want overlay stable_id %q", got, idA)
+	}
+	objB := modelHTTPRoute(routeB, "tenant-a", "gateway", "tenant-a")
+	rulesB := nestedSlice(t, objB.Object, "spec", "rules")
+	headerB := nestedMapAt(t, nestedSlice(t, nestedMapAt(t, nestedSlice(t, nestedMapAt(t, rulesB, 0), "matches"), 0), "headers"), 0)
+	if got := nestedString(t, headerB, "value"); got != idB {
+		t.Fatalf("model-b HTTPRoute header value = %q, want overlay stable_id %q", got, idB)
 	}
 }
 

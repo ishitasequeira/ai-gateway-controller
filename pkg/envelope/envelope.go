@@ -188,9 +188,15 @@ func Render(routes *resolver.ResolvedRouteSet, scope Scope, prev Revision, opts 
 			// Candidate names are the client-visible model identity.  This must
 			// match resolver.Route.ClientName and the HTTPRoute body/header
 			// matches; the ExternalModel object name is control-plane identity.
+			//
+			// StableID is scoped to the model-provider pair so two models
+			// sharing the same provider produce distinct overlay candidates.
+			// Praxis validates stable_id uniqueness and rejects overlays with
+			// duplicates, which would cause the second model to get 404/503.
+			// The Cluster stays shared (one transport per provider).
 			cand := Candidate{
 				Cluster:  r.Cluster,
-				StableID: "provider-" + r.Provider,
+				StableID: CandidateStableID(r.Model, r.Provider),
 				Kind:     "inference_model",
 				Name:     r.ClientName,
 				Site:     scope.LocalSite,
@@ -285,6 +291,15 @@ func StrategyFor(route resolver.Route) (string, error) {
 	default:
 		return "", fmt.Errorf("envelope: unknown auth.type %q", route.AuthType)
 	}
+}
+
+// CandidateStableID returns the canonical stable_id for a model-provider
+// pair. It is the single derivation authority: the overlay renderer, the
+// tenant ExtProc runtime preload, and the HTTPRoute header match must all
+// use this function to stay in agreement. The value is scoped to the model
+// so two models sharing the same provider produce distinct candidates.
+func CandidateStableID(model, provider string) string {
+	return model + "/provider-" + provider
 }
 
 // checkUniformWeights enforces the R1 guard for one model group.

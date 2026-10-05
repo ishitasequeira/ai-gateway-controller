@@ -409,3 +409,32 @@ func TestResolvePath_MalformedBracesPassThrough(t *testing.T) {
 		}
 	}
 }
+
+// TestResolveTwoModelsOneProvider verifies that two distinct ExternalModels
+// referencing the same ExternalProvider both resolve cleanly. The resolver
+// must not reject this topology; the envelope layer is responsible for
+// giving each candidate a unique stable_id.
+func TestResolveTwoModelsOneProvider(t *testing.T) {
+	shared := provider("ns1", "shared-prov", PhaseReady, "api.example.com", nil)
+	modelA := model("ns1", "model-a", ref("shared-prov", "gpt-4o", "/v1/chat/completions"))
+	modelB := model("ns1", "model-b", ref("shared-prov", "gpt-4o-mini", "/v1/chat/completions"))
+
+	set, err := Resolve([]*v1alpha1.ExternalModel{modelA, modelB}, []*v1alpha1.ExternalProvider{shared})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	routes := set.Routes()
+	if len(routes) != 2 {
+		t.Fatalf("routes = %d, want 2", len(routes))
+	}
+	if routes[0].Model != "model-a" || routes[1].Model != "model-b" {
+		t.Fatalf("models = [%q, %q], want [model-a, model-b]", routes[0].Model, routes[1].Model)
+	}
+	if routes[0].Cluster != routes[1].Cluster {
+		t.Fatalf("two models sharing a provider must have the same Cluster; got %q and %q",
+			routes[0].Cluster, routes[1].Cluster)
+	}
+	if routes[0].Cluster != "provider-shared-prov" {
+		t.Fatalf("cluster = %q, want provider-shared-prov", routes[0].Cluster)
+	}
+}

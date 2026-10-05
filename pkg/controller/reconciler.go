@@ -1025,10 +1025,11 @@ func modelHTTPRouteSet(routes []resolver.Route, ns, gateway, gatewayNS string) u
 			continue
 		}
 		seenProviders[candidate.Provider] = true
+		stableID := envelope.CandidateStableID(route.Model, candidate.Provider)
 		rules = append(rules, map[string]any{
 			"matches": []any{map[string]any{
 				"path":    map[string]any{"type": "PathPrefix", "value": path},
-				"headers": []any{map[string]any{"name": selectedProviderHeader, "type": "Exact", "value": "provider-" + candidate.Provider}},
+				"headers": []any{map[string]any{"name": selectedProviderHeader, "type": "Exact", "value": stableID}},
 			}},
 			"backendRefs": []any{map[string]any{"name": providerServicePrefix + candidate.Provider, "port": providerPort(candidate)}},
 			"filters":     []any{providerURLRewrite(providerEndpointForRoute(candidate)), removeInternalRoutingHeaders()},
@@ -1040,7 +1041,7 @@ func modelHTTPRouteSet(routes []resolver.Route, ns, gateway, gatewayNS string) u
 		rules = append(rules, map[string]any{
 			"matches": []any{map[string]any{"headers": []any{
 				map[string]any{"name": "X-Gateway-Model-Name", "type": "Exact", "value": route.ClientName},
-				map[string]any{"name": selectedProviderHeader, "type": "Exact", "value": "provider-" + candidate.Provider},
+				map[string]any{"name": selectedProviderHeader, "type": "Exact", "value": stableID},
 			}}},
 			"backendRefs": []any{map[string]any{"name": providerServicePrefix + candidate.Provider, "port": providerPort(candidate)}},
 			"filters":     []any{providerHostnameRewrite(providerEndpointForRoute(candidate)), removeInternalRoutingHeaders()},
