@@ -10,6 +10,8 @@ GATEWAY_TLS_SECRET="xmp-gateway-tls-$OPENSHIFT_E2E_RUN_ID"
 AITENANT="${OPENSHIFT_E2E_AITENANT_NAME:-xmp-$OPENSHIFT_E2E_RUN_ID}"
 SHARED_AITENANT=false
 AITENANT_RETAINED=false
+MTC_NAME=default-tenant
+MTC_RETAINED=false
 # A recorded original snapshot is authoritative for runs that predate the
 # persisted AITENANT_NAME field. Never enter the deletion path for the shared
 # shared MaaS AITenant when that snapshot exists.
@@ -55,6 +57,71 @@ fi
 OUT="$OPENSHIFT_E2E_EVIDENCE_ROOT/cleanup-$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$OUT"
 cleanup_failed=0
+
+# The selector is owned by MaaS's tenant config, not AITenant. A shared
+# default tenant must remain in place, so restore only the selector annotation
+# captured before this run's opt-in. Unrelated labels, annotations, and
+# handoff status belong to MaaS/controller reconciliation and are never
+# overwritten by cleanup.
+if [[ "$SHARED_AITENANT" == true ]]; then
+  mtc_original="$STATE/maastenantconfig-original.json"
+  if [[ -s "$mtc_original" ]]; then
+    mtc_selector_snapshot="$OUT/maastenantconfig-selector-original.json"
+    jq --arg selector 'maas.opendatahub.io/payload-processing-type' \
+      'if (.selector? != null) then .selector else {present:((.metadata.annotations // {}) | has($selector)),value:((.metadata.annotations // {})[$selector] // null)} end' \
+      "$mtc_original" >"$mtc_selector_snapshot"
+    "${OC[@]}" get maastenantconfig "$MTC_NAME" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -o json >"$OUT/shared-maastenantconfig-before-restore.json" 2>/dev/null || {
+      echo "refusing shared cleanup: MaasTenantConfig snapshot exists but live $MTC_NAME is missing" >&2
+      exit 1
+    }
+    jq -e --slurpfile original "$mtc_original" '.metadata.uid == $original[0].metadata.uid' "$OUT/shared-maastenantconfig-before-restore.json" >/dev/null || {
+      echo "refusing shared cleanup: MaasTenantConfig UID changed" >&2
+      exit 1
+    }
+    selector_present=$(jq -r '.present' "$mtc_selector_snapshot")
+    selector_value=$(jq -r '.value // ""' "$mtc_selector_snapshot")
+    live_selector_present=$(jq -r --arg selector 'maas.opendatahub.io/payload-processing-type' '((.metadata.annotations // {}) | has($selector))' "$OUT/shared-maastenantconfig-before-restore.json")
+    live_selector=$(jq -r '.metadata.annotations["maas.opendatahub.io/payload-processing-type"] // ""' "$OUT/shared-maastenantconfig-before-restore.json")
+    if [[ "$live_selector_present" == "$selector_present" && "$live_selector" == "$selector_value" ]]; then
+      # The previous destroy already restored the recorded selector. This is
+      # the harmless idempotent path and performs no mutation.
+      MTC_RETAINED=true
+    elif [[ "$live_selector_present" == true && "$live_selector" == praxis ]]; then
+      # Only restore a value that this run explicitly wrote. Any other live
+      # value is a concurrent decision and must not be overwritten.
+      :
+    else
+      echo "refusing shared cleanup: MaasTenantConfig selector changed since this run wrote praxis" >&2
+      exit 1
+    fi
+    if [[ "$MTC_RETAINED" != true ]]; then
+      if [[ "$selector_present" == true ]]; then
+        "${OC[@]}" annotate maastenantconfig "$MTC_NAME" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" \
+          "maas.opendatahub.io/payload-processing-type=$selector_value" --overwrite >"$OUT/shared-maastenantconfig-restore.log"
+      else
+        "${OC[@]}" annotate maastenantconfig "$MTC_NAME" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" \
+          maas.opendatahub.io/payload-processing-type- --overwrite >"$OUT/shared-maastenantconfig-restore.log"
+      fi
+      deadline=$((SECONDS + 180))
+      while (( SECONDS < deadline )); do
+        if "${OC[@]}" get maastenantconfig "$MTC_NAME" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -o json 2>/dev/null |
+          jq -e --arg selector 'maas.opendatahub.io/payload-processing-type' --slurpfile original "$mtc_selector_snapshot" '((.metadata.annotations // {}) | has($selector)) == $original[0].present and (((.metadata.annotations // {})[$selector] // null) == ($original[0].value // null))' >/dev/null; then
+          MTC_RETAINED=true
+          break
+        fi
+        sleep 3
+      done
+    fi
+    [[ "$MTC_RETAINED" == true ]] || { echo "shared MaasTenantConfig selector did not restore" >&2; exit 1; }
+    echo "shared MaaS MaasTenantConfig selector restored; object and namespace retained; unrelated metadata preserved" >"$OUT/shared-maastenantconfig-restored.txt"
+  elif "${OC[@]}" get maastenantconfig "$MTC_NAME" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -o json >"$OUT/shared-maastenantconfig-untracked.json" 2>/dev/null; then
+    if jq -e '.metadata.annotations["maas.opendatahub.io/payload-processing-type"] == "praxis"' "$OUT/shared-maastenantconfig-untracked.json" >/dev/null; then
+      echo "refusing shared cleanup: live MaasTenantConfig is selected for praxis but original metadata snapshot is missing" >&2
+      exit 1
+    fi
+    MTC_RETAINED=true
+  fi
+fi
 
 # The AITenant finalizer is serviced by the run-owned controller.  Keep the
 # controller, tenant namespace, and Gateway alive until the object disappears;

@@ -87,7 +87,7 @@ func withModelName(name string) externalModelOption {
 func withProviderModel(provider, targetModel string) externalModelOption {
 	return func(model *inferencev1alpha1.ExternalModel) {
 		model.Spec.ExternalProviderRefs = append(model.Spec.ExternalProviderRefs, inferencev1alpha1.ExternalProviderRef{
-			Ref: inferencev1alpha1.NameReference{Name: provider}, TargetModel: targetModel,
+			Ref: inferencev1alpha1.ExternalProviderReference{Name: provider}, TargetModel: targetModel,
 			APIFormat: "openai-chat", Path: "/v1/chat/completions",
 		})
 	}

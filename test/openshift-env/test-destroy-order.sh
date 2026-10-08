@@ -16,6 +16,14 @@ timeout_line=$(grep -n 'AITenant finalization timed out' "$script" | cut -d: -f1
 [[ -n "$timeout_line" ]] || { echo "finalization timeout guard is missing" >&2; exit 1; }
 grep -q 'shared MaaS AITenant metadata restored' "$script" || { echo "shared AITenant restoration path is missing" >&2; exit 1; }
 grep -q 'tenant and namespace retained' "$script" || { echo "shared AITenant namespace protection is missing" >&2; exit 1; }
+grep -q 'maastenantconfig-selector-original' "$script" || { echo "selector-only MaasTenantConfig snapshot is missing" >&2; exit 1; }
+grep -q 'maas.opendatahub.io/payload-processing-type-' "$script" || { echo "selector removal path is missing" >&2; exit 1; }
+grep -q 'selector changed since this run wrote praxis' "$script" || { echo "shared selector conflict guard is missing" >&2; exit 1; }
+grep -q 'previous destroy already restored' "$script" || { echo "shared selector idempotence guard is missing" >&2; exit 1; }
+if grep -q 'shared-maastenantconfig-restore-patch' "$script"; then
+  echo "MaasTenantConfig cleanup must not replace the full metadata map" >&2
+  exit 1
+fi
 grep -q 'shared Authorino identity changed; refusing volume restoration' "$script" || { echo "shared Authorino identity guard is missing" >&2; exit 1; }
 grep -q 'xmp-service-ca-' "$script" || { echo "run-owned Authorino CA cleanup is missing" >&2; exit 1; }
 

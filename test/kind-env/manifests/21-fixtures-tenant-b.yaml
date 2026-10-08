@@ -6,7 +6,8 @@
 # Dependencies: Requires the ai-tenants and ai-tenant-tenant-b namespaces, the
 # maas-tenant-b-gateway from 30-gateway.yaml, the tenant-B credential Secret,
 # and provider-a-tenant-b/provider-b-tenant-b from 00-backends.yaml. Its
-# AITenant is applied before the remaining resources during provisioning.
+# AITenant is applied before MaaS creates its MaasTenantConfig; run.sh then
+# applies the Praxis selector to that config before the remaining resources.
 #
 # Qualification role: Proves tenant-B model/provider discovery and routing are
 # isolated from tenant A. The credential is a dummy test value and must never
@@ -17,8 +18,6 @@ kind: AITenant
 metadata:
   name: tenant-b
   namespace: ai-tenants
-  annotations:
-    maas.opendatahub.io/payload-processing-type: praxis
 spec:
   gateway:
     name: maas-tenant-b-gateway

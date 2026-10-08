@@ -55,6 +55,7 @@ type ExternalProviderSpec struct {
 	Endpoint string `json:"endpoint"`
 
 	// Auth configures how to authenticate with the provider.
+	// Its Secret is in this ExternalProvider's namespace.
 	// +kubebuilder:validation:Required
 	Auth AuthConfig `json:"auth"`
 

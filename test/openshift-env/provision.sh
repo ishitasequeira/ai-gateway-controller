@@ -388,8 +388,6 @@ metadata:
   namespace: ai-tenants
   labels:
     external-model-praxis.opendatahub.io/run-id: $OPENSHIFT_E2E_RUN_ID
-  annotations:
-    maas.opendatahub.io/payload-processing-type: praxis
 spec:
   gateway:
     name: $OPENSHIFT_E2E_GATEWAY_NAME
@@ -420,8 +418,6 @@ metadata:
   labels:
     external-model-praxis.opendatahub.io/run-id: $OPENSHIFT_E2E_RUN_ID
     app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e
-  annotations:
-    maas.opendatahub.io/payload-processing-type: praxis
 spec:
   gateway:
     name: $OPENSHIFT_E2E_GATEWAY_NAME
@@ -457,6 +453,41 @@ attach_pull_secret_to_sa maas-system "$api_service_account"
 "${OC[@]}" wait --for=condition=Ready "aitenant/$AITENANT_NAME" -n ai-tenants --timeout=10m >/dev/null
 OPENSHIFT_E2E_TENANT_NAMESPACE=$("${OC[@]}" get aitenant "$AITENANT_NAME" -n ai-tenants -o jsonpath='{.status.tenantNamespace}')
 [[ -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" ]] || { echo "MaaS did not report a resolved tenant namespace" >&2; exit 1; }
+# MaaS creates the tenant-local MaasTenantConfig. The controller must use that
+# object as the sole payload-processing selector, so wait for the source-created
+# singleton before opting this run into Praxis. The original metadata is saved
+# for the shared default tenant; cleanup restores it rather than deleting the
+# MaaS-owned object or namespace.
+MTC_NAME=default-tenant
+MTC_NAMESPACE="$OPENSHIFT_E2E_TENANT_NAMESPACE"
+MTC_ORIGINAL="$STATE/maastenantconfig-original.json"
+MTC_DEADLINE=$((SECONDS + 300))
+while ! "${OC[@]}" get maastenantconfig "$MTC_NAME" -n "$MTC_NAMESPACE" -o json >"$OUT/maastenantconfig-before-opt-in.json" 2>/dev/null; do
+  (( SECONDS < MTC_DEADLINE )) || { echo "MaaS did not create $MTC_NAMESPACE/$MTC_NAME" >&2; exit 1; }
+  sleep 2
+done
+if [[ "$AITENANT_NAME" == models-as-a-service && ! -s "$MTC_ORIGINAL" ]]; then
+  jq --arg selector 'maas.opendatahub.io/payload-processing-type' \
+    '{metadata:{uid:.metadata.uid},selector:{present:((.metadata.annotations // {}) | has($selector)),value:((.metadata.annotations // {})[$selector] // null)}}' \
+    "$OUT/maastenantconfig-before-opt-in.json" >"$MTC_ORIGINAL"
+fi
+"${OC[@]}" annotate maastenantconfig "$MTC_NAME" -n "$MTC_NAMESPACE" \
+  maas.opendatahub.io/payload-processing-type=praxis --overwrite >"$OUT/maastenantconfig-opt-in.log"
+MTC_STATUS_DEADLINE=$((SECONDS + 300))
+MTC_STATUS=""
+while (( SECONDS < MTC_STATUS_DEADLINE )); do
+  MTC_STATUS=$("${OC[@]}" get maastenantconfig "$MTC_NAME" -n "$MTC_NAMESPACE" -o jsonpath='{.metadata.annotations.maas\.opendatahub\.io/payload-processing-status}' 2>/dev/null || true)
+  [[ "$MTC_STATUS" == cleanup-complete || "$MTC_STATUS" == steady ]] && break
+  sleep 2
+done
+if [[ "$MTC_STATUS" != cleanup-complete && "$MTC_STATUS" != steady ]]; then
+  "${OC[@]}" get maastenantconfig "$MTC_NAME" -n "$MTC_NAMESPACE" -o json >"$OUT/maastenantconfig-handoff-timeout.json" 2>&1 || true
+  echo "MaaS/Praxis handoff did not reach cleanup-complete or steady before controller claim; diagnostics: $OUT/maastenantconfig-handoff-timeout.json" >&2
+  exit 1
+fi
+"${OC[@]}" get maastenantconfig "$MTC_NAME" -n "$MTC_NAMESPACE" -o json |
+  jq '{name:.metadata.name,namespace:.metadata.namespace,uid:.metadata.uid,selector:(.metadata.annotations["maas.opendatahub.io/payload-processing-type"] // ""),status:(.metadata.annotations["maas.opendatahub.io/payload-processing-status"] // "")}' \
+  >"$OUT/maastenantconfig-after-opt-in.json"
 # The resolved shared tenant may differ from the provisional ai-tenants
 # namespace. Create its pull Secret in the actual image-consuming namespace
 # before attaching it to the tenant ServiceAccount.
@@ -676,6 +707,26 @@ apply_rendered 40-model-fixtures.yaml
 export OPENSHIFT_E2E_USER
 "$ROOT/test/openshift-env/render-manifests.sh" "$RENDER_DIR" 50-maas-fixtures.yaml.tmpl >"$OUT/render-manifests-maas.log"
 apply_rendered 50-maas-fixtures.yaml
+
+# The run-owned controller claims the Praxis handoff only after it is applied
+# and the ExternalModel fixtures exist. A fresh tenant may correctly enter the
+# early gate in cleanup-complete; serving state is not publishable until the
+# controller has completed its real handoff and MaaS reports steady.
+MTC_STEADY_DEADLINE=$((SECONDS + 300))
+MTC_STATUS=""
+while (( SECONDS < MTC_STEADY_DEADLINE )); do
+  MTC_STATUS=$("${OC[@]}" get maastenantconfig "$MTC_NAME" -n "$MTC_NAMESPACE" -o jsonpath='{.metadata.annotations.maas\.opendatahub\.io/payload-processing-status}' 2>/dev/null || true)
+  [[ "$MTC_STATUS" == steady ]] && break
+  sleep 2
+done
+if [[ "$MTC_STATUS" != steady ]]; then
+  "${OC[@]}" get maastenantconfig "$MTC_NAME" -n "$MTC_NAMESPACE" -o json >"$OUT/maastenantconfig-steady-timeout.json" 2>&1 || true
+  echo "MaaS/Praxis handoff did not reach steady after controller and ExternalModel fixtures; diagnostics: $OUT/maastenantconfig-steady-timeout.json" >&2
+  exit 1
+fi
+"${OC[@]}" get maastenantconfig "$MTC_NAME" -n "$MTC_NAMESPACE" -o json |
+  jq '{name:.metadata.name,namespace:.metadata.namespace,uid:.metadata.uid,selector:(.metadata.annotations["maas.opendatahub.io/payload-processing-type"] // ""),status:(.metadata.annotations["maas.opendatahub.io/payload-processing-status"] // "")}' \
+  >"$OUT/maastenantconfig-after-controller-fixtures.json"
 
 # MaaS creates the gateway AuthPolicy from its fixture.  Do not finish
 # provisioning until Kuadrant has both accepted and enforced that generated

@@ -113,7 +113,7 @@ vendored overlay's shape are caught here too.
 |---|---|
 | `cmd/manager/` | Flags, manager bootstrap, registers `pkg/tenant.Reconciler` |
 | `pkg/render/` | Kustomize build, placeholder post-render, SSA apply (tenant-agnostic primitives) |
-| `pkg/tenant/` | Primarily watches `MaasTenantConfig` (mirroring maas-controller's own `TenantReconciler`); per opted-in (`maas.opendatahub.io/payload-processing-type: praxis` annotation) tenant, renames/patches and applies its own copy of the rendered resources, and cleans them up again via `PraxisCleanupFinalizer` (on `MaasTenantConfig`) on switch-away/deletion. Also Gets the tenant's owning `AITenant` for `status.gatewayRef`/`status.phase`. |
+| `pkg/tenant/` | Primarily watches `MaasTenantConfig` (mirroring maas-controller's own `TenantReconciler`); per config whose `maas.opendatahub.io/payload-processing-type` is absent or `praxis`, renames/patches and applies its own copy of the rendered resources, and cleans them up again via `PraxisCleanupFinalizer` (on `MaasTenantConfig`) on switch-away/deletion. Explicit `ipp` leaves payload processing to MaaS. It also Gets the owning `AITenant` for `status.gatewayRef`/`status.phase`. |
 | `config/self/` | This repo's own deploy manifest (SA/ClusterRole/ClusterRoleBinding/Deployment), vendored by `ai-gateway-operator` |
 | `config/manifests/praxis-extproc/` | Exact pinned `praxis-extproc` manifests; never add controller-specific patches here |
 | `config/manifests/external-model/` | Controller-owned Kustomize composition and ExternalModel EnvoyFilter patches |

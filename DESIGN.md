@@ -24,6 +24,41 @@ overlay, credential projections, and Envoy-owned provider transport.
 
 ## Purpose
 
+### ExternalModel handoff and transport cleanup ownership
+
+`ai-gateway-controller` reads `payload-processing-type` and
+`payload-processing-status` only from the tenant-local `MaasTenantConfig`.
+It publishes ExternalModel serving state only after the selector is Praxis and
+the handoff status is `steady`; the tenant reconciler owns the transition to
+`steady` and `cleanup-complete`. An explicit `ipp` selector is a cleanup
+request and does not wait for `steady`. A missing configuration is retained
+for non-deleting models, while deleting models use controller ownership labels
+and the model namespace to complete safe final-model cleanup.
+
+Gateway-local provider `DestinationRule` objects and the route `EnvoyFilter`
+carry the model namespace, tenant identifier, and current Gateway name and
+namespace. On a Gateway move, the controller applies the new copy first and
+removes only the old copy carrying the same tenant identity. Neighboring
+tenant and foreign-controller resources are not candidates for deletion.
+
+The pre-PR DestinationRule shape from `origin/main` was
+`provider-<provider>` in the Gateway namespace with only
+`app.kubernetes.io/managed-by=ai-gateway-controller` and
+`inference.opendatahub.io/external-provider=<provider>` labels. It has no
+tenant or Gateway identity and is therefore inherently ambiguous in a shared
+Gateway namespace. The controller intentionally leaves such an object alone;
+an operator must perform a targeted manual migration after identifying its
+owner. New controller-owned rules are unambiguous and are cleaned up by the
+normal handoff/finalizer path.
+
+If a deleting ExternalModel has no resolvable `MaasTenantConfig`/`AITenant` and
+there are sibling models, deletion is conservative: it will not rebuild shared
+Praxis serving state without a live, steady tenant handoff. The ExternalModel
+finalizer remains until the owning handoff objects are restored or the sibling
+models are removed. Final-model deletion can clean controller-owned state
+using its namespace and ownership labels. Ambiguous pre-PR resources are never
+removed by a label-only sweep.
+
 `ai-gateway-controller` is the AI Gateway control-plane controller. Target
 state (3.6): sibling of `maas-controller`, both deployed by
 `ai-gateway-operator`:
@@ -115,7 +150,7 @@ flowchart TD
   - **`ai-gateway-controller`** — deployment and reconciling of external models (per-model config generation, formerly in IPP).
   - **Praxis (`praxis-extproc`)** — ExtProc dataplane only.
 - **`MaasTenantConfig` selects the dataplane backend per tenant (EA2 / Phase 2, implemented):**
-  - `MaasTenantConfig.metadata.annotations["maas.opendatahub.io/payload-processing-type"] == "praxis"` chooses **Praxis** (via `ai-gateway-controller`'s `pkg/tenant`) vs **IPP** (`payload-processing`, legacy MaaS path, the default when the annotation is absent/other). This annotation lives only on `MaasTenantConfig` — it is never mirrored to/from `AITenant` — so both controllers always read the same single source of truth from the same object they both watch.
+  - `MaasTenantConfig.metadata.annotations["maas.opendatahub.io/payload-processing-type"] == "ipp"` selects **IPP** (`payload-processing`); absent, empty, or unrecognized values follow the current **Praxis** default (via `ai-gateway-controller`'s `pkg/tenant`). This annotation lives only on `MaasTenantConfig` — it is never mirrored to/from `AITenant` — so both controllers always read the same single source of truth from the same object they both watch.
   - Lets 3.6 support both backends during the Praxis migration, one tenant at a time, with a race-free handoff (see [Approach](#approach)) when a tenant swaps backends.
 - **Multi-tenancy works the same way it does today:**
   - `MaasTenantConfig` / `AITenant` fan-out drives per-tenant namespaces, gateway binding, and dataplane install — no change to the tenancy model, only which ExtProc backend is selected.
@@ -208,6 +243,12 @@ doc comment for the full state machine this mirrors. In short:
   `Conflict` and re-evaluates.
 - Status itself is the durable claim — apply failures after a successful
   claim resume on the next reconcile because status is already `steady`.
+- If `MaasTenantConfig/default-tenant` itself is temporarily missing, the
+  ExternalModel reconciler treats selection as unknown: it retains existing
+  serving state, does not infer a backend from `AITenant`, and waits for the
+  owner to recreate the config. Cleanup is performed only after an explicit
+  `ipp` selection (or the established deletion handoff), never merely because
+  the selector object disappeared.
 - After a full, successful switch-off cleanup (`Reconciler.cleanup`), this
   controller writes `cleanup-complete` (`MarkPayloadProcessingCleanupComplete`)
   so maas-controller may claim to absent and (re)deploy legacy IPP.
@@ -231,17 +272,16 @@ doc comment for the full state machine this mirrors. In short:
 - **Implemented:** `pkg/tenant` primarily watches `MaasTenantConfig`
   (`maas.opendatahub.io/v1alpha1`) — mirroring maas-controller's own
   `TenantReconciler` — and, for every tenant whose
-  `maas.opendatahub.io/payload-processing-type` annotation is `praxis`,
+  `maas.opendatahub.io/payload-processing-type` annotation is absent or `praxis`,
   renders and applies a dedicated, per-tenant-named copy of the
   praxis-extproc resources (`{base}-{tenantID}`, the default/legacy tenant
   keeps the unsuffixed names) into that tenant's owning `AITenant`'s
   `status.gatewayRef` namespace, once that `AITenant`'s `status.phase` is
   `Active`. A secondary `AITenant` watch reacts to gatewayRef/phase changes
-  that a `MaasTenantConfig`-only watch would miss. Tenants that don't opt in
-  (absent/empty/other) are untouched — `maas-controller`'s own
-  `TenantReconciler` owns their IPP deployment. There is no
-  unconditional/default install anymore: a tenant gets praxis-extproc only
-  by opting in via its `MaasTenantConfig`.
+  that a `MaasTenantConfig`-only watch would miss. Tenants explicitly set to
+  `ipp` are untouched — `maas-controller`'s own
+  `TenantReconciler` owns their IPP deployment. The current product default is
+  Praxis when the selector is absent; explicit `ipp` is the opt-out.
   `PraxisCleanupFinalizer` (on `MaasTenantConfig`) deletes a tenant's
   praxis-extproc resources when it switches away from `praxis` or its
   `MaasTenantConfig` is deleted; `--deletion-timeout` bounds how long that
@@ -266,6 +306,40 @@ doc comment for the full state machine this mirrors. In short:
   `ModelsAsAService.ManagementState == Managed` in
   `internal/controller/aigateway/aigateway.go`; a real vendoring/deploy run
   from this repo's side has not been confirmed yet.
+
+## Inference API schema extension
+
+[RHOAIENG-90800](https://redhat.atlassian.net/browse/RHOAIENG-90800) is a bounded,
+additive extension to ODH-ADR-MS-0005's frozen migration baseline. AGC's
+`api/inference/v1alpha1` types and generated `config/crd/bases` schemas source
+the new fields. Retain the ADR's local API mirrors and CI drift checks;
+MaaS installs the inference CRDs, and operator manifest pins propagate them.
+AGC, MaaS and API owners agreed this extension separately from the migration
+baseline.
+
+`spec.gatewayRefs` is optional, with 1–16 unique namespace/name pairs when
+present. Omission retains tenant-local resolution without a global default.
+`status.gateways` uses the same full identity, optional `httpRouteRef`
+name/namespace, and conditions keyed by type whose `observedGeneration`
+refers to the model generation. Ready attests reconciliation/distribution;
+aggregate Ready requires every requested attachment. `httpRouteName` remains
+the legacy alias, populated for a single attachment only when its route is
+in the model namespace. Other existing status fields remain available.
+
+An omitted provider-reference namespace means the model namespace. Inherited
+auth uses the provider-local Secret; an override uses the model-local Secret.
+Secret references remain name-only. Preserve the installed schema's accepted
+names and `auth.type: simple`; schema acceptance does not add auth behavior.
+The schema compatibility test pins the legacy MaaS validation baseline.
+Until cross-namespace authorization is implemented, the resolver skips a
+provider reference to another namespace and never substitutes a local provider.
+
+Schema installation alone does not enable serving these fields. Attachment
+ownership, status publication, provider authorization/credential delivery,
+and MaaS selection belong to the follow-up stories. Activation requires
+aligned packaged schemas and serving implementations, verified tenant
+cleanup/claim ownership (including shared models/providers), and the serving,
+status, MaaS and installed-package checks.
 
 ## Dependencies
 

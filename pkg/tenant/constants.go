@@ -14,18 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package tenant watches AITenant CRs (owned by maas-controller) and, for
-// every tenant whose spec.payloadProcessing.type is "praxis", renders and
-// SSA-applies a dedicated per-tenant copy of the vendored praxis-extproc
-// manifests into that tenant's Gateway namespace.
+// Package tenant watches MaasTenantConfig CRs (owned by maas-controller) and,
+// for every tenant whose payload-processing annotation selects Praxis, renders
+// and SSA-applies a dedicated per-tenant copy of the vendored praxis-extproc
+// manifests into that tenant's Gateway namespace. AITenant is resolved only
+// for status, ownership, and Gateway identity.
 //
-// This package deliberately reads AITenant via unstructured +
+// This package deliberately reads both resources via unstructured +
 // schema.GroupVersionKind rather than importing
 // models-as-a-service/maas-controller's Go types: that module's go.mod pulls
 // in kserve, knative, KEDA, openshift/api, and more, none of which this
 // controller needs, and DESIGN.md's stated goal is to keep this repo's
-// dependency graph minimal. AITenant's on-wire JSON shape is the only
-// contract this package relies on.
+// dependency graph minimal. Their on-wire JSON shapes are the only contracts
+// this package relies on.
 package tenant
 
 import "k8s.io/apimachinery/pkg/runtime/schema"

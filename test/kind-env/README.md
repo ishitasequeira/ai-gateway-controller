@@ -5,18 +5,23 @@ described by ADR 0001. It creates and uses only the named Kind context,
 records provenance and cluster state, and supports `--preflight`,
 `--provision`, and `--destroy`.
 
-MaaS tenant opt-in uses its current annotation contract:
+MaaS tenant opt-in uses the `MaasTenantConfig/default-tenant` annotation
+contract. The AITenant supplies only ownership, status, and Gateway identity:
 
 ```yaml
 metadata:
+  name: default-tenant
+  namespace: <resolved-tenant-namespace>
   annotations:
     maas.opendatahub.io/payload-processing-type: praxis
 ```
 
-An absent, empty, or different value remains on the existing IPP path. The
-controller reads this annotation but does not write the AITenant or claim
-MaaS-owned IPP resources. A typed AITenant selector would require a separate
-approved API proposal.
+The Kind provisioner applies the AITenant first, waits for MaaS to create this
+config in the resolved tenant namespace, and then annotates the config. An
+absent, empty, or unrecognized value follows the controller's current Praxis
+default; explicit `ipp` selects the MaaS-owned IPP path. The ExternalModel
+controller never reads a backend selector from AITenant and never claims
+MaaS-owned IPP resources.
 
 The controller watches ExternalModel and ExternalProvider, publishes transport
 resources before the content-addressed overlay, and the local manifests
@@ -44,10 +49,11 @@ backends remain in `maas-system`, and evidence records that backend namespace
 separately. The extended run proves positive tenant-B traffic after a bounded
 tenant-B Gateway route/provider convergence gate; this is workload and route
 isolation evidence, not proof of multi-tenant MaaS authorization. Gateway-local
-provider `DestinationRule` objects are tenant-qualified when more than one
-tenant shares `maas-system`, so endpoint and SNI policy from one tenant cannot
-overwrite another tenant's policy. A separate `ai-tenant-transition` fixture is
-annotation absent and reserved for real MaaS IPP cutover/rollback qualification.
+provider `DestinationRule` objects carry a tenant ownership label and are
+tenant-qualified when more than one tenant shares `maas-system`, so endpoint
+and SNI policy from one tenant cannot overwrite another tenant's policy. A
+separate `ai-tenant-transition` fixture is explicitly set to `ipp` and
+reserved for real MaaS IPP cutover/rollback qualification.
 
 ### Shared External Model resources
 
@@ -198,7 +204,7 @@ not a production transport behavior.
 
 The Katan backends are credential-enforcing fixtures, not permissive traffic
 sinks. ExtProc providers use the run-only `kind-only-dummy` value and the
-annotation-absent IPP transition fixture uses its separate
+explicit-`ipp` IPP transition fixture uses its separate
 `transition-provider-key` value through the dedicated `katan-transition`
 Deployment. These values are qualification fixtures only and are never
 production credentials. The E2E first proves direct requests without a
@@ -247,14 +253,24 @@ ExternalModel-only filter is a separate SEND/NONE chain, disabled by default
 and enabled only by controller-owned route patches. Ordinary KServe routes on
 the same Gateway therefore retain their upstream body-processing behavior.
 
-The transition fixture uses a real annotation-absent AITenant and MaaS model
+The transition fixture uses a real `MaasTenantConfig` explicitly set to
+`ipp` and MaaS model
 resources. It reached real IPP ownership in the fresh run, but the existing IPP
 request/cutover path was blocked by a stale IPP ExternalModel-owned HTTPRoute.
 The narrowly scoped MaaS change now deletes that route only after the IPP writer
 stops and only when its labels and exact owner UID prove ownership; ambiguous,
 user-owned, or controller-owned routes remain untouched. The current annotation
-contract and controller-owned cleanup are
-preserved and must not be replaced by a typed AITenant field.
+contract and controller-owned cleanup are preserved; the selector must not be
+reintroduced on AITenant.
+
+The Kind harness writes only the `payload-processing-type` selector. It does
+not synthesize `payload-processing-status=cleanup-complete`; MaaS and the
+selected controller own that handoff signal. Provisioning waits until the
+Praxis-selected configs reach `steady` before creating ExternalModel fixtures.
+If a config is temporarily missing, the ExternalModel controller retains
+serving state and waits rather than inferring selection from AITenant or
+deleting resources. An explicit `ipp` selector is required for switch-away
+cleanup.
 
 The controller still uses the persisted ExternalProvider phase as its
 reconciliation gate. Before each live provider request, the Kind E2E also

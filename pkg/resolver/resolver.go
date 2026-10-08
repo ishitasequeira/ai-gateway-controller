@@ -26,6 +26,9 @@ const (
 	// SkipRefNotFound: the referenced ExternalProvider does not exist in
 	// the model's namespace.
 	SkipRefNotFound SkipReason = "RefNotFound"
+	// SkipRefNamespaceUnsupported: cross-namespace provider resolution and
+	// authorization are not implemented; never substitute a local provider.
+	SkipRefNamespaceUnsupported SkipReason = "RefNamespaceUnsupported"
 	// SkipProviderNotReady: the provider exists but its status.phase is
 	// not Ready. Blocking gate ported from IPP: a ref may not route to a
 	// provider whose networking (Service/SE/DR) is not confirmed.
@@ -157,6 +160,11 @@ func resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalPro
 		}
 		for _, ref := range m.Spec.ExternalProviderRefs {
 			base := Skip{ModelRef: mref, ProviderRef: ref.Ref.Name}
+			if ref.Ref.Namespace != "" && ref.Ref.Namespace != m.Namespace {
+				mr.Skips = append(mr.Skips, newSkip(base, SkipRefNamespaceUnsupported,
+					fmt.Sprintf("cross-namespace ExternalProvider reference %q is not supported", ref.Ref.Namespace+"/"+ref.Ref.Name)))
+				continue
+			}
 
 			prov, ok := byKey[provKey{m.Namespace, ref.Ref.Name}]
 			if !ok {

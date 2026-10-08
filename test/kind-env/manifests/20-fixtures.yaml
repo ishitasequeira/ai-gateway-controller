@@ -6,7 +6,8 @@
 # Dependencies: Requires the ai-tenants and models-as-a-service namespaces and
 # the maas-default-gateway from 30-gateway.yaml. Provider A/B resources are
 # rendered from test/external-model/providers.yaml.tmpl; the AITenant is
-# applied first and the remaining resources are applied after MaaS handoff.
+# applied first, then run.sh opts the MaaS-created MaasTenantConfig into
+# Praxis before the remaining resources are applied after handoff.
 #
 # Qualification role: Defines the tenant-local provider topology that the
 # controller converts into transport resources, routing overlay, and Praxis
@@ -17,8 +18,6 @@ kind: AITenant
 metadata:
   name: models-as-a-service
   namespace: ai-tenants
-  annotations:
-    maas.opendatahub.io/payload-processing-type: praxis
 spec:
   gateway:
     name: maas-default-gateway

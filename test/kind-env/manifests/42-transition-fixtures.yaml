@@ -10,8 +10,8 @@
 # 30-gateway.yaml, the transition backend compatibility Service from
 # 00-backends.yaml, and the MaaS controller/IPP handoff resources.
 #
-# Qualification role: Keeps the annotation-absent transition path explicit so
-# IPP ownership, Praxis cutover, and rollback can be tested independently.
+# Qualification role: Keeps the explicit `ipp` transition path so IPP
+# ownership, Praxis cutover, and rollback can be tested independently.
 # The credential is a dummy test value and must never be treated as a
 # production secret.
 

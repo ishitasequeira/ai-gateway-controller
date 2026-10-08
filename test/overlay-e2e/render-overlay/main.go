@@ -65,7 +65,7 @@ func main() {
 			ObjectMeta: metav1.ObjectMeta{Name: model, Namespace: *ns},
 			Spec: v1alpha1.ExternalModelSpec{
 				ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
-					Ref:         v1alpha1.NameReference{Name: provider},
+					Ref:         v1alpha1.ExternalProviderReference{Name: provider},
 					TargetModel: model,
 					APIFormat:   "messages",
 					Path:        "/v1/messages",

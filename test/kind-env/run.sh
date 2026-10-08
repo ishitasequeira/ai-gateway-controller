@@ -44,6 +44,20 @@ KCTL=(kubectl --context "kind-$CLUSTER")
 failures=0
 fail() { echo "FAIL: $*" | tee -a "$EVIDENCE/failures.txt"; failures=$((failures + 1)); }
 check_cmd() { command -v "$1" >/dev/null 2>&1 || fail "missing command: $1"; }
+wait_for_praxis_handoff() {
+  local namespace=$1 status
+  for _ in $(seq 1 90); do
+    status=$("${KCTL[@]}" -n "$namespace" get maastenantconfig default-tenant -o jsonpath='{.metadata.annotations.maas\.opendatahub\.io/payload-processing-status}' 2>/dev/null || true)
+    if [[ "$status" == steady ]]; then
+      printf 'tenant=%s status=steady\n' "$namespace" >>"$EVIDENCE/maas-payload-handoff.txt"
+      return 0
+    fi
+    sleep 2
+  done
+  "${KCTL[@]}" -n "$namespace" get maastenantconfig default-tenant -o json >"$EVIDENCE/maas-payload-handoff-${namespace}.json" 2>&1 || true
+  fail "MaaS/Praxis handoff did not reach steady for $namespace"
+  return 1
+}
 check_repo() { local name=$1 path=${!1:-}; [[ -n "$path" && -d "$path/.git" ]] || fail "$name checkout missing: ${path:-unset}"; }
 dirty_hash() {
   local source=$1 file
@@ -439,6 +453,35 @@ EOF
   for manifest in "$ROOT/test/kind-env/manifests/20-fixtures.yaml" "$ROOT/test/kind-env/manifests/21-fixtures-tenant-b.yaml" "$ROOT/test/kind-env/manifests/42-transition-fixtures.yaml"; do
     yq eval 'select(.kind == "AITenant")' "$manifest" | "${KCTL[@]}" apply -f -
   done
+  # MaaS owns and creates each tenant-local MaasTenantConfig. Apply the
+  # payload-processing selector only after that object exists; the AITenant is
+  # deliberately not a second source of backend-selection truth. The
+  # explicit-ipp transition tenant remains on the normal IPP path.
+  for tenant_namespace in models-as-a-service ai-tenant-tenant-b; do
+    mtc_ready=false
+    for _ in $(seq 1 90); do
+      if "${KCTL[@]}" -n "$tenant_namespace" get maastenantconfig default-tenant >/dev/null 2>&1; then
+        mtc_ready=true
+        break
+      fi
+      sleep 2
+    done
+    [[ "$mtc_ready" == true ]] || { fail "MaaS did not create $tenant_namespace/default-tenant MaasTenantConfig"; exit 2; }
+    "${KCTL[@]}" -n "$tenant_namespace" annotate maastenantconfig default-tenant \
+      maas.opendatahub.io/payload-processing-type=praxis --overwrite
+    wait_for_praxis_handoff "$tenant_namespace" || exit 2
+  done
+  transition_mtc_ready=false
+  for _ in $(seq 1 90); do
+    if "${KCTL[@]}" -n ai-tenant-transition get maastenantconfig default-tenant >/dev/null 2>&1; then
+      transition_mtc_ready=true
+      break
+    fi
+    sleep 2
+  done
+  [[ "$transition_mtc_ready" == true ]] || { fail "MaaS did not create ai-tenant-transition/default-tenant MaasTenantConfig"; exit 2; }
+  "${KCTL[@]}" -n ai-tenant-transition annotate maastenantconfig default-tenant \
+    maas.opendatahub.io/payload-processing-type=ipp --overwrite
   for tenant_id in "" tenant-b; do
     deployment_name=payload-processing${tenant_id:+-$tenant_id}
     pre_deployment_name=payload-pre-processing${tenant_id:+-$tenant_id}
@@ -597,11 +640,11 @@ EOF
   # runner supports a namespace-scoped cache and explicit Gateway settings;
   # provide those only in this Kind fixture.  Keep IPP disabled for tenants
   # already owned by Praxis so it cannot create a competing direct-provider
-  # route, and enable it only for the annotation-absent transition tenant.
+  # route, and enable it only for the explicit-ipp transition tenant.
   ipp_ready=false
   for _ in $(seq 1 60); do
     # Praxis tenants may already have had their MaaS IPP operands removed by
-    # the ownership-gated transition. Only the annotation-absent transition
+    # the ownership-gated transition. Only the explicit-ipp transition
     # tenant is required to retain an existing-IPP deployment at this stage.
     if "${KCTL[@]}" -n maas-system get deployment payload-processing-transition >/dev/null 2>&1; then
       ipp_ready=true
