@@ -66,6 +66,40 @@ func TestIsActive(t *testing.T) {
 	}
 }
 
+func TestPlatformPrerequisitesReady(t *testing.T) {
+	current := NewAITenant()
+	current.SetGeneration(3)
+	status := map[string]any{
+		"conditions": []any{map[string]any{
+			"type":               AITenantConditionPlatformPrerequisitesReady,
+			"status":             "True",
+			"observedGeneration": int64(3),
+		}},
+	}
+	current.Object["status"] = status
+	if !PlatformPrerequisitesReady(current) {
+		t.Fatal("PlatformPrerequisitesReady = false, want true for a current True condition")
+	}
+
+	status["conditions"] = []any{map[string]any{
+		"type":               AITenantConditionPlatformPrerequisitesReady,
+		"status":             "True",
+		"observedGeneration": int64(2),
+	}}
+	if PlatformPrerequisitesReady(current) {
+		t.Fatal("PlatformPrerequisitesReady = true, want false for a stale condition")
+	}
+
+	status["conditions"] = []any{map[string]any{
+		"type":               AITenantConditionPlatformPrerequisitesReady,
+		"status":             "False",
+		"observedGeneration": int64(3),
+	}}
+	if PlatformPrerequisitesReady(current) {
+		t.Fatal("PlatformPrerequisitesReady = true, want false for a False condition")
+	}
+}
+
 // aitenantWithReady builds an AITenant carrying the AITenantConditionReady
 // condition maas-controller writes alongside status.phase, with an explicit
 // metadata.generation and the condition's observedGeneration, so the

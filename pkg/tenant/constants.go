@@ -137,6 +137,13 @@ const (
 	// metadata.generation — see StatusIsCurrent.
 	AITenantConditionReady = "Ready"
 
+	// AITenantConditionPlatformPrerequisitesReady is the backend-neutral
+	// readiness signal maas-controller publishes once the tenant namespace,
+	// validated Gateway claim, RBAC, and MaasTenantConfig are safe for a
+	// dataplane controller to provision. It may be true before Ready while the
+	// selected dataplane controller is creating its Gateway resources.
+	AITenantConditionPlatformPrerequisitesReady = "PlatformPrerequisitesReady"
+
 	// PraxisCleanupFinalizer is added to every MaasTenantConfig this controller
 	// has applied praxis-extproc resources for, so it can clean them up when
 	// the tenant switches away from praxis or the MaasTenantConfig is deleted

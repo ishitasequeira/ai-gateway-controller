@@ -149,6 +149,21 @@ func withMarker(u *unstructured.Unstructured, value string) *unstructured.Unstru
 	return u
 }
 
+func withPlatformPrerequisites(u *unstructured.Unstructured) *unstructured.Unstructured {
+	status, ok := u.Object["status"].(map[string]any)
+	if !ok {
+		status = map[string]any{}
+		u.Object["status"] = status
+	}
+	conditions, _ := status["conditions"].([]any)
+	status["conditions"] = append(conditions, map[string]any{
+		"type":               AITenantConditionPlatformPrerequisitesReady,
+		"status":             "True",
+		"observedGeneration": u.GetGeneration(),
+	})
+	return u
+}
+
 func withMTCFinalizer(u *unstructured.Unstructured) *unstructured.Unstructured {
 	controllerutil.AddFinalizer(u, PraxisCleanupFinalizer)
 	return u
@@ -352,6 +367,28 @@ func TestReconcileAddsFinalizerAndRequeuesShortlyWhenNotActiveYet(t *testing.T) 
 	}
 	if !controllerutil.ContainsFinalizer(&got, PraxisCleanupFinalizer) {
 		t.Fatal("expected PraxisCleanupFinalizer to be added even though the tenant is not Active yet")
+	}
+}
+
+func TestReconcileAllowsProvisioningWhenPlatformPrerequisitesAreReady(t *testing.T) {
+	requireManifests(t)
+	scheme := mtcSchemeForTests()
+	mtc := withMarker(newMTC("ai-tenant-redteam", "redteam", PayloadProcessingBackendPraxis, "redteam", "ai-tenants"), PayloadProcessingStatusSteady)
+	aitenant := withPlatformPrerequisites(newAITenantOwner("redteam", "ai-tenants", "Pending", "redteam-gateway", "gateway-system", "ai-tenant-redteam"))
+	rec := &recorder{}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant).WithInterceptorFuncs(rec.funcs()).Build()
+
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Hour}
+	res, err := r.Reconcile(context.Background(), mtcRequest("ai-tenant-redteam"))
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if res.RequeueAfter != time.Hour {
+		t.Fatalf("RequeueAfter = %v, want the configured resync interval after prerequisite-gated provisioning", res.RequeueAfter)
+	}
+	patched, _, deleted := rec.snapshot()
+	if len(patched) == 0 || len(deleted) != 0 {
+		t.Fatalf("expected Praxis resources to be applied during prerequisite-gated bootstrap, got patched=%v deleted=%v", patched, deleted)
 	}
 }
 

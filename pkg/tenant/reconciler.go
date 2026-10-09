@@ -42,7 +42,8 @@ import (
 )
 
 // notReadyRequeueInterval is used when a MaasTenantConfig has opted into
-// praxis but is not yet ready for it (see IsActive / GatewayRef), or when a
+// praxis but is not yet ready for it (see IsActive / PlatformPrerequisitesReady
+// / GatewayRef), or when a
 // transition-in is blocked on the IPP migration marker. This is a "come
 // back shortly" wait, distinct from ResyncInterval's steady-state resync.
 const notReadyRequeueInterval = 10 * time.Second
@@ -220,18 +221,20 @@ func (r *Reconciler) resolveOwnedAITenant(ctx context.Context, mtc *unstructured
 	return aitenant, nil
 }
 
-// resolveOwningAITenant is resolveOwnedAITenant plus the Active readiness
-// gate used by the praxis apply path.
+// resolveOwningAITenant is resolveOwnedAITenant plus the readiness gate used
+// by the praxis apply path. Active remains the steady-state gate; during
+// bootstrap or repair, maas-controller's backend-neutral
+// PlatformPrerequisitesReady condition permits this controller to create the
+// dataplane that is required before MaasTenantConfig can become Ready.
 func (r *Reconciler) resolveOwningAITenant(ctx context.Context, mtc *unstructured.Unstructured) (aitenant *unstructured.Unstructured, ready bool, err error) {
 	aitenant, err = r.resolveOwnedAITenant(ctx, mtc)
 	if err != nil || aitenant == nil {
 		return aitenant, false, err
 	}
-	// Require both an Active phase and status observed for the current spec
-	// generation: an Active phase whose gatewayRef still reflects a superseded
-	// generation (maas-controller mid-reconcile after a spec change) must not
-	// drive a praxis-extproc install against a stale Gateway.
-	if !IsActive(aitenant) || !StatusIsCurrent(aitenant) {
+	// Require current status, and either the established Active state or the
+	// validated platform-prerequisites handoff. A stale condition must not
+	// drive a praxis-extproc install against a superseded Gateway.
+	if !StatusIsCurrent(aitenant) || (!IsActive(aitenant) && !PlatformPrerequisitesReady(aitenant)) {
 		return aitenant, false, nil
 	}
 	return aitenant, true, nil
@@ -249,9 +252,10 @@ func (r *Reconciler) resolveOwningAITenant(ctx context.Context, mtc *unstructure
 //
 // It returns false (transient ⇒ requeue, not an error) when, read live, the
 // AITenant: is gone; has a different metadata.uid than wantUID; no longer binds
-// this MaasTenantConfig (status.tenantNamespace); is not Active; is not current
-// for its generation (StatusIsCurrent); or no longer publishes the same
-// status.gatewayRef this reconcile rendered against. An empty wantUID disables
+// this MaasTenantConfig (status.tenantNamespace); is neither Active nor
+// PlatformPrerequisitesReady; is not current for its generation
+// (StatusIsCurrent); or no longer publishes the same status.gatewayRef this
+// reconcile rendered against. An empty wantUID disables
 // the check, so a live object always carries a UID and only tests can opt out.
 // This guards the apply path only: delete/cleanup must run regardless of
 // identity (see resolveOwnedAITenant).
@@ -290,10 +294,10 @@ func (r *Reconciler) aiTenantStillValidForApply(ctx context.Context, mtc *unstru
 	if ns, ok := ConfigNamespace(aitenant); !ok || ns != mtc.GetNamespace() {
 		return false, nil
 	}
-	// Readiness + generation currency against live state: an Active tenant
-	// whose status lags a spec change (StatusIsCurrent false) must not drive an
-	// install against a superseded generation.
-	if !IsActive(aitenant) || !StatusIsCurrent(aitenant) {
+	// Readiness + generation currency against live state: an Active tenant or a
+	// tenant in the validated platform-prerequisites handoff whose status lags
+	// a spec change must not drive an install against a superseded generation.
+	if !StatusIsCurrent(aitenant) || (!IsActive(aitenant) && !PlatformPrerequisitesReady(aitenant)) {
 		return false, nil
 	}
 	// The gateway we rendered against must still be the live one: a re-home

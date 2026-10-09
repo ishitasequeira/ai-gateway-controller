@@ -39,6 +39,15 @@ func IsActive(aitenant *unstructured.Unstructured) bool {
 	return phase == AITenantPhaseActive
 }
 
+// PlatformPrerequisitesReady reports whether maas-controller has validated the
+// tenant's base resources for the current AITenant generation. This is weaker
+// than Active by design: it is the permission for the selected dataplane
+// controller to create its resources, not a claim that the complete tenant
+// dataplane is serving yet.
+func PlatformPrerequisitesReady(aitenant *unstructured.Unstructured) bool {
+	return statusConditionCurrent(aitenant, AITenantConditionPlatformPrerequisitesReady, true)
+}
+
 // GatewayRef reads status.gatewayRef.{name,namespace}. ok is false until
 // the AITenant reconciler (maas-controller) has resolved and published the
 // Gateway reference; callers should requeue rather than treat that as an
@@ -58,11 +67,18 @@ func GatewayRef(aitenant *unstructured.Unstructured) (name, namespace string, ok
 // transition (setAITenantPhase), and AITenantStatus exposes no top-level
 // observedGeneration to rely on instead.
 //
-// Used together with IsActive as the readiness gate: acting on an Active phase
-// whose gatewayRef still reflects a superseded generation would install
-// praxis-extproc against a stale Gateway. A false result is a transient
-// not-ready state (requeue), not an error.
+// Used together with IsActive or PlatformPrerequisitesReady as the generation
+// fence: acting on status whose gatewayRef still reflects a superseded
+// generation would install praxis-extproc against a stale Gateway. A false
+// result is a transient not-ready state (requeue), not an error.
 func StatusIsCurrent(aitenant *unstructured.Unstructured) bool {
+	return statusConditionCurrent(aitenant, AITenantConditionReady, false)
+}
+
+// statusConditionCurrent reports whether a status condition exists for the
+// object's current spec generation. When requireTrue is set, the condition
+// must also carry status=True.
+func statusConditionCurrent(aitenant *unstructured.Unstructured, conditionType string, requireTrue bool) bool {
 	conditions, _, _ := unstructured.NestedSlice(aitenant.Object, "status", "conditions")
 	for _, entry := range conditions {
 		condition, ok := entry.(map[string]any)
@@ -70,8 +86,14 @@ func StatusIsCurrent(aitenant *unstructured.Unstructured) bool {
 			continue
 		}
 		condType, _, _ := unstructured.NestedString(condition, "type")
-		if condType != AITenantConditionReady {
+		if condType != conditionType {
 			continue
+		}
+		if requireTrue {
+			status, _, _ := unstructured.NestedString(condition, "status")
+			if status != "True" {
+				return false
+			}
 		}
 		observed, ok := nestedInt64(condition, "observedGeneration")
 		return ok && observed == aitenant.GetGeneration()
