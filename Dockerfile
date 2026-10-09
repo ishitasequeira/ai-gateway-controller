@@ -4,6 +4,7 @@ ARG BUILDPLATFORM
 ARG TARGETPLATFORM
 
 FROM --platform=$BUILDPLATFORM registry.access.redhat.com/ubi9/go-toolset:$GOLANG_VERSION AS builder
+ENV GOTOOLCHAIN=auto
 ARG CGO_ENABLED=1
 ARG GOEXPERIMENT=strictfipsruntime
 ARG TARGETOS
