@@ -37,6 +37,7 @@ spec:
   provider: openai
   endpoint: provider-a-tenant-b.maas-system.svc.cluster.local
   auth: {type: apikey, secretRef: {name: provider-credentials}}
+  config: {tls.caCertificates: /etc/external-model-e2e/provider-ca/ca.crt}
 ---
 apiVersion: inference.opendatahub.io/v1alpha1
 kind: ExternalProvider
@@ -45,6 +46,7 @@ spec:
   provider: openai
   endpoint: provider-b-tenant-b.maas-system.svc.cluster.local
   auth: {type: apikey, secretRef: {name: provider-credentials}}
+  config: {tls.caCertificates: /etc/external-model-e2e/provider-ca/ca.crt}
 ---
 apiVersion: inference.opendatahub.io/v1alpha1
 kind: ExternalModel
@@ -56,11 +58,7 @@ spec:
     targetModel: demo
     apiFormat: openai-chat
     path: /v1/chat/completions
-    config:
-      tls.caCertificates: /etc/external-model-e2e/provider-ca/ca.crt
   - ref: {name: provider-b}
     targetModel: demo
     apiFormat: openai-chat
     path: /v1/chat/completions
-    config:
-      tls.caCertificates: /etc/external-model-e2e/provider-ca/ca.crt

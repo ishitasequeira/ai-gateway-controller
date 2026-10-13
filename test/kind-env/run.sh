@@ -620,7 +620,8 @@ EOF
   EXTERNAL_MODEL_RUN_ID="$CLUSTER" \
   EXTERNAL_MODEL_PROVIDER_A_ENDPOINT=provider-a-ext.maas-system.svc.cluster.local \
   EXTERNAL_MODEL_PROVIDER_B_ENDPOINT=provider-b-ext.maas-system.svc.cluster.local \
-    envsubst '${EXTERNAL_MODEL_NAMESPACE} ${EXTERNAL_MODEL_PROVIDER_A_ENDPOINT} ${EXTERNAL_MODEL_PROVIDER_B_ENDPOINT} ${EXTERNAL_MODEL_RUN_ID}' \
+  EXTERNAL_MODEL_PROVIDER_CA_PATH=/etc/external-model-e2e/provider-ca/ca.crt \
+    envsubst '${EXTERNAL_MODEL_NAMESPACE} ${EXTERNAL_MODEL_PROVIDER_A_ENDPOINT} ${EXTERNAL_MODEL_PROVIDER_B_ENDPOINT} ${EXTERNAL_MODEL_PROVIDER_CA_PATH} ${EXTERNAL_MODEL_RUN_ID}' \
       <"$ROOT/test/external-model/providers.yaml.tmpl" | "${KCTL[@]}" apply -f -
   if [[ "$APPLY_REAL_OPENAI_FIXTURE" == true ]]; then
     # This fixture is intentionally explicit: it expands the allowlist with

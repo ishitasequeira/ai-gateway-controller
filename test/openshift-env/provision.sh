@@ -636,9 +636,9 @@ done
 # Istio's Gateway proxy does not automatically trust OpenShift service-ca.
 # Inject the public service CA into a run-owned ConfigMap in the Gateway
 # namespace and mount it into only this run-owned Gateway deployment. The
-# ExternalModel reference supplies the same absolute path to the generated
-# provider DestinationRules; verification remains enabled and no provider
-# certificate or MaaS-owned workload is modified.
+# ExternalProvider supplies this path to its shared Gateway DestinationRule;
+# verification remains enabled and no provider certificate or MaaS-owned
+# workload is modified.
 PROVIDER_CA_CONFIGMAP="xmp-provider-ca-$OPENSHIFT_E2E_RUN_ID"
 PROVIDER_CA_MOUNT_PATH=/etc/external-model-e2e/provider-ca
 PROVIDER_CA_CONFIGMAP_EVIDENCE="$OUT/provider-ca-configmap.json"
@@ -700,6 +700,7 @@ export EXTERNAL_MODEL_NAMESPACE="$OPENSHIFT_E2E_TENANT_NAMESPACE"
 export EXTERNAL_MODEL_RUN_ID="$OPENSHIFT_E2E_RUN_ID"
 export EXTERNAL_MODEL_PROVIDER_A_ENDPOINT="provider-a.${OPENSHIFT_E2E_BACKEND_NAMESPACE}.svc.cluster.local"
 export EXTERNAL_MODEL_PROVIDER_B_ENDPOINT="provider-b.${OPENSHIFT_E2E_BACKEND_NAMESPACE}.svc.cluster.local"
+export EXTERNAL_MODEL_PROVIDER_CA_PATH=/etc/external-model-e2e/provider-ca/service-ca.crt
 "$ROOT/test/openshift-env/render-manifests.sh" "$RENDER_DIR" providers.yaml.tmpl >"$OUT/render-manifests-shared-providers.log"
 apply_rendered providers.yaml
 "$ROOT/test/openshift-env/render-manifests.sh" "$RENDER_DIR" 40-model-fixtures.yaml.tmpl >"$OUT/render-manifests-models.log"

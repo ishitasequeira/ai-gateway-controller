@@ -21,6 +21,8 @@ spec:
   provider: openai
   endpoint: ${EXTERNAL_MODEL_PROVIDER_A_ENDPOINT}
   auth: {type: apikey, secretRef: {name: provider-credentials}}
+  config:
+    tls.caCertificates: ${EXTERNAL_MODEL_PROVIDER_CA_PATH}
 ---
 apiVersion: inference.opendatahub.io/v1alpha1
 kind: ExternalProvider
@@ -34,3 +36,5 @@ spec:
   provider: openai
   endpoint: ${EXTERNAL_MODEL_PROVIDER_B_ENDPOINT}
   auth: {type: apikey, secretRef: {name: provider-credentials}}
+  config:
+    tls.caCertificates: ${EXTERNAL_MODEL_PROVIDER_CA_PATH}

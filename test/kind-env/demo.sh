@@ -318,7 +318,7 @@ if [[ "$RESET" == true ]]; then
     echo "RESET: expected ExtProc deployment $DATAPLANE_DEPLOYMENT is absent" >&2
     exit 1
   }
-  mutate -n "$TENANT" patch externalmodel demo-model --type=json -p='[{"op":"replace","path":"/spec/externalProviderRefs","value":[{"ref":{"name":"provider-a"},"targetModel":"demo","apiFormat":"openai-chat","path":"/v1/chat/completions","config":{"tls.caCertificates":"/etc/external-model-e2e/provider-ca/ca.crt"}},{"ref":{"name":"provider-b"},"weight":0,"targetModel":"demo","apiFormat":"openai-chat","path":"/v1/chat/completions","config":{"tls.caCertificates":"/etc/external-model-e2e/provider-ca/ca.crt"}}]}]' >/dev/null
+  mutate -n "$TENANT" patch externalmodel demo-model --type=json -p='[{"op":"replace","path":"/spec/externalProviderRefs","value":[{"ref":{"name":"provider-a"},"targetModel":"demo","apiFormat":"openai-chat","path":"/v1/chat/completions"},{"ref":{"name":"provider-b"},"weight":0,"targetModel":"demo","apiFormat":"openai-chat","path":"/v1/chat/completions"}]}]' >/dev/null
   wait_for "tenant model Ready after reset" 120 model_converged "$TENANT" demo-model || exit 1
   for _ in $(seq 1 60); do
     reset_overlay=$(kctl -n "$TENANT" get configmap routing-overlay -o jsonpath='{.data.routing-overlay\.json}' 2>/dev/null || true)

@@ -32,12 +32,8 @@ spec:
     targetModel: demo
     apiFormat: openai-chat
     path: /v1/chat/completions
-    config:
-      tls.caCertificates: /etc/external-model-e2e/provider-ca/ca.crt
   - ref: {name: provider-b}
     weight: 0
     targetModel: demo
     apiFormat: openai-chat
     path: /v1/chat/completions
-    config:
-      tls.caCertificates: /etc/external-model-e2e/provider-ca/ca.crt

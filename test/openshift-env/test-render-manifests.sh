@@ -26,6 +26,7 @@ export EXTERNAL_MODEL_NAMESPACE=xmp-tenant-test
 export EXTERNAL_MODEL_RUN_ID=render-test-123
 export EXTERNAL_MODEL_PROVIDER_A_ENDPOINT=provider-a.xmp-backend-test.svc.cluster.local
 export EXTERNAL_MODEL_PROVIDER_B_ENDPOINT=provider-b.xmp-backend-test.svc.cluster.local
+export EXTERNAL_MODEL_PROVIDER_CA_PATH=/etc/external-model-e2e/provider-ca/service-ca.crt
 export EXTERNAL_MODEL_OPENAI_SECRET=openai-provider-credentials
 export EXTERNAL_MODEL_OPENAI_SUBSCRIPTION=openai-e2e-subscription
 export EXTERNAL_MODEL_OPENAI_POLICY=openai-e2e-access
@@ -48,7 +49,12 @@ if grep -R -nE '\$\{[A-Za-z_][A-Za-z0-9_]*\}|(stringData:|data:.*api-key|Authori
 fi
 grep -R -q 'name: xmp-gateway' "$OUTPUT/10-gateway.yaml"
 grep -q 'provider-a.xmp-backend-test.svc.cluster.local' "$OUTPUT/providers.yaml"
+grep -q 'tls.caCertificates: /etc/external-model-e2e/provider-ca/service-ca.crt' "$OUTPUT/providers.yaml"
 grep -R -q 'namespace: xmp-tenant-test' "$OUTPUT/40-model-fixtures.yaml"
+if grep -q 'tls.caCertificates' "$OUTPUT/40-model-fixtures.yaml"; then
+  echo 'model fixture sets the shared provider CA at the model binding' >&2
+  exit 1
+fi
 grep -R -q 'external-model-praxis.opendatahub.io/run-id: render-test-123' "$OUTPUT"
 grep -q 'name: gpt-4o-mini' "$OUTPUT/openai.yaml"
 grep -q 'name: openai-gpt-4o-mini' "$OUTPUT/openai.yaml"
