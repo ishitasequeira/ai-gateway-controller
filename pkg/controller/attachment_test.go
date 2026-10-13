@@ -66,6 +66,15 @@ func attachmentReconciler(t *testing.T, objects ...client.Object) *Reconciler {
 	t.Helper()
 	r := controllerTestClient(t, objects...)
 	r.Network = "external-model"
+	for _, object := range objects {
+		provider, ok := object.(*v1alpha1.ExternalProvider)
+		if !ok {
+			continue
+		}
+		if _, err := r.ReconcileProvider(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(provider)}); err != nil {
+			t.Fatalf("reconcile provider %s/%s: %v", provider.Namespace, provider.Name, err)
+		}
+	}
 	return r
 }
 

@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/gowebpki/jcs"
 
@@ -41,7 +42,7 @@ type Scope struct {
 // Digest changes. On the wire it decomposes into RevisionField (value) and
 // provenance.source_generation (generation) — see overlay.rs in praxis-ai.
 type Revision struct {
-	Generation uint64
+	Generation int64
 	Digest     string
 }
 
@@ -93,7 +94,7 @@ type Provenance struct {
 	ProducerVersion  string `json:"producer_version"`
 	SourceName       string `json:"source_name"`
 	SourceUID        string `json:"source_uid"`
-	SourceGeneration uint64 `json:"source_generation"`
+	SourceGeneration int64  `json:"source_generation"`
 	RenderedAt       string `json:"rendered_at"` // RFC3339
 }
 
@@ -164,6 +165,9 @@ type Options struct {
 // Revision rule: digest equal to prev → prev returned unchanged (no bump);
 // digest changed → Generation = prev.Generation + 1.
 func Render(routes *resolver.ResolvedRouteSet, scope Scope, prev Revision, opts Options) (Envelope, error) {
+	if prev.Generation < 0 {
+		return Envelope{}, fmt.Errorf("%w: previous generation cannot be negative: %d", ErrGenerationRegression, prev.Generation)
+	}
 	if scope.Network == "" || scope.Gateway == "" || scope.Namespace == "" || scope.LocalSite == "" {
 		return Envelope{}, fmt.Errorf("%w: %+v", ErrScopeMismatch, scope)
 	}
@@ -235,6 +239,9 @@ func Render(routes *resolver.ResolvedRouteSet, scope Scope, prev Revision, opts 
 	if prev.Digest == digest && prev.Generation > 0 {
 		rev = prev // no content change, no generation bump
 	} else if prev.Generation > 0 {
+		if prev.Generation == math.MaxInt64 {
+			return Envelope{}, fmt.Errorf("%w: generation exhausted at %d", ErrGenerationRegression, prev.Generation)
+		}
 		rev = Revision{Generation: prev.Generation + 1, Digest: digest}
 	}
 
@@ -400,6 +407,8 @@ func ComputeDigestFromWire(raw []byte) (string, error) {
 // same digest → same generation; changed digest → strictly greater.
 func CheckRevisionTransition(prev, next Revision) error {
 	switch {
+	case prev.Generation < 0 || next.Generation < 0:
+		return fmt.Errorf("%w: generations cannot be negative: %d -> %d", ErrGenerationRegression, prev.Generation, next.Generation)
 	case next.Generation == 0:
 		return fmt.Errorf("%w: generation must be positive", ErrGenerationRegression)
 	case prev.Generation == 0:

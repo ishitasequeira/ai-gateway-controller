@@ -162,7 +162,7 @@ func main() {
 		Log: ctrl.Log.WithName("external-model"),
 	}
 	if err := modelReconciler.SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to set up ExternalModel reconciler")
+		setupLog.Error(err, "unable to set up ExternalModel and ExternalProvider reconcilers")
 		os.Exit(1)
 	}
 

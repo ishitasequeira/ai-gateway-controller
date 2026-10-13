@@ -84,6 +84,48 @@ if [[ -z "$RESOLVED_TENANT_NAMESPACE" || "$RESOLVED_TENANT_NAMESPACE" != "$OPENS
 fi
 wait_json "AITenant Ready" "${OC[*]} get aitenant $AITENANT_NAME -n ai-tenants -o json | jq -e '[.status.conditions[]? | select(.type==\"Ready\" and .status==\"True\")] | length == 1' >/dev/null" || { record 2 "AITenant Ready" FAIL maas "MaaS did not report Ready"; exit 1; }
 record 2 "AITenant Ready" PASS maas "MaaS reported Ready"
+# A provider with no ExternalModel reference must still validate credentials,
+# install provider transport, and publish Ready. Keep this resource run-owned
+# so the normal destroy path removes it from the shared E2E tenant namespace.
+STANDALONE_SUFFIX=${OPENSHIFT_E2E_RUN_ID//-/}
+STANDALONE_SUFFIX=${STANDALONE_SUFFIX: -8}
+STANDALONE_PROVIDER="provider-only-$STANDALONE_SUFFIX"
+STANDALONE_ENDPOINT="standalone-$STANDALONE_SUFFIX.e2e.example.com"
+"${OC[@]}" apply -f - <<EOF >"$OUT/provider-only-apply.log"
+apiVersion: inference.opendatahub.io/v1alpha1
+kind: ExternalProvider
+metadata:
+  name: $STANDALONE_PROVIDER
+  namespace: $OPENSHIFT_E2E_TENANT_NAMESPACE
+  labels:
+    external-model-praxis.opendatahub.io/run-id: $OPENSHIFT_E2E_RUN_ID
+    app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e
+spec:
+  provider: openai
+  endpoint: $STANDALONE_ENDPOINT
+  auth:
+    type: apikey
+    secretRef:
+      name: provider-credentials
+EOF
+wait_json "standalone provider Ready" "${OC[*]} get externalprovider $STANDALONE_PROVIDER -n $OPENSHIFT_E2E_TENANT_NAMESPACE -o json | jq -e '.status.phase == \"Ready\" and .status.observedGeneration == .metadata.generation and ([.status.conditions[]? | select(.type==\"Ready\" and .status==\"True\")] | length == 1)' >/dev/null" || { record provider-only "ExternalProvider Ready without model reference" FAIL controller "provider-only status did not converge"; exit 1; }
+if ! "${OC[@]}" get externalmodel -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -o json |
+  jq -e --arg provider "$STANDALONE_PROVIDER" '[.items[] | .spec.externalProviderRefs[]? | select(.ref.name == $provider)] | length == 0' >/dev/null; then
+  record provider-only "ExternalProvider Ready without model reference" FAIL controller "an ExternalModel unexpectedly references the provider"
+  exit 1
+fi
+standalone_provider_transport_ready() {
+  local service service_entry destination_rule
+  service=$("${OC[@]}" get service "provider-$STANDALONE_PROVIDER" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -o json) || return 1
+  service_entry=$("${OC[@]}" get serviceentry "provider-$STANDALONE_PROVIDER" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -o json) || return 1
+  destination_rule=$("${OC[@]}" get destinationrules -n "$OPENSHIFT_E2E_GATEWAY_NAMESPACE" \
+    -l "app.kubernetes.io/managed-by=ai-gateway-controller,inference.opendatahub.io/external-provider=$STANDALONE_PROVIDER,inference.opendatahub.io/external-tenant=$OPENSHIFT_E2E_TENANT_NAMESPACE" -o json) || return 1
+  jq -e --arg endpoint "$STANDALONE_ENDPOINT" '.spec.type == "ExternalName" and .spec.externalName == $endpoint' <<<"$service" >/dev/null &&
+    jq -e --arg endpoint "$STANDALONE_ENDPOINT" '.spec.hosts | index($endpoint) != null' <<<"$service_entry" >/dev/null &&
+    jq -e --arg endpoint "$STANDALONE_ENDPOINT" '[.items[] | select(.spec.host == $endpoint and .spec.trafficPolicy.tls.sni == $endpoint)] | length == 1' <<<"$destination_rule" >/dev/null
+}
+wait_json "standalone provider transport" standalone_provider_transport_ready || { record provider-only "ExternalProvider transport without model reference" FAIL transport "provider Service, ServiceEntry, or Gateway DestinationRule did not converge"; exit 1; }
+record provider-only "ExternalProvider Ready without model reference" PASS controller "status Ready and Service, ServiceEntry, and Gateway DestinationRule exist with no ExternalModel reference"
 CURRENT_ASSERTION="ExternalProvider Ready"
 wait_json "provider Ready" "${OC[*]} get externalprovider provider-a -n $OPENSHIFT_E2E_TENANT_NAMESPACE -o json | jq -e '.status.phase == \"Ready\"' >/dev/null" || { record 3 "ExternalProvider Ready" FAIL controller "provider status did not converge"; exit 1; }
 record 3 "ExternalProvider Ready" PASS controller "status.phase=Ready"

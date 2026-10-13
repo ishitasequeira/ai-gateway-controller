@@ -55,13 +55,15 @@ const (
 	externalModelExtProcFilter    = "envoy.filters.http.ext_proc.external-model"
 	modelRoutePrefix              = "external-model-"
 	externalModelFinalizer        = "inference.opendatahub.io/external-model-cleanup"
+	externalProviderFinalizer     = "inference.opendatahub.io/external-provider-cleanup"
 )
 
 var errCredentialNotReady = errors.New("effective provider credential is not ready")
 
-// Reconciler is the sole writer for the ExternalModel transport plane and the
-// routing overlay. It resolves one namespace-scoped route set and renders both
-// planes from that same result.
+// Reconciler coordinates Praxis ExternalModel routes and ExternalProvider
+// transport. The model loop resolves one namespace-scoped route set and
+// renders the serving resources and routing overlay from that result; the
+// provider loop provisions provider transport even when no models exist.
 type Reconciler struct {
 	client.Client
 	// APIReader reads referenced Secret data directly from the API server. The
@@ -87,14 +89,13 @@ type Reconciler struct {
 	PublishOverlay func(context.Context, *resolver.ResolvedRouteSet, envelope.Scope, envelope.Options) (publisher.Result, error)
 }
 
-// SetupWithManager registers model, provider, Secret, MaasTenantConfig, and
-// AITenant watches. Provider, Secret, and MaasTenantConfig changes fan out to
-// affected models in the same namespace; AITenant changes fan out to models
-// in its resolved tenant namespace because status and Gateway identity remain
-// owned by AITenant.
+// SetupWithManager registers the ExternalModel and ExternalProvider loops,
+// along with their shared tenant and Secret watches. Provider and Secret
+// changes fan out to models that reference the provider; Secret and tenant
+// changes also reconcile providers independently of any model.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	inScope := predicate.NewPredicateFuncs(func(obj client.Object) bool { return r.namespaceAllowed(obj.GetNamespace()) })
-	return builder.ControllerManagedBy(mgr).
+	if err := builder.ControllerManagedBy(mgr).
 		For(&v1alpha1.ExternalModel{}, builder.WithPredicates(inScope)).
 		Watches(&v1alpha1.ExternalProvider{}, handler.EnqueueRequestsFromMapFunc(r.providerModels), builder.WithPredicates(inScope)).
 		WatchesMetadata(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.secretModels), builder.WithPredicates(inScope)).
@@ -106,7 +107,67 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(r.serviceModels), builder.WithPredicates(inScope)).
 		WatchesRawSource(source.Kind(mgr.GetCache(), tenant.NewMaasTenantConfig(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.maasTenantConfigModels))).
 		WatchesRawSource(source.Kind(mgr.GetCache(), tenant.NewAITenant(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.tenantModels))).
-		Complete(r)
+		Complete(r); err != nil {
+		return err
+	}
+	return builder.ControllerManagedBy(mgr).
+		For(&v1alpha1.ExternalProvider{}, builder.WithPredicates(inScope)).
+		WatchesMetadata(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.secretProviders), builder.WithPredicates(inScope)).
+		WatchesRawSource(source.Kind(mgr.GetCache(), tenant.NewMaasTenantConfig(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.tenantProviders))).
+		WatchesRawSource(source.Kind(mgr.GetCache(), tenant.NewAITenant(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.aitenantProviders))).
+		Complete(&providerReconciler{Reconciler: r})
+}
+
+type providerReconciler struct{ *Reconciler }
+
+func (r *providerReconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
+	return r.ReconcileProvider(ctx, req)
+}
+
+func (r *Reconciler) secretProviders(ctx context.Context, obj client.Object) []reconcile.Request {
+	if !r.namespaceAllowed(obj.GetNamespace()) {
+		return nil
+	}
+	var providers v1alpha1.ExternalProviderList
+	if err := r.List(ctx, &providers, client.InNamespace(obj.GetNamespace())); err != nil {
+		r.Log.Error(err, "list providers for Secret event", "secret", obj.GetName())
+		return nil
+	}
+	requests := make([]reconcile.Request, 0, len(providers.Items))
+	for i := range providers.Items {
+		if providers.Items[i].Spec.Auth.SecretRef.Name == obj.GetName() {
+			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&providers.Items[i])})
+		}
+	}
+	return requests
+}
+
+func (r *Reconciler) tenantProviders(ctx context.Context, mtc *unstructured.Unstructured) []reconcile.Request {
+	return r.providersInNamespace(ctx, mtc.GetNamespace())
+}
+
+func (r *Reconciler) aitenantProviders(ctx context.Context, ait *unstructured.Unstructured) []reconcile.Request {
+	ns, _, _ := unstructured.NestedString(ait.Object, "status", "tenantNamespace")
+	if ns == "" {
+		ns = ait.GetNamespace()
+	}
+	return r.providersInNamespace(ctx, ns)
+}
+
+func (r *Reconciler) providersInNamespace(ctx context.Context, namespace string) []reconcile.Request {
+	if !r.namespaceAllowed(namespace) {
+		return nil
+	}
+	var providers v1alpha1.ExternalProviderList
+	if err := r.List(ctx, &providers, client.InNamespace(namespace)); err != nil {
+		r.Log.Error(err, "list providers for tenant event", "namespace", namespace)
+		return nil
+	}
+	requests := make([]reconcile.Request, 0, len(providers.Items))
+	for i := range providers.Items {
+		requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&providers.Items[i])})
+	}
+	return requests
 }
 
 func (r *Reconciler) providerModels(ctx context.Context, obj client.Object) []reconcile.Request {
@@ -207,41 +268,140 @@ func (r *Reconciler) modelsReferencingProviders(ctx context.Context, namespace s
 	return requests
 }
 
-// providerInputs validates providers before building the route set. The
-// persisted phase is informational and may have been written by the
-// handoff-side IPP controller; the Secret and transport reconciliation below
-// are the authoritative gates for Praxis. Invalid providers remain excluded
-// and fail closed.
-func (r *Reconciler) providerInputs(ctx context.Context, namespace string) (
-	v1alpha1.ExternalProviderList, []*v1alpha1.ExternalProvider,
-	[]*v1alpha1.ExternalProvider, error,
-) {
+// providerInputs returns only providers whose persisted readiness covers their
+// current spec. ExternalProvider reconciliation is the sole writer of that
+// status and of provider transport resources.
+func (r *Reconciler) providerInputs(ctx context.Context, namespace string) ([]*v1alpha1.ExternalProvider, error) {
 	var providers v1alpha1.ExternalProviderList
 	if err := r.List(ctx, &providers, client.InNamespace(namespace)); err != nil {
-		return providers, nil, nil, err
+		return nil, err
 	}
 	providerPtrs := make([]*v1alpha1.ExternalProvider, 0, len(providers.Items))
-	validProviders := make([]*v1alpha1.ExternalProvider, 0, len(providers.Items))
 	for i := range providers.Items {
 		p := &providers.Items[i]
-		if err := r.validateProvider(ctx, p); err != nil {
-			if statusErr := r.updateProviderStatus(ctx, p, false, reasonReconcileFailed, err.Error()); statusErr != nil {
-				return providers, nil, nil, statusErr
-			}
+		if !p.DeletionTimestamp.IsZero() || p.Status.Phase != resolver.PhaseReady || p.Status.ObservedGeneration != p.Generation {
 			continue
 		}
-		ready := p.DeepCopy()
-		if ready.Status.Phase != resolver.PhaseReady {
-			ready.Status.Phase = resolver.PhaseReady
-		}
-		providerPtrs = append(providerPtrs, ready)
-		validProviders = append(validProviders, p)
+		providerPtrs = append(providerPtrs, p)
 	}
-	return providers, providerPtrs, validProviders, nil
+	return providerPtrs, nil
 }
 
-// Reconcile applies provider resources, then model routes, then the overlay.
-// The overlay is never published when an earlier stage fails.
+// ReconcileProvider owns provider-level transport and persisted readiness. It
+// deliberately does not require an ExternalModel: provider creation and
+// credential rotation must be observable before any model references it.
+func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
+	if !r.namespaceAllowed(req.Namespace) {
+		return reconcile.Result{}, nil
+	}
+	var provider v1alpha1.ExternalProvider
+	if err := r.Get(ctx, req.NamespacedName, &provider); err != nil {
+		if apierrors.IsNotFound(err) {
+			// Clean resources left by a provider that predated the provider
+			// finalizer. All cleanup remains label-gated to this provider.
+			return reconcile.Result{}, r.cleanupProviderTransport(ctx, req.Namespace, req.Name)
+		}
+		return reconcile.Result{}, err
+	}
+	if !provider.DeletionTimestamp.IsZero() {
+		if !controllerutil.ContainsFinalizer(&provider, externalProviderFinalizer) {
+			return reconcile.Result{}, r.cleanupProviderTransport(ctx, provider.Namespace, provider.Name)
+		}
+		if err := r.cleanupProviderTransport(ctx, provider.Namespace, provider.Name); err != nil {
+			return reconcile.Result{}, err
+		}
+		return reconcile.Result{}, r.removeExternalProviderFinalizer(ctx, &provider)
+	}
+
+	live, err := r.liveTenantResolution(ctx, provider.Namespace)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	// An explicit IPP selection is a handoff command. Remove only resources
+	// owned by Praxis and release our finalizer; IPP remains the status owner.
+	if !live.missingConfig && !live.selected {
+		if err := r.cleanupProviderTransport(ctx, provider.Namespace, provider.Name); err != nil {
+			return reconcile.Result{}, err
+		}
+		if controllerutil.ContainsFinalizer(&provider, externalProviderFinalizer) {
+			return reconcile.Result{}, r.removeExternalProviderFinalizer(ctx, &provider)
+		}
+		return reconcile.Result{}, nil
+	}
+	if live.missingConfig || live.mtc == nil || live.aitenant == nil ||
+		!live.mtc.GetDeletionTimestamp().IsZero() || !live.aitenant.GetDeletionTimestamp().IsZero() ||
+		live.status != tenant.PayloadProcessingStatusSteady || !tenant.IsActive(live.aitenant) ||
+		!tenant.StatusIsCurrent(live.aitenant) {
+		return reconcile.Result{}, nil
+	}
+	gatewayName, gatewayNamespace, gatewayReady := tenant.GatewayRef(live.aitenant)
+	if !gatewayReady {
+		return reconcile.Result{}, nil
+	}
+	want := modelTenantContext{
+		aitenantUID: live.aitenant.GetUID(), mtcUID: live.mtc.GetUID(),
+		gatewayName: gatewayName, gatewayNamespace: gatewayNamespace,
+	}
+
+	validationErr := r.validateProvider(ctx, &provider)
+	if validationErr == nil {
+		validationErr = r.validateProviderCredential(ctx, &provider)
+	}
+	if validationErr != nil {
+		cleanupErr := r.cleanupProviderTransport(ctx, provider.Namespace, provider.Name)
+		if statusErr := r.updateProviderStatus(ctx, &provider, false, reasonReconcileFailed, validationErr.Error()); statusErr != nil {
+			return reconcile.Result{}, statusErr
+		}
+		if cleanupErr != nil {
+			return reconcile.Result{}, cleanupErr
+		}
+		return reconcile.Result{}, nil
+	}
+
+	if err := r.ensureExternalProviderFinalizer(ctx, &provider); err != nil {
+		return reconcile.Result{}, err
+	}
+	valid, err := r.livePraxisBeforeWrite(ctx, provider.Namespace, want)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	if !valid {
+		return reconcile.Result{Requeue: true}, nil
+	}
+	err = r.applyProviderTransport(ctx, &provider, tenant.ID(live.aitenant.GetName()), gatewayName, gatewayNamespace)
+	if err == nil {
+		err = r.cleanupStaleProviderDestinationRules(ctx, &provider, gatewayName, gatewayNamespace)
+	}
+	if err != nil {
+		cleanupErr := r.cleanupProviderTransport(ctx, provider.Namespace, provider.Name)
+		if statusErr := r.updateProviderStatus(ctx, &provider, false, reasonReconcileFailed, err.Error()); statusErr != nil {
+			return reconcile.Result{}, statusErr
+		}
+		if cleanupErr != nil {
+			return reconcile.Result{}, fmt.Errorf("%w; clean up partially applied provider transport: %w", err, cleanupErr)
+		}
+		return reconcile.Result{}, err
+	}
+	if err := r.updateProviderStatus(ctx, &provider, true, reasonReconciled, "provider Secret reference and transport resources are ready"); err != nil {
+		return reconcile.Result{}, err
+	}
+	return reconcile.Result{}, nil
+}
+
+func (r *Reconciler) ensureExternalProviderFinalizer(ctx context.Context, provider *v1alpha1.ExternalProvider) error {
+	if controllerutil.ContainsFinalizer(provider, externalProviderFinalizer) {
+		return nil
+	}
+	base := provider.DeepCopy()
+	controllerutil.AddFinalizer(provider, externalProviderFinalizer)
+	if err := r.Patch(ctx, provider, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
+		return fmt.Errorf("add ExternalProvider cleanup finalizer: %w", err)
+	}
+	return nil
+}
+
+// Reconcile applies model routes, then the routing overlay. The overlay is
+// never published when an earlier stage fails.
 func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	if !r.namespaceAllowed(req.Namespace) {
 		return reconcile.Result{}, nil
@@ -292,7 +452,7 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 	if err := r.List(ctx, &models, client.InNamespace(req.Namespace)); err != nil {
 		return reconcile.Result{}, err
 	}
-	providers, providerPtrs, validProviders, err := r.providerInputs(ctx, req.Namespace)
+	providerPtrs, err := r.providerInputs(ctx, req.Namespace)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
@@ -305,10 +465,6 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 		}
 		modelPtrs = append(modelPtrs, &models.Items[i])
 		modelOwners[models.Items[i].Name] = &models.Items[i]
-	}
-	providerOwners := make(map[string]*v1alpha1.ExternalProvider, len(providers.Items))
-	for i := range providers.Items {
-		providerOwners[providers.Items[i].Name] = &providers.Items[i]
 	}
 	set, err := resolver.Resolve(modelPtrs, providerPtrs)
 	if err != nil {
@@ -346,7 +502,7 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 		if err := r.deleteLegacyExternalModelRouteFilter(ctx, tenant.ID(modelTenant.aitenant.GetName())); err != nil {
 			return reconcile.Result{}, err
 		}
-		if cleanupErr := r.cleanupTransport(ctx, req.Namespace, gatewayName, gatewayNamespace, nil); cleanupErr != nil {
+		if cleanupErr := r.cleanupModelTransport(ctx, req.Namespace, nil); cleanupErr != nil {
 			return reconcile.Result{}, cleanupErr
 		}
 		if cleanupErr := r.cleanupOverlay(ctx, req.Namespace); cleanupErr != nil {
@@ -358,12 +514,7 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 		}
 		return reconcile.Result{}, resolver.ErrNoRoutes
 	}
-	if err := r.applyTransport(ctx, set.Routes(), req.Namespace, tenant.ID(modelTenant.aitenant.GetName()), gatewayName, gatewayNamespace, modelOwners, providerOwners); err != nil {
-		for _, p := range validProviders {
-			if statusErr := r.updateProviderStatus(ctx, p, false, reasonReconcileFailed, err.Error()); statusErr != nil {
-				return reconcile.Result{}, statusErr
-			}
-		}
+	if err := r.applyTransport(ctx, set.Routes(), req.Namespace, tenant.ID(modelTenant.aitenant.GetName()), gatewayName, gatewayNamespace, modelOwners); err != nil {
 		if statusErr := report(false, reasonReconcileFailed, err.Error(), nil); statusErr != nil {
 			return reconcile.Result{}, statusErr
 		}
@@ -372,18 +523,12 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 	if err := r.cleanupExternalModelRouteFilters(ctx, req.Namespace, tenant.ID(modelTenant.aitenant.GetName()), gatewayName, gatewayNamespace); err != nil {
 		return reconcile.Result{}, err
 	}
-	if err := r.cleanupTransport(ctx, req.Namespace, gatewayName, gatewayNamespace, set.Routes()); err != nil {
+	if err := r.cleanupModelTransport(ctx, req.Namespace, set.Routes()); err != nil {
 		if statusErr := report(false, reasonReconcileFailed, err.Error(), nil); statusErr != nil {
 			return reconcile.Result{}, statusErr
 		}
 		return reconcile.Result{}, err
 	}
-	for _, p := range validProviders {
-		if statusErr := r.updateProviderStatus(ctx, p, true, reasonReconciled, "provider Secret reference and transport resources are ready"); statusErr != nil {
-			return reconcile.Result{}, statusErr
-		}
-	}
-
 	pub, err := publisher.New(r.Client, publisher.Config{Namespace: req.Namespace, Name: r.ConfigMap})
 	if err != nil {
 		return reconcile.Result{}, err
@@ -508,7 +653,7 @@ func (r *Reconciler) cleanupUnselectedModel(ctx context.Context, model *v1alpha1
 			return err
 		}
 	}
-	if err := r.cleanupTransport(ctx, model.Namespace, "", "", nil); err != nil {
+	if err := r.cleanupModelTransport(ctx, model.Namespace, nil); err != nil {
 		return err
 	}
 	if err := r.cleanupOverlay(ctx, model.Namespace); err != nil {
@@ -564,7 +709,7 @@ func (r *Reconciler) reconcileDeletedModelWithoutOwner(ctx context.Context, dele
 	if err := r.deleteExternalModelRouteFiltersForTenant(ctx, deleted.Namespace); err != nil {
 		return err
 	}
-	if err := r.cleanupTransport(ctx, deleted.Namespace, "", "", nil); err != nil {
+	if err := r.cleanupModelTransport(ctx, deleted.Namespace, nil); err != nil {
 		return err
 	}
 	if err := r.cleanupOverlay(ctx, deleted.Namespace); err != nil {
@@ -638,13 +783,9 @@ func (r *Reconciler) republishHomeWithout(ctx context.Context, deleted *v1alpha1
 		modelPtrs = append(modelPtrs, m)
 		modelOwners[m.Name] = m
 	}
-	providers, providerPtrs, _, err := r.providerInputs(ctx, deleted.Namespace)
+	providerPtrs, err := r.providerInputs(ctx, deleted.Namespace)
 	if err != nil {
 		return err
-	}
-	providerOwners := make(map[string]*v1alpha1.ExternalProvider, len(providers.Items))
-	for i := range providers.Items {
-		providerOwners[providers.Items[i].Name] = &providers.Items[i]
 	}
 	set, err := resolver.Resolve(modelPtrs, providerPtrs)
 	if errors.Is(err, resolver.ErrNoRoutes) {
@@ -662,7 +803,7 @@ func (r *Reconciler) republishHomeWithout(ctx context.Context, deleted *v1alpha1
 				return err
 			}
 		}
-		if err := r.cleanupTransport(ctx, deleted.Namespace, gatewayName, gatewayNamespace, nil); err != nil {
+		if err := r.cleanupModelTransport(ctx, deleted.Namespace, nil); err != nil {
 			return err
 		}
 		return r.cleanupOverlay(ctx, deleted.Namespace)
@@ -673,7 +814,7 @@ func (r *Reconciler) republishHomeWithout(ctx context.Context, deleted *v1alpha1
 	if err := r.validateResolvedCredentials(ctx, set.Routes()); err != nil {
 		return fmt.Errorf("validate remaining ExternalModel credentials after deletion: %w", err)
 	}
-	if err := r.applyTransport(ctx, set.Routes(), deleted.Namespace, tenantID, gatewayName, gatewayNamespace, modelOwners, providerOwners); err != nil {
+	if err := r.applyTransport(ctx, set.Routes(), deleted.Namespace, tenantID, gatewayName, gatewayNamespace, modelOwners); err != nil {
 		return fmt.Errorf("rebuild transport after ExternalModel deletion: %w", err)
 	}
 	if err := r.cleanupExternalModelRouteFilters(ctx, deleted.Namespace, tenantID, gatewayName, gatewayNamespace); err != nil {
@@ -682,7 +823,7 @@ func (r *Reconciler) republishHomeWithout(ctx context.Context, deleted *v1alpha1
 	if err := r.deleteLegacyExternalModelRouteFilter(ctx, tenantID); err != nil {
 		return err
 	}
-	if err := r.cleanupTransport(ctx, deleted.Namespace, gatewayName, gatewayNamespace, set.Routes()); err != nil {
+	if err := r.cleanupModelTransport(ctx, deleted.Namespace, set.Routes()); err != nil {
 		return err
 	}
 	pub, err := publisher.New(r.Client, publisher.Config{Namespace: deleted.Namespace, Name: r.ConfigMap})
@@ -714,61 +855,132 @@ func (r *Reconciler) removeExternalModelFinalizer(ctx context.Context, model *v1
 	return nil
 }
 
-func (r *Reconciler) cleanupTransport(ctx context.Context, namespace, gatewayName, gatewayNamespace string, routes []resolver.Route) error {
-	providers := map[string]bool{}
+func (r *Reconciler) cleanupModelTransport(ctx context.Context, namespace string, routes []resolver.Route) error {
 	models := map[string]bool{}
 	for _, route := range routes {
-		providers[route.Provider] = true
 		models[route.Model] = true
 	}
 	resources := []struct {
 		kind, group, version, label string
 		keep                        map[string]bool
 	}{
-		{"Service", "", "v1", "inference.opendatahub.io/external-provider", providers},
 		{"Service", "", "v1", "inference.opendatahub.io/external-model", models},
-		{"ServiceEntry", "networking.istio.io", "v1", "inference.opendatahub.io/external-provider", providers},
-		{"DestinationRule", "networking.istio.io", "v1", "inference.opendatahub.io/external-provider", providers},
 		{"HTTPRoute", "gateway.networking.k8s.io", "v1", "inference.opendatahub.io/external-model", models},
 	}
 	for _, resource := range resources {
-		namespaces := []string{namespace}
-		listOptions := []client.ListOption{client.MatchingLabels{"app.kubernetes.io/managed-by": "ai-gateway-controller"}}
-		if resource.kind == "DestinationRule" {
-			// DestinationRules are Gateway-local and may survive in a
-			// previous Gateway namespace. The tenant ownership label is
-			// required before listing cluster-wide; provider name and
-			// managed-by alone are not a safe ownership key in a shared
-			// Gateway namespace.
-			namespaces = []string{""}
-			listOptions = append(listOptions, client.MatchingLabels{externalTenantLabel: namespace})
+		list := &unstructured.UnstructuredList{}
+		list.SetGroupVersionKind(schema.GroupVersionKind{Group: resource.group, Version: resource.version, Kind: resource.kind + "List"})
+		if err := r.List(ctx, list, client.InNamespace(namespace), client.MatchingLabels{"app.kubernetes.io/managed-by": "ai-gateway-controller"}); err != nil {
+			return fmt.Errorf("list stale %s resources: %w", resource.kind, err)
 		}
-		for _, resourceNamespace := range namespaces {
-			list := &unstructured.UnstructuredList{}
-			list.SetGroupVersionKind(schema.GroupVersionKind{Group: resource.group, Version: resource.version, Kind: resource.kind + "List"})
-			if err := r.List(ctx, list, append([]client.ListOption{client.InNamespace(resourceNamespace)}, listOptions...)...); err != nil {
-				return fmt.Errorf("list stale %s resources: %w", resource.kind, err)
-			}
-			for i := range list.Items {
-				name := list.Items[i].GetLabels()[resource.label]
-				keep := resource.keep[name]
-				if resource.kind == "DestinationRule" {
-					labels := list.Items[i].GetLabels()
-					// A provider name is not a sufficient keep key in a
-					// shared Gateway namespace. Keep only the copy rendered
-					// for this tenant's current Gateway. Empty routes are a
-					// full cleanup request for this tenant's labeled rules.
-					keep = keep && gatewayName != "" && gatewayNamespace != "" &&
-						labels[externalGatewayNameLabel] == gatewayName &&
-						labels[externalGatewayNamespaceLabel] == gatewayNamespace
-				}
-				if name != "" && !keep {
-					if err := r.Delete(ctx, &list.Items[i]); client.IgnoreNotFound(err) != nil {
-						return fmt.Errorf("delete stale %s %s/%s: %w", resource.kind, resourceNamespace, list.Items[i].GetName(), err)
-					}
+		for i := range list.Items {
+			name := list.Items[i].GetLabels()[resource.label]
+			if name != "" && !resource.keep[name] {
+				if err := r.Delete(ctx, &list.Items[i]); client.IgnoreNotFound(err) != nil {
+					return fmt.Errorf("delete stale %s %s/%s: %w", resource.kind, namespace, list.Items[i].GetName(), err)
 				}
 			}
 		}
+	}
+	return nil
+}
+
+func (r *Reconciler) applyProviderTransport(ctx context.Context, provider *v1alpha1.ExternalProvider, tenantID, gatewayName, gatewayNamespace string) error {
+	route := resolver.Route{
+		Namespace: provider.Namespace, Provider: provider.Name, ProviderType: provider.Spec.Provider,
+		Endpoint: provider.Spec.Endpoint, TLSCACertificates: strings.TrimSpace(provider.Spec.Config["tls.caCertificates"]),
+	}
+	service := providerService(route, provider.Namespace)
+	serviceEntry := providerServiceEntry(route, provider.Namespace)
+	setOwnerReference(&service, provider)
+	setOwnerReference(&serviceEntry, provider)
+	resources := []unstructured.Unstructured{
+		service,
+		serviceEntry,
+		providerDestinationRuleAtGateway(route, gatewayName, gatewayNamespace, tenantID),
+	}
+	for _, resource := range resources {
+		if r.ApplyResource != nil {
+			if err := r.ApplyResource(ctx, r.Client, resource); err != nil {
+				return fmt.Errorf("apply provider %s %s/%s: %w", provider.Name, resource.GetKind(), resource.GetNamespace(), err)
+			}
+			continue
+		}
+		if err := render.Apply(ctx, r.Client, []unstructured.Unstructured{resource}); err != nil {
+			return fmt.Errorf("apply provider %s %s/%s: %w", provider.Name, resource.GetKind(), resource.GetNamespace(), err)
+		}
+	}
+	return nil
+}
+
+func (r *Reconciler) cleanupProviderTransport(ctx context.Context, namespace, providerName string) error {
+	for _, resource := range []struct {
+		group, version, kind string
+	}{
+		{group: "", version: "v1", kind: "Service"},
+		{group: "networking.istio.io", version: "v1", kind: "ServiceEntry"},
+	} {
+		list := &unstructured.UnstructuredList{}
+		list.SetGroupVersionKind(schema.GroupVersionKind{Group: resource.group, Version: resource.version, Kind: resource.kind + "List"})
+		if err := r.List(ctx, list, client.InNamespace(namespace), client.MatchingLabels{
+			"app.kubernetes.io/managed-by":               "ai-gateway-controller",
+			"inference.opendatahub.io/external-provider": providerName,
+		}); err != nil {
+			return fmt.Errorf("list provider %s %s resources for cleanup: %w", providerName, resource.kind, err)
+		}
+		for i := range list.Items {
+			if err := client.IgnoreNotFound(r.Delete(ctx, &list.Items[i])); err != nil {
+				return fmt.Errorf("delete provider %s %s %s/%s: %w", providerName, resource.kind, namespace, list.Items[i].GetName(), err)
+			}
+		}
+	}
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1", Kind: "DestinationRuleList"})
+	if err := r.List(ctx, list, client.MatchingLabels{
+		"app.kubernetes.io/managed-by":               "ai-gateway-controller",
+		externalTenantLabel:                          namespace,
+		"inference.opendatahub.io/external-provider": providerName,
+	}); err != nil {
+		return fmt.Errorf("list provider %s DestinationRules for cleanup: %w", providerName, err)
+	}
+	for i := range list.Items {
+		if err := client.IgnoreNotFound(r.Delete(ctx, &list.Items[i])); err != nil {
+			return fmt.Errorf("delete provider %s DestinationRule %s/%s: %w", providerName, list.Items[i].GetNamespace(), list.Items[i].GetName(), err)
+		}
+	}
+	return nil
+}
+
+func (r *Reconciler) cleanupStaleProviderDestinationRules(ctx context.Context, provider *v1alpha1.ExternalProvider, gatewayName, gatewayNamespace string) error {
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1", Kind: "DestinationRuleList"})
+	if err := r.List(ctx, list, client.MatchingLabels{
+		"app.kubernetes.io/managed-by":               "ai-gateway-controller",
+		externalTenantLabel:                          provider.Namespace,
+		"inference.opendatahub.io/external-provider": provider.Name,
+	}); err != nil {
+		return fmt.Errorf("list stale provider DestinationRules: %w", err)
+	}
+	for i := range list.Items {
+		obj := &list.Items[i]
+		labels := obj.GetLabels()
+		if labels[externalGatewayNameLabel] == gatewayName && labels[externalGatewayNamespaceLabel] == gatewayNamespace && obj.GetNamespace() == gatewayNamespace {
+			continue
+		}
+		if err := client.IgnoreNotFound(r.Delete(ctx, obj)); err != nil {
+			return fmt.Errorf("delete stale provider DestinationRule %s/%s: %w", obj.GetNamespace(), obj.GetName(), err)
+		}
+	}
+	return nil
+}
+
+func (r *Reconciler) removeExternalProviderFinalizer(ctx context.Context, provider *v1alpha1.ExternalProvider) error {
+	base := provider.DeepCopy()
+	if !controllerutil.RemoveFinalizer(provider, externalProviderFinalizer) {
+		return nil
+	}
+	if err := r.Patch(ctx, provider, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
+		return fmt.Errorf("remove ExternalProvider cleanup finalizer: %w", err)
 	}
 	return nil
 }
@@ -919,6 +1131,25 @@ func (r *Reconciler) validateProvider(_ context.Context, p *v1alpha1.ExternalPro
 	if p.Spec.Auth.SecretRef.Name == "" {
 		return errors.New("auth.secretRef.name is required")
 	}
+	if caCertificates := strings.TrimSpace(p.Spec.Config["tls.caCertificates"]); caCertificates != "" &&
+		(!strings.HasPrefix(caCertificates, "/") || strings.Contains(caCertificates, "..")) {
+		return errors.New("config tls.caCertificates must be an absolute mounted file path")
+	}
+	return nil
+}
+
+func (r *Reconciler) validateProviderCredential(ctx context.Context, p *v1alpha1.ExternalProvider) error {
+	if r.APIReader == nil {
+		return errors.New("APIReader is required for credential Secret reads")
+	}
+	key := client.ObjectKey{Namespace: p.Namespace, Name: p.Spec.Auth.SecretRef.Name}
+	var secret corev1.Secret
+	if err := r.APIReader.Get(ctx, key, &secret); err != nil {
+		return fmt.Errorf("provider credential Secret %s/%s is not ready: %w", key.Namespace, key.Name, err)
+	}
+	if _, ok := secret.Data["api-key"]; !ok {
+		return fmt.Errorf("provider credential Secret %s/%s is missing key api-key", key.Namespace, key.Name)
+	}
 	return nil
 }
 
@@ -961,32 +1192,9 @@ func (r *Reconciler) namespaceAllowed(namespace string) bool {
 }
 
 func (r *Reconciler) applyTransport(ctx context.Context, routes []resolver.Route, modelNamespace, tenantID, gatewayName,
-	gatewayNamespace string, modelOwners map[string]*v1alpha1.ExternalModel,
-	providerOwners map[string]*v1alpha1.ExternalProvider) error {
-	resources := make([]unstructured.Unstructured, 0, len(routes)*3+len(routes))
+	gatewayNamespace string, modelOwners map[string]*v1alpha1.ExternalModel) error {
+	resources := make([]unstructured.Unstructured, 0, len(routes))
 	seen := map[string]bool{}
-	for _, route := range routes {
-		for _, obj := range []unstructured.Unstructured{
-			providerService(route, modelNamespace),
-			providerServiceEntry(route, modelNamespace),
-			providerDestinationRuleAtGateway(route, gatewayName, gatewayNamespace, tenantID),
-		} {
-			if owner := providerOwners[route.Provider]; owner != nil && owner.GetNamespace() == obj.GetNamespace() {
-				setOwnerReference(&obj, owner)
-			} else if obj.GetKind() == "DestinationRule" {
-				// Gateway-local rules cannot be owned by the tenant-local
-				// ExternalProvider. Explicitly clear any owner reference from
-				// an older reconciliation so Kubernetes does not garbage-collect
-				// the cross-namespace rule.
-				obj.SetOwnerReferences([]metav1.OwnerReference{})
-			}
-			key := obj.GetKind() + "/" + obj.GetNamespace() + "/" + obj.GetName()
-			if !seen[key] {
-				resources = append(resources, obj)
-				seen[key] = true
-			}
-		}
-	}
 	models := map[string][]resolver.Route{}
 	for _, route := range routes {
 		models[route.Model] = append(models[route.Model], route)

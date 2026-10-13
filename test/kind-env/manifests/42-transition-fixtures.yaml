@@ -54,6 +54,11 @@ rules:
   - externalmodels
   verbs: [get, list, watch, create, update]
 - apiGroups:
+  - inference.opendatahub.io
+  resources:
+  - externalproviders
+  verbs: [patch]
+- apiGroups:
   - maas.opendatahub.io
   resources:
   - externalmodels

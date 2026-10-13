@@ -282,6 +282,9 @@ func TestRender_RevisionLifecycle(t *testing.T) {
 		t.Errorf("content change must bump gen and change digest: gen=%d value=%s",
 			second.Provenance.SourceGeneration, second.Revision.Value)
 	}
+	if _, err := Render(set2, scope(), Revision{Generation: 1<<63 - 1, Digest: first.Revision.Value}, Options{}); !errors.Is(err, ErrGenerationRegression) {
+		t.Errorf("generation overflow error = %v, want ErrGenerationRegression", err)
+	}
 }
 
 func ov(candidates []Candidate, policy string) Overlay {
@@ -423,6 +426,8 @@ func TestCheckRevisionTransition(t *testing.T) {
 		{"stable", Revision{Generation: 3, Digest: "a"}, Revision{Generation: 3, Digest: "a"}, false},
 		{"valid bump", Revision{Generation: 3, Digest: "a"}, Revision{Generation: 4, Digest: "b"}, false},
 		{"zero generation", Revision{Generation: 3, Digest: "a"}, Revision{Generation: 0, Digest: "b"}, true},
+		{"negative previous generation", Revision{Generation: -1, Digest: "a"}, Revision{Generation: 1, Digest: "b"}, true},
+		{"negative next generation", Revision{Generation: 1, Digest: "a"}, Revision{Generation: -1, Digest: "b"}, true},
 		{"same digest re-bumped", Revision{Generation: 3, Digest: "a"}, Revision{Generation: 4, Digest: "a"}, true},
 		{"changed digest flat", Revision{Generation: 3, Digest: "a"}, Revision{Generation: 3, Digest: "b"}, true},
 		{"changed digest regressed", Revision{Generation: 3, Digest: "a"}, Revision{Generation: 2, Digest: "b"}, true},

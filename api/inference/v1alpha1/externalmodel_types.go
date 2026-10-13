@@ -151,7 +151,7 @@ type ExternalModelStatus struct {
 
 	// OverlayGeneration is the monotonic source generation distributed to Praxis.
 	// +optional
-	OverlayGeneration uint64 `json:"overlayGeneration,omitempty"`
+	OverlayGeneration int64 `json:"overlayGeneration,omitempty"`
 
 	// Conditions represent the latest available observations of the model's state.
 	// +optional

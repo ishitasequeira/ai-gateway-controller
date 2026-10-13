@@ -203,7 +203,7 @@ func (p *Publisher) Publish(ctx context.Context, set *resolver.ResolvedRouteSet,
 			labelManagedBy: "ai-gateway-controller",
 		}).
 		WithAnnotations(map[string]string{
-			AnnotationSourceGeneration: strconv.FormatUint(env.Provenance.SourceGeneration, 10),
+			AnnotationSourceGeneration: strconv.FormatInt(env.Provenance.SourceGeneration, 10),
 			AnnotationContentDigest:    env.Revision.Value,
 		}).
 		WithData(map[string]string{p.cfg.DataKey: string(data)})

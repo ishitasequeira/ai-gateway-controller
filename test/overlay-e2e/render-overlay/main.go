@@ -41,7 +41,7 @@ func main() {
 	gateway := flag.String("gateway", "praxis", "overlay scope: gateway")
 	localSite := flag.String("local-site", "kind-local", "overlay scope: local_site")
 	sourceUID := flag.String("source-uid", "overlay-e2e", "provenance source_uid")
-	prevGeneration := flag.Uint64("prev-generation", 0, "previous revision generation (0 = first revision)")
+	prevGeneration := flag.Int64("prev-generation", 0, "previous revision generation (0 = first revision)")
 	prevDigest := flag.String("prev-digest", "", "previous revision digest (empty = first revision)")
 	renderedAt := flag.String("rendered-at", "", "RFC3339 rendered_at stamp (default: now)")
 	out := flag.String("out", "", "output path (default: stdout)")

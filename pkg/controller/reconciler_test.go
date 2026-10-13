@@ -850,10 +850,17 @@ func TestExplicitIPPSwitchCleansOnlyTenantDestinationRulesAcrossGatewayMove(t *t
 	ownedCurrent := providerDestinationRuleForTenant(resolver.Route{Provider: "provider-b", Namespace: "tenant-a", Endpoint: "current.example.com"}, "new-gateway-system", "tenant")
 	neighbor := providerDestinationRuleForTenant(resolver.Route{Provider: "provider-a", Namespace: "tenant-b", Endpoint: "neighbor.example.com"}, "new-gateway-system", "tenant-b")
 	foreign := providerDestinationRule(resolver.Route{Provider: "provider-a", Endpoint: "foreign.example.com"}, "old-gateway-system")
-	r := controllerTestClient(t, model, ait, mtc, &ownedOld, &ownedCurrent, &neighbor, &foreign)
+	providerA := &v1alpha1.ExternalProvider{ObjectMeta: metav1.ObjectMeta{Name: "provider-a", Namespace: "tenant-a", Finalizers: []string{externalProviderFinalizer}}}
+	providerB := &v1alpha1.ExternalProvider{ObjectMeta: metav1.ObjectMeta{Name: "provider-b", Namespace: "tenant-a", Finalizers: []string{externalProviderFinalizer}}}
+	r := controllerTestClient(t, model, providerA, providerB, ait, mtc, &ownedOld, &ownedCurrent, &neighbor, &foreign)
 	r.Namespace, r.GatewayNamespace = "tenant-a", "new-gateway-system"
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
 		t.Fatal(err)
+	}
+	for _, provider := range []*v1alpha1.ExternalProvider{providerA, providerB} {
+		if _, err := r.ReconcileProvider(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(provider)}); err != nil {
+			t.Fatalf("provider %s cleanup after IPP switch: %v", provider.Name, err)
+		}
 	}
 	for _, owned := range []*unstructured.Unstructured{&ownedOld, &ownedCurrent} {
 		got := &unstructured.Unstructured{}
@@ -871,14 +878,14 @@ func TestExplicitIPPSwitchCleansOnlyTenantDestinationRulesAcrossGatewayMove(t *t
 	}
 }
 
-func TestDefaultTenantCleanupPreservesNeighborDestinationRule(t *testing.T) {
+func TestProviderCleanupPreservesNeighborDefaultTenantDestinationRule(t *testing.T) {
 	defaultRule := providerDestinationRuleForTenant(resolver.Route{Provider: "provider-a", Namespace: "models-as-a-service", Endpoint: "default.example.com"}, "gateway-system", "")
 	neighbor := providerDestinationRuleForTenant(resolver.Route{Provider: "provider-a", Namespace: "tenant-b", Endpoint: "neighbor.example.com"}, "gateway-system", "tenant-b")
 	if got := defaultRule.GetLabels()[externalTenantLabel]; got != "models-as-a-service" {
 		t.Fatalf("default DestinationRule tenant label = %q, want models-as-a-service", got)
 	}
 	r := controllerTestClient(t, &defaultRule, &neighbor)
-	if err := r.cleanupTransport(context.Background(), "models-as-a-service", "", "", nil); err != nil {
+	if err := r.cleanupProviderTransport(context.Background(), "models-as-a-service", "provider-a"); err != nil {
 		t.Fatal(err)
 	}
 	got := &unstructured.Unstructured{}
@@ -908,7 +915,7 @@ func TestResolveTenantRejectsWrongOwnerAndStatusNamespace(t *testing.T) {
 	}
 }
 
-func TestReconcileCreatesTransportAndOverlayFromOneRouteSet(t *testing.T) {
+func TestReconcileStandaloneProviderThenModelRoutes(t *testing.T) {
 	provider := &v1alpha1.ExternalProvider{
 		ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "tenant-a", UID: "provider-uid"},
 		Spec: v1alpha1.ExternalProviderSpec{
@@ -925,9 +932,23 @@ func TestReconcileCreatesTransportAndOverlayFromOneRouteSet(t *testing.T) {
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "credentials", Namespace: "tenant-a"}, Data: map[string][]byte{"api-key": []byte("must-not-be-published")}}
 	ait := controllerAITenant("tenant", "models-as-a-service", "tenant-a", "gateway", "gateway-system")
 	mtc := controllerMaasTenantConfig("tenant-a", "tenant", "models-as-a-service", "praxis")
-	r := controllerTestClient(t, provider, model, secret, ait, mtc)
+	r := controllerTestClient(t, provider, secret, ait, mtc)
 	r.Namespace, r.GatewayName, r.GatewayNamespace, r.Network = "tenant-a", "gateway", "gateway-system", "external-model"
 	r.KnownClusters = []string{"provider-provider"}
+	providerReq := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(provider)}
+	if _, err := r.ReconcileProvider(context.Background(), providerReq); err != nil {
+		t.Fatalf("reconcile standalone provider: %v", err)
+	}
+	var gotProvider v1alpha1.ExternalProvider
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(provider), &gotProvider); err != nil {
+		t.Fatal(err)
+	}
+	if gotProvider.Status.Phase != resolver.PhaseReady || gotProvider.Status.ObservedGeneration != provider.Generation {
+		t.Fatalf("standalone provider status = %#v", gotProvider.Status)
+	}
+	if err := r.Create(context.Background(), model); err != nil {
+		t.Fatalf("create model after standalone provider reconcile: %v", err)
+	}
 	req := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}
 	if _, err := r.Reconcile(context.Background(), req); err != nil {
 		t.Fatal(err)
@@ -997,7 +1018,6 @@ func TestReconcileCreatesTransportAndOverlayFromOneRouteSet(t *testing.T) {
 	if gotModel.Status.Phase != resolver.PhaseReady || gotModel.Status.HTTPRouteName != "external-model-model" {
 		t.Fatalf("model status = %#v", gotModel.Status)
 	}
-	var gotProvider v1alpha1.ExternalProvider
 	if err := r.Get(context.Background(), client.ObjectKeyFromObject(provider), &gotProvider); err != nil {
 		t.Fatal(err)
 	}
@@ -1013,6 +1033,9 @@ func TestReconcileCreatesTransportAndOverlayFromOneRouteSet(t *testing.T) {
 	mtc.SetAnnotations(map[string]string{tenant.AnnotationPayloadProcessingType: tenant.PayloadProcessingBackendIPP, tenant.AnnotationAITenantName: "tenant", tenant.AnnotationAITenantNamespace: "models-as-a-service"})
 	if err := r.Update(context.Background(), mtc); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := r.ReconcileProvider(context.Background(), providerReq); err != nil {
+		t.Fatalf("provider cleanup after IPP handoff: %v", err)
 	}
 	if _, err := r.Reconcile(context.Background(), req); err != nil {
 		t.Fatal(err)
@@ -1075,6 +1098,10 @@ func TestReconcileRecoversProviderAfterSecretDeletionAndRestoration(t *testing.T
 	r.Namespace, r.GatewayName, r.GatewayNamespace, r.Network = "tenant-a", "gateway", "tenant-a", "external-model"
 	r.KnownClusters = []string{"provider-provider"}
 	req := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}
+	providerReq := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(provider)}
+	if _, err := r.ReconcileProvider(context.Background(), providerReq); err != nil {
+		t.Fatalf("initial provider reconcile = %v", err)
+	}
 	if _, err := r.Reconcile(context.Background(), req); err != nil {
 		t.Fatal(err)
 	}
@@ -1086,8 +1113,11 @@ func TestReconcileRecoversProviderAfterSecretDeletionAndRestoration(t *testing.T
 	if err := r.Delete(context.Background(), secret); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.Reconcile(context.Background(), req); !errors.Is(err, errCredentialNotReady) {
-		t.Fatalf("missing-secret reconcile error = %v, want credential-not-ready", err)
+	if _, err := r.ReconcileProvider(context.Background(), providerReq); err != nil {
+		t.Fatalf("provider reconcile after Secret deletion = %v", err)
+	}
+	if _, err := r.Reconcile(context.Background(), req); !errors.Is(err, resolver.ErrNoRoutes) {
+		t.Fatalf("missing-Secret model reconcile error = %v, want no routes while Provider is failed", err)
 	}
 	var after corev1.ConfigMap
 	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: "routing-overlay"}, &after); err != nil {
@@ -1103,10 +1133,20 @@ func TestReconcileRecoversProviderAfterSecretDeletionAndRestoration(t *testing.T
 	if failed.Status.Phase != "Failed" || !hasConditionReason(failed.Status.Conditions, conditionReady, reasonProviderNotReady) {
 		t.Fatalf("missing-secret status = %#v", failed.Status)
 	}
+	var failedProvider v1alpha1.ExternalProvider
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(provider), &failedProvider); err != nil {
+		t.Fatal(err)
+	}
+	if failedProvider.Status.Phase != "Failed" {
+		t.Fatalf("provider status after Secret deletion = %#v", failedProvider.Status)
+	}
 
 	secret.ResourceVersion = ""
 	if err := r.Create(context.Background(), secret); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := r.ReconcileProvider(context.Background(), providerReq); err != nil {
+		t.Fatalf("provider reconcile after Secret restoration = %v", err)
 	}
 	if _, err := r.Reconcile(context.Background(), req); err != nil {
 		t.Fatal(err)
@@ -1120,7 +1160,7 @@ func TestReconcileRecoversProviderAfterSecretDeletionAndRestoration(t *testing.T
 	}
 }
 
-func TestReconcileRecoversProviderAfterTransientTransportFailure(t *testing.T) {
+func TestModelTransportFailureDoesNotRewriteProviderReadiness(t *testing.T) {
 	r, model := reconcilerFixture(t)
 	req := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}
 	if _, err := r.Reconcile(context.Background(), req); err != nil {
@@ -1136,8 +1176,8 @@ func TestReconcileRecoversProviderAfterTransientTransportFailure(t *testing.T) {
 	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: "provider"}, &failedProvider); err != nil {
 		t.Fatal(err)
 	}
-	if failedProvider.Status.Phase != "Failed" {
-		t.Fatalf("provider phase after transport failure = %q, want Failed", failedProvider.Status.Phase)
+	if failedProvider.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("provider phase after model transport failure = %q, want Ready", failedProvider.Status.Phase)
 	}
 	r.ApplyResource = nil
 	if _, err := r.Reconcile(context.Background(), req); err != nil {
@@ -1148,7 +1188,7 @@ func TestReconcileRecoversProviderAfterTransientTransportFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	if provider.Status.Phase != resolver.PhaseReady {
-		t.Fatalf("provider phase after transport recovery = %q, want Ready", provider.Status.Phase)
+		t.Fatalf("provider phase after model transport recovery = %q, want Ready", provider.Status.Phase)
 	}
 }
 
@@ -1371,8 +1411,18 @@ func TestReconcileFailureBoundariesRetainPublishedOverlay(t *testing.T) {
 }
 
 func TestReconcileCanFailEachSSAApplyBoundary(t *testing.T) {
-	for _, boundary := range []string{"Service", "ServiceEntry", "DestinationRule", "HTTPRoute"} {
-		t.Run(boundary, func(t *testing.T) {
+	boundaries := []struct {
+		name, kind string
+		provider   bool
+	}{
+		{name: "ModelService", kind: "Service"},
+		{name: "HTTPRoute", kind: "HTTPRoute"},
+		{name: "ProviderService", kind: "Service", provider: true},
+		{name: "ServiceEntry", kind: "ServiceEntry", provider: true},
+		{name: "DestinationRule", kind: "DestinationRule", provider: true},
+	}
+	for _, boundary := range boundaries {
+		t.Run(boundary.name, func(t *testing.T) {
 			r, model := reconcilerFixture(t)
 			req := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}
 			if _, err := r.Reconcile(context.Background(), req); err != nil {
@@ -1383,20 +1433,27 @@ func TestReconcileCanFailEachSSAApplyBoundary(t *testing.T) {
 				t.Fatal(err)
 			}
 			r.ApplyResource = func(ctx context.Context, _ client.Client, object unstructured.Unstructured) error {
-				if object.GetKind() == boundary {
-					return fmt.Errorf("injected %s apply failure", boundary)
+				if object.GetKind() == boundary.kind {
+					return fmt.Errorf("injected %s apply failure", boundary.name)
 				}
 				return render.Apply(ctx, r.Client, []unstructured.Unstructured{object})
 			}
-			if _, err := r.Reconcile(context.Background(), req); err == nil || !strings.Contains(err.Error(), "injected "+boundary) {
-				t.Fatalf("%s failure = %v", boundary, err)
+			var err error
+			if boundary.provider {
+				providerReq := reconcile.Request{NamespacedName: client.ObjectKey{Namespace: model.Namespace, Name: "provider"}}
+				_, err = r.ReconcileProvider(context.Background(), providerReq)
+			} else {
+				_, err = r.Reconcile(context.Background(), req)
+			}
+			if err == nil || !strings.Contains(err.Error(), "injected "+boundary.name) {
+				t.Fatalf("%s failure = %v", boundary.name, err)
 			}
 			var after corev1.ConfigMap
 			if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: "routing-overlay"}, &after); err != nil {
 				t.Fatal(err)
 			}
 			if after.Data["routing-overlay.json"] != before.Data["routing-overlay.json"] {
-				t.Fatalf("%s failure changed the published overlay", boundary)
+				t.Fatalf("%s failure changed the published overlay", boundary.name)
 			}
 		})
 	}
@@ -1444,6 +1501,7 @@ func reconcilerFixture(t *testing.T) (*Reconciler, *v1alpha1.ExternalModel) {
 	provider := &v1alpha1.ExternalProvider{
 		ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "tenant-a", UID: "provider-uid"},
 		Spec:       v1alpha1.ExternalProviderSpec{Provider: "openai", Endpoint: "api.example.com", Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "credentials"}}},
+		Status:     v1alpha1.ExternalProviderStatus{Phase: resolver.PhaseReady},
 	}
 	model := &v1alpha1.ExternalModel{
 		ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "tenant-a", UID: "model-uid"},
@@ -1461,7 +1519,7 @@ func reconcilerFixture(t *testing.T) (*Reconciler, *v1alpha1.ExternalModel) {
 	return r, model
 }
 
-func TestReconcileRevalidatesPendingProviderDuringIPPHandoff(t *testing.T) {
+func TestProviderReadinessIsReconciledIndependentlyFromModels(t *testing.T) {
 	r, model := reconcilerFixture(t)
 	var provider v1alpha1.ExternalProvider
 	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: "provider"}, &provider); err != nil {
@@ -1476,18 +1534,62 @@ func TestReconcileRevalidatesPendingProviderDuringIPPHandoff(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
-		t.Fatalf("reconcile with pending handoff provider = %v", err)
+	modelReq := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}
+	if _, err := r.Reconcile(context.Background(), modelReq); !errors.Is(err, resolver.ErrNoRoutes) {
+		t.Fatalf("model reconcile with pending provider = %v, want no routes", err)
 	}
 	if err := r.Get(context.Background(), client.ObjectKeyFromObject(&provider), &provider); err != nil {
 		t.Fatal(err)
 	}
-	if provider.Status.Phase != resolver.PhaseReady {
-		t.Fatalf("provider phase = %q, want Ready", provider.Status.Phase)
+	if provider.Status.Phase != "Pending" {
+		t.Fatalf("model reconcile changed provider phase to %q, want Pending", provider.Status.Phase)
+	}
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: "routing-overlay"}, &corev1.ConfigMap{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("routing overlay before provider transport is ready = %v, want NotFound", err)
+	}
+	if _, err := r.ReconcileProvider(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&provider)}); err != nil {
+		t.Fatalf("provider reconcile = %v", err)
+	}
+	if _, err := r.Reconcile(context.Background(), modelReq); err != nil {
+		t.Fatalf("model reconcile after provider readiness = %v", err)
 	}
 	var overlay corev1.ConfigMap
 	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: "routing-overlay"}, &overlay); err != nil {
-		t.Fatalf("routing overlay = %v", err)
+		t.Fatalf("routing overlay after provider transport is ready = %v", err)
+	}
+}
+
+func TestModelRoutesRequireCurrentProviderGeneration(t *testing.T) {
+	provider := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "tenant-a", UID: "provider-uid", Generation: 2},
+		Spec:       v1alpha1.ExternalProviderSpec{Provider: "openai", Endpoint: "api.example.com", Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "credentials"}}},
+		Status:     v1alpha1.ExternalProviderStatus{Phase: resolver.PhaseReady, ObservedGeneration: 1},
+	}
+	model := &v1alpha1.ExternalModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "tenant-a", UID: "model-uid"},
+		Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
+			Ref: v1alpha1.ExternalProviderReference{Name: provider.Name}, TargetModel: "gpt",
+			APIFormat: "openai-chat", Path: "/v1/chat/completions",
+		}}},
+	}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "credentials", Namespace: "tenant-a"}, Data: map[string][]byte{"api-key": []byte("fixture-only-secret")}}
+	ait := controllerAITenant("tenant", "models-as-a-service", "tenant-a", "gateway", "tenant-a")
+	mtc := controllerMaasTenantConfig("tenant-a", "tenant", "models-as-a-service", "praxis")
+	r := controllerTestClient(t, provider, model, secret, ait, mtc)
+	r.Namespace, r.GatewayName, r.GatewayNamespace, r.Network = "tenant-a", "gateway", "tenant-a", "external-model"
+	r.KnownClusters = []string{"provider-provider"}
+
+	req := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}
+	if _, err := r.Reconcile(context.Background(), req); !errors.Is(err, resolver.ErrNoRoutes) {
+		t.Fatalf("model reconcile with stale Provider generation = %v, want no routes", err)
+	}
+	route := &unstructured.Unstructured{}
+	route.SetGroupVersionKind(schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"})
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: "external-model-model"}, route); !apierrors.IsNotFound(err) {
+		t.Fatalf("HTTPRoute for stale Provider generation error = %v, want NotFound", err)
+	}
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: "routing-overlay"}, &corev1.ConfigMap{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("routing overlay for stale Provider generation error = %v, want NotFound", err)
 	}
 }
 
@@ -1590,7 +1692,7 @@ func TestStalePraxisDecisionDoesNotPublishAfterLiveIPPSwitch(t *testing.T) {
 	}
 }
 
-func TestDeletingModelCleansOwnedResourcesWithoutMTCOrAITenant(t *testing.T) {
+func TestDeletingModelAndMissingProviderCleanOwnedResourcesWithoutMTCOrAITenant(t *testing.T) {
 	for _, withMTC := range []bool{false, true} {
 		t.Run(map[bool]string{false: "missing-mtc", true: "missing-aitenant"}[withMTC], func(t *testing.T) {
 			model := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{
@@ -1616,6 +1718,9 @@ func TestDeletingModelCleansOwnedResourcesWithoutMTCOrAITenant(t *testing.T) {
 			r.Namespace = "tenant-a"
 			if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
 				t.Fatal(err)
+			}
+			if _, err := r.ReconcileProvider(context.Background(), reconcile.Request{NamespacedName: client.ObjectKey{Namespace: model.Namespace, Name: "provider"}}); err != nil {
+				t.Fatalf("cleanup resources from missing provider: %v", err)
 			}
 			var gotModel v1alpha1.ExternalModel
 			if err := r.Get(context.Background(), client.ObjectKeyFromObject(model), &gotModel); err != nil && !apierrors.IsNotFound(err) {
@@ -1831,6 +1936,9 @@ func TestActiveProviderGatewayMoveRemovesOnlyPriorTenantCopies(t *testing.T) {
 	r := controllerTestClient(t, provider, model, secret, ait, mtc, &oldRule, &neighborRule, oldFilter, legacy, neighborLegacy, foreignLegacy)
 	r.Namespace, r.GatewayName, r.GatewayNamespace, r.Network = "tenant-a", "new-gateway", "new-gateway-system", "external-model"
 	r.KnownClusters = []string{"provider-provider"}
+	if _, err := r.ReconcileProvider(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(provider)}); err != nil {
+		t.Fatalf("reconcile provider after Gateway move: %v", err)
+	}
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
 		t.Fatal(err)
 	}
@@ -1883,7 +1991,7 @@ func TestAmbiguousPrePRDestinationRuleIsPreserved(t *testing.T) {
 	}}
 	owned := providerDestinationRuleAtGateway(resolver.Route{Provider: "provider-a", Namespace: "tenant-a", Endpoint: "current.example.com"}, "gateway", "gateway-system", "tenant")
 	r := controllerTestClient(t, &legacy, &owned)
-	if err := r.cleanupTransport(context.Background(), "tenant-a", "", "", nil); err != nil {
+	if err := r.cleanupProviderTransport(context.Background(), "tenant-a", "provider-a"); err != nil {
 		t.Fatal(err)
 	}
 	gotLegacy := &unstructured.Unstructured{}
