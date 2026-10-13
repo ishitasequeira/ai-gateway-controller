@@ -3,7 +3,8 @@
 //
 // It reproduces the merged-config semantics of the IPP model-provider-resolver
 // (opendatahub-io/ai-gateway-payload-processing): model-ref config overrides
-// provider config, refs are skipped (not failed) when individually bad, and
+// provider config except for tls.caCertificates, which configures shared
+// provider transport; refs are skipped (not failed) when individually bad, and
 // reconciliation fails only when a model resolves zero routes.
 package resolver
 
@@ -192,6 +193,11 @@ func resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalPro
 			}
 			if weight > 0 {
 				activeProviders[prov.Name] = true
+			}
+
+			providerCA := strings.TrimSpace(prov.Spec.Config["tls.caCertificates"])
+			if modelCA, configured := ref.Config["tls.caCertificates"]; configured && strings.TrimSpace(modelCA) != providerCA {
+				return nil, fmt.Errorf("resolver: model %s ref %s: tls.caCertificates cannot override ExternalProvider %s because provider transport is shared; configure it on the ExternalProvider", mref, ref.Ref.Name, prov.Name)
 			}
 
 			cfg := mergeConfig(prov.Spec.Config, ref.Config)

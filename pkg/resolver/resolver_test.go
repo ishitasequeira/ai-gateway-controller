@@ -299,6 +299,9 @@ func TestResolve_MergedConfigAndPathTemplates(t *testing.T) {
 
 func TestResolve_MergedConfigCarriesMountedTLSCAPath(t *testing.T) {
 	m := model("ns1", "m", ref("p", "target", "/v1"))
+	m.Spec.ExternalProviderRefs[0].Config = map[string]string{
+		"tls.caCertificates": "/etc/istio/provider-ca/ca.crt",
+	}
 	p := provider("ns1", "p", PhaseReady, "provider.example.com", map[string]string{
 		"tls.caCertificates": "/etc/istio/provider-ca/ca.crt",
 	})
@@ -308,6 +311,21 @@ func TestResolve_MergedConfigCarriesMountedTLSCAPath(t *testing.T) {
 	}
 	if got := set.Routes()[0].TLSCACertificates; got != "/etc/istio/provider-ca/ca.crt" {
 		t.Fatalf("TLS CA path = %q", got)
+	}
+}
+
+func TestResolve_RejectsModelSpecificTLSCAOverride(t *testing.T) {
+	m := model("ns1", "m", ref("p", "target", "/v1"))
+	m.Spec.ExternalProviderRefs[0].Config = map[string]string{
+		"tls.caCertificates": "/etc/istio/model-ca/ca.crt",
+	}
+	p := provider("ns1", "p", PhaseReady, "provider.example.com", map[string]string{
+		"tls.caCertificates": "/etc/istio/provider-ca/ca.crt",
+	})
+
+	_, err := Resolve([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{p})
+	if err == nil || !strings.Contains(err.Error(), "tls.caCertificates cannot override ExternalProvider p") {
+		t.Fatalf("Resolve error = %v, want explicit shared-transport CA override error", err)
 	}
 }
 

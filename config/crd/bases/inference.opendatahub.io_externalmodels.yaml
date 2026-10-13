@@ -107,7 +107,9 @@ spec:
                         type: string
                       description: |-
                         Config holds model-specific configuration as key-value pairs.
-                        Overrides the ExternalProvider config for this model-provider binding.
+                        Overrides the ExternalProvider config for this model-provider binding,
+                        except tls.caCertificates, which configures shared provider transport and
+                        must be set on the ExternalProvider.
                       type: object
                     path:
                       description: |-

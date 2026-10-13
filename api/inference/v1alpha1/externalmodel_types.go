@@ -101,7 +101,9 @@ type ExternalProviderRef struct {
 	Path string `json:"path"`
 
 	// Config holds model-specific configuration as key-value pairs.
-	// Overrides the ExternalProvider config for this model-provider binding.
+	// Overrides the ExternalProvider config for this model-provider binding,
+	// except tls.caCertificates, which configures shared provider transport and
+	// must be set on the ExternalProvider.
 	// +optional
 	Config map[string]string `json:"config,omitempty"`
 
