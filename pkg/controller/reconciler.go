@@ -44,6 +44,8 @@ const (
 	reasonTenantNotReady          = "TenantNotReady"
 	reasonNoRoutes                = "NoRoutes"
 	reasonProviderNotReady        = "ProviderNotReady"
+	providerPhasePending          = "Pending"
+	providerPhaseFailed           = "Failed"
 	providerServicePrefix         = "provider-"
 	providerSelectionSinkPrefix   = "provider-selection-required-"
 	selectedProviderHeader        = "X-AI-Routing-Candidate"
@@ -328,15 +330,12 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 		}
 		return reconcile.Result{}, nil
 	}
-	if live.missingConfig || live.mtc == nil || live.aitenant == nil ||
-		!live.mtc.GetDeletionTimestamp().IsZero() || !live.aitenant.GetDeletionTimestamp().IsZero() ||
-		live.status != tenant.PayloadProcessingStatusSteady || !tenant.IsActive(live.aitenant) ||
-		!tenant.StatusIsCurrent(live.aitenant) {
-		return reconcile.Result{}, nil
+	if message := providerTenantReadinessMessage(live); message != "" {
+		return reconcile.Result{}, r.updateProviderStatus(ctx, &provider, providerPhasePending, reasonTenantNotReady, message)
 	}
 	gatewayName, gatewayNamespace, gatewayReady := tenant.GatewayRef(live.aitenant)
 	if !gatewayReady {
-		return reconcile.Result{}, nil
+		return reconcile.Result{}, r.updateProviderStatus(ctx, &provider, providerPhasePending, reasonTenantNotReady, "AITenant Gateway reference is not ready")
 	}
 	want := modelTenantContext{
 		aitenantUID: live.aitenant.GetUID(), mtcUID: live.mtc.GetUID(),
@@ -349,7 +348,7 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 	}
 	if validationErr != nil {
 		cleanupErr := r.cleanupProviderTransport(ctx, provider.Namespace, provider.Name)
-		if statusErr := r.updateProviderStatus(ctx, &provider, false, reasonReconcileFailed, validationErr.Error()); statusErr != nil {
+		if statusErr := r.updateProviderStatus(ctx, &provider, providerPhaseFailed, reasonReconcileFailed, validationErr.Error()); statusErr != nil {
 			return reconcile.Result{}, statusErr
 		}
 		if cleanupErr != nil {
@@ -374,7 +373,7 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 	}
 	if err != nil {
 		cleanupErr := r.cleanupProviderTransport(ctx, provider.Namespace, provider.Name)
-		if statusErr := r.updateProviderStatus(ctx, &provider, false, reasonReconcileFailed, err.Error()); statusErr != nil {
+		if statusErr := r.updateProviderStatus(ctx, &provider, providerPhaseFailed, reasonReconcileFailed, err.Error()); statusErr != nil {
 			return reconcile.Result{}, statusErr
 		}
 		if cleanupErr != nil {
@@ -382,7 +381,7 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 		}
 		return reconcile.Result{}, err
 	}
-	if err := r.updateProviderStatus(ctx, &provider, true, reasonReconciled, "provider Secret reference and transport resources are ready"); err != nil {
+	if err := r.updateProviderStatus(ctx, &provider, resolver.PhaseReady, reasonReconciled, "provider Secret reference and transport resources are ready"); err != nil {
 		return reconcile.Result{}, err
 	}
 	return reconcile.Result{}, nil
@@ -1009,6 +1008,32 @@ type tenantResolution struct {
 	status        string
 }
 
+// providerTenantReadinessMessage explains why provider transport is waiting
+// for the Praxis tenant handoff to become ready. An empty message means the
+// tenant gate is open.
+func providerTenantReadinessMessage(live tenantResolution) string {
+	switch {
+	case live.missingConfig:
+		return "MaasTenantConfig/default-tenant is missing"
+	case live.mtc == nil:
+		return "MaasTenantConfig/default-tenant is not resolvable"
+	case !live.mtc.GetDeletionTimestamp().IsZero():
+		return "MaasTenantConfig/default-tenant is being deleted"
+	case live.aitenant == nil:
+		return "owning AITenant is not yet resolvable for MaasTenantConfig"
+	case !live.aitenant.GetDeletionTimestamp().IsZero():
+		return "owning AITenant is being deleted"
+	case live.status != tenant.PayloadProcessingStatusSteady:
+		return fmt.Sprintf("MaasTenantConfig selects Praxis but payload-processing-status is %q, expected %q", live.status, tenant.PayloadProcessingStatusSteady)
+	case !tenant.IsActive(live.aitenant):
+		return "owning AITenant phase is not Active"
+	case !tenant.StatusIsCurrent(live.aitenant):
+		return "owning AITenant Ready condition does not observe its current generation"
+	default:
+		return ""
+	}
+}
+
 func (r *Reconciler) resolveTenantForNamespace(ctx context.Context, namespace string) (tenantResolution, error) {
 	mtc := tenant.NewMaasTenantConfig()
 	err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: tenant.MaasTenantConfigInstanceName}, mtc)
@@ -1472,15 +1497,11 @@ func setOwnerReference(obj *unstructured.Unstructured, owner client.Object) {
 	}})
 }
 
-func (r *Reconciler) updateProviderStatus(ctx context.Context, p *v1alpha1.ExternalProvider, ready bool, reason, message string) error {
+func (r *Reconciler) updateProviderStatus(ctx context.Context, p *v1alpha1.ExternalProvider, phase, reason, message string) error {
 	old := p.DeepCopy()
 	p.Status.ObservedGeneration = p.Generation
-	if ready {
-		p.Status.Phase = resolver.PhaseReady
-	} else {
-		p.Status.Phase = "Failed"
-	}
-	setCondition(&p.Status.Conditions, conditionReady, boolStatus(ready), reason, message)
+	p.Status.Phase = phase
+	setCondition(&p.Status.Conditions, conditionReady, boolStatus(phase == resolver.PhaseReady), reason, message)
 	if equality.Semantic.DeepEqual(old.Status, p.Status) {
 		return nil
 	}

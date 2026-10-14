@@ -1559,6 +1559,52 @@ func TestProviderReadinessIsReconciledIndependentlyFromModels(t *testing.T) {
 	}
 }
 
+func TestProviderReportsTenantHandoffReadinessCondition(t *testing.T) {
+	r, _ := reconcilerFixture(t)
+	ctx := context.Background()
+
+	mtc := tenant.NewMaasTenantConfig()
+	mtcKey := client.ObjectKey{Namespace: "tenant-a", Name: tenant.MaasTenantConfigInstanceName}
+	if err := r.Get(ctx, mtcKey, mtc); err != nil {
+		t.Fatal(err)
+	}
+	annotations := mtc.GetAnnotations()
+	annotations[tenant.AnnotationPayloadProcessingStatus] = tenant.PayloadProcessingStatusCleanupComplete
+	mtc.SetAnnotations(annotations)
+	if err := r.Update(ctx, mtc); err != nil {
+		t.Fatal(err)
+	}
+
+	providerKey := client.ObjectKey{Namespace: "tenant-a", Name: "provider"}
+	if _, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: providerKey}); err != nil {
+		t.Fatalf("reconcile provider during tenant handoff: %v", err)
+	}
+
+	var got v1alpha1.ExternalProvider
+	if err := r.Get(ctx, providerKey, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != providerPhasePending || got.Status.ObservedGeneration != got.Generation {
+		t.Fatalf("provider status = %#v, want %s at current generation", got.Status, providerPhasePending)
+	}
+	var ready *metav1.Condition
+	for i := range got.Status.Conditions {
+		if got.Status.Conditions[i].Type == conditionReady {
+			ready = &got.Status.Conditions[i]
+			break
+		}
+	}
+	if ready == nil {
+		t.Fatalf("provider Ready condition missing: %#v", got.Status.Conditions)
+	}
+	if ready.Status != metav1.ConditionFalse || ready.Reason != reasonTenantNotReady {
+		t.Fatalf("provider Ready condition = %#v, want False with reason %q", *ready, reasonTenantNotReady)
+	}
+	if !strings.Contains(ready.Message, tenant.PayloadProcessingStatusCleanupComplete) || !strings.Contains(ready.Message, tenant.PayloadProcessingStatusSteady) {
+		t.Fatalf("provider Ready condition message = %q, want actual and required handoff states", ready.Message)
+	}
+}
+
 func TestModelRoutesRequireCurrentProviderGeneration(t *testing.T) {
 	provider := &v1alpha1.ExternalProvider{
 		ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "tenant-a", UID: "provider-uid", Generation: 2},
