@@ -3534,3 +3534,149 @@ func TestAmbiguousPrePRDestinationRuleIsPreserved(t *testing.T) {
 		t.Fatalf("owned DestinationRule cleanup error = %v, want NotFound", err)
 	}
 }
+
+func TestReconcileProviderClaimsOwnershipWhenMaasTenantConfigMissing(t *testing.T) {
+	provider := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "tenant-a"},
+		Spec: v1alpha1.ExternalProviderSpec{
+			Provider: "openai", Endpoint: "api.example.com",
+			Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "credentials"}},
+		},
+	}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "credentials", Namespace: "tenant-a"}, Data: map[string][]byte{"api-key": []byte("secret")}}
+	r := controllerTestClient(t, provider, secret)
+	r.Namespace = "tenant-a"
+
+	if _, err := r.ReconcileProvider(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(provider)}); err != nil {
+		t.Fatalf("ReconcileProvider: %v", err)
+	}
+	var got v1alpha1.ExternalProvider
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(provider), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !controllerutil.ContainsFinalizer(&got, externalProviderFinalizer) {
+		t.Fatal("expected ExternalProvider cleanup finalizer when MaasTenantConfig is absent (Praxis default)")
+	}
+	if got.Status.Phase != providerPhasePending {
+		t.Fatalf("status phase = %q, want Pending while waiting for MaasTenantConfig", got.Status.Phase)
+	}
+	if !strings.Contains(got.Status.Conditions[0].Message, "MaasTenantConfig/default-tenant is missing") {
+		t.Fatalf("status message = %q", got.Status.Conditions[0].Message)
+	}
+}
+
+// A tenant claims its namespace before maas-controller creates the
+// MaasTenantConfig there, so a provider in a multi-namespace deployment is
+// claimed as Praxis-default rather than reported as a standalone provider.
+func TestReconcileProviderClaimsOwnershipInTenantNamespaceAwaitingMaasTenantConfig(t *testing.T) {
+	provider := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "tenant-a"},
+		Spec: v1alpha1.ExternalProviderSpec{
+			Provider: "openai", Endpoint: "api.example.com",
+			Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "credentials"}},
+		},
+	}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "credentials", Namespace: "tenant-a"}, Data: map[string][]byte{"api-key": []byte("secret")}}
+	ait := controllerAITenant("tenant", "models-as-a-service", "tenant-a", "gateway", "gateway-system")
+	r := controllerTestClient(t, provider, secret, ait)
+
+	if _, err := r.ReconcileProvider(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(provider)}); err != nil {
+		t.Fatalf("ReconcileProvider: %v", err)
+	}
+	var got v1alpha1.ExternalProvider
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(provider), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !controllerutil.ContainsFinalizer(&got, externalProviderFinalizer) {
+		t.Fatal("expected ExternalProvider cleanup finalizer in a claimed tenant namespace")
+	}
+	if got.Status.Phase != providerPhasePending {
+		t.Fatalf("status phase = %q, want Pending while waiting for MaasTenantConfig", got.Status.Phase)
+	}
+	if !strings.Contains(got.Status.Conditions[0].Message, "waiting for maas-controller") {
+		t.Fatalf("status message = %q", got.Status.Conditions[0].Message)
+	}
+}
+
+// A tenant resolution failure must not leave the provider unclaimed and
+// stateless: the provider keeps our finalizer and a Pending condition while the
+// reconcile error still asks for a retry.
+func TestReconcileProviderClaimsAndReportsPendingWhenTenantResolutionFails(t *testing.T) {
+	for name, tc := range map[string]struct {
+		objects []client.Object
+		reader  func(*Reconciler)
+		message string
+	}{
+		"owning AITenant does not own the namespace": {
+			objects: []client.Object{
+				controllerAITenant("tenant", "models-as-a-service", "tenant-b", "gateway", "gateway-system"),
+				controllerMaasTenantConfig("tenant-a", "tenant", "models-as-a-service", tenant.PayloadProcessingBackendPraxis),
+			},
+			message: "does not own MaasTenantConfig",
+		},
+		"owning AITenant is unreadable": {
+			objects: []client.Object{
+				controllerMaasTenantConfig("tenant-a", "tenant", "models-as-a-service", tenant.PayloadProcessingBackendPraxis),
+			},
+			reader:  func(r *Reconciler) { r.APIReader = failingAITenantReader{Reader: r.APIReader} },
+			message: "transient AITenant read failure",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			provider := &v1alpha1.ExternalProvider{
+				ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "tenant-a"},
+				Spec: v1alpha1.ExternalProviderSpec{
+					Provider: "openai", Endpoint: "api.example.com",
+					Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "credentials"}},
+				},
+			}
+			secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "credentials", Namespace: "tenant-a"}, Data: map[string][]byte{"api-key": []byte("secret")}}
+			r := controllerTestClient(t, append(tc.objects, provider, secret)...)
+			r.Namespace = "tenant-a"
+			if tc.reader != nil {
+				tc.reader(r)
+			}
+
+			if _, err := r.ReconcileProvider(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(provider)}); err == nil {
+				t.Fatal("ReconcileProvider succeeded despite an unresolved tenant owner")
+			}
+			var got v1alpha1.ExternalProvider
+			if err := r.Get(context.Background(), client.ObjectKeyFromObject(provider), &got); err != nil {
+				t.Fatal(err)
+			}
+			if !controllerutil.ContainsFinalizer(&got, externalProviderFinalizer) {
+				t.Fatal("provider was left unclaimed after a tenant resolution failure")
+			}
+			if got.Status.Phase != providerPhasePending {
+				t.Fatalf("status phase = %q, want Pending", got.Status.Phase)
+			}
+			if !hasConditionReason(got.Status.Conditions, conditionReady, reasonTenantNotReady) {
+				t.Fatalf("provider conditions = %#v, want Ready with reason %q", got.Status.Conditions, reasonTenantNotReady)
+			}
+			if !strings.Contains(got.Status.Conditions[0].Message, tc.message) {
+				t.Fatalf("status message = %q, want it to explain the failure", got.Status.Conditions[0].Message)
+			}
+		})
+	}
+}
+
+type failingAITenantReader struct {
+	client.Reader
+}
+
+func (r failingAITenantReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if u, ok := obj.(*unstructured.Unstructured); ok && u.GroupVersionKind() == tenant.AITenantGVK {
+		return errors.New("transient AITenant read failure")
+	}
+	return r.Reader.Get(ctx, key, obj, opts...)
+}
+
+func TestProviderTenantReadinessMessageAbsentMaasTenantConfig(t *testing.T) {
+	msg := providerTenantReadinessMessage(tenantResolution{missingConfig: true, selected: true})
+	if msg == "" {
+		t.Fatal("expected pending message while MaasTenantConfig is absent")
+	}
+	if !strings.Contains(msg, "missing") {
+		t.Fatalf("message = %q", msg)
+	}
+}

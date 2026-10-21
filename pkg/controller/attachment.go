@@ -171,17 +171,28 @@ func (r *Reconciler) implicitlyAttached(ctx context.Context, model *v1alpha1.Ext
 	}
 	// A tenant namespace whose MaasTenantConfig is not created yet, or is being
 	// recreated, is never served by another tenant.
+	claimed, err := r.namespaceClaimedByAITenant(ctx, model.Namespace)
+	if err != nil {
+		return false, err
+	}
+	return !claimed, nil
+}
+
+// namespaceClaimedByAITenant reports whether an AITenant claims the namespace.
+// A tenant claims its namespace before maas-controller creates the
+// MaasTenantConfig there, and keeps the claim while the config is recreated.
+func (r *Reconciler) namespaceClaimedByAITenant(ctx context.Context, namespace string) (bool, error) {
 	list := &unstructured.UnstructuredList{}
 	list.SetGroupVersionKind(tenant.AITenantGVK.GroupVersion().WithKind("AITenantList"))
 	if err := r.List(ctx, list); err != nil {
-		return false, fmt.Errorf("list AITenants for namespace %s: %w", model.Namespace, err)
+		return false, fmt.Errorf("list AITenants for namespace %s: %w", namespace, err)
 	}
 	for i := range list.Items {
-		if namespace, ok := tenant.ConfigNamespace(&list.Items[i]); ok && namespace == model.Namespace {
-			return false, nil
+		if claimed, ok := tenant.ConfigNamespace(&list.Items[i]); ok && claimed == namespace {
+			return true, nil
 		}
 	}
-	return true, nil
+	return false, nil
 }
 
 // mayAttachImplicitly is implicitlyAttached for event fan-out, which logs a

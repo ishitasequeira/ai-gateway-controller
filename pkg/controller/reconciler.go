@@ -344,6 +344,16 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 
 	live, err := r.liveTenantResolution(ctx, provider.Namespace)
 	if err != nil {
+		// Tenant resolution fails on an unreadable or inconsistent AITenant
+		// owner. Claim the provider and report Pending before returning: a bare
+		// error would leave it with neither our finalizer nor a status writer,
+		// while IPP remains free to write status for this namespace.
+		if finalizerErr := r.ensureExternalProviderFinalizer(ctx, &provider); finalizerErr != nil {
+			return reconcile.Result{}, errors.Join(err, finalizerErr)
+		}
+		if statusErr := r.updateProviderStatus(ctx, &provider, providerPhasePending, reasonTenantNotReady, err.Error()); statusErr != nil {
+			return reconcile.Result{}, errors.Join(err, statusErr)
+		}
 		return reconcile.Result{}, err
 	}
 	// An explicit IPP selection is a handoff command. Remove only resources
@@ -352,7 +362,7 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 	// provider Service and ServiceEntry; removing the attachment collects them.
 	// Routes are read live and applied before their transport, so a route
 	// created a moment ago is never missed.
-	if !live.missingConfig && !live.selected {
+	if !praxisSelected(live) {
 		routes, err := r.listAttachmentRoutes(ctx, r.APIReader, client.InNamespace(provider.Namespace))
 		if err != nil {
 			return reconcile.Result{}, err
@@ -370,13 +380,26 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 		validationErr = r.validateProviderCredential(ctx, &provider)
 	}
 	if live.missingConfig && !controllerutil.ContainsFinalizer(&provider, externalProviderFinalizer) {
-		// Never served by a tenant here: this namespace has no
-		// MaasTenantConfig. Gateway attachments apply the provider's transport,
-		// so only its own configuration is reported.
-		if validationErr != nil {
-			return reconcile.Result{}, r.updateProviderStatus(ctx, &provider, providerPhaseFailed, reasonReconcileFailed, validationErr.Error())
+		// A namespace no tenant claims is served only through Gateway
+		// attachments: its provider has no tenant-local transport, so only its
+		// own configuration is reported. A tenant namespace whose
+		// MaasTenantConfig maas-controller has not created yet falls through
+		// and is claimed below.
+		tenantNamespace, err := r.tenantNamespace(ctx, provider.Namespace)
+		if err != nil {
+			return reconcile.Result{}, err
 		}
-		return reconcile.Result{}, r.updateProviderStatus(ctx, &provider, resolver.PhaseReady, reasonValidated, "provider Secret reference is ready; Gateway attachments apply its transport")
+		if !tenantNamespace {
+			if validationErr != nil {
+				return reconcile.Result{}, r.updateProviderStatus(ctx, &provider, providerPhaseFailed, reasonReconcileFailed, validationErr.Error())
+			}
+			return reconcile.Result{}, r.updateProviderStatus(ctx, &provider, resolver.PhaseReady, reasonValidated, "provider Secret reference is ready; Gateway attachments apply its transport")
+		}
+	}
+	// Claim the provider before any tenant gate: an absent MaasTenantConfig is
+	// Praxis-default, and IPP must not write status for a provider we own.
+	if err := r.ensureExternalProviderFinalizer(ctx, &provider); err != nil {
+		return reconcile.Result{}, err
 	}
 	if message := providerTenantReadinessMessage(live); message != "" {
 		return reconcile.Result{}, r.updateProviderStatus(ctx, &provider, providerPhasePending, reasonTenantNotReady, message)
@@ -402,9 +425,6 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 		return reconcile.Result{}, nil
 	}
 
-	if err := r.ensureExternalProviderFinalizer(ctx, &provider); err != nil {
-		return reconcile.Result{}, err
-	}
 	valid, err := r.livePraxisBeforeWrite(ctx, provider.Namespace, want)
 	if err != nil {
 		return reconcile.Result{}, err
@@ -1440,14 +1460,33 @@ type tenantResolution struct {
 	apiTranslationEnabled bool
 }
 
+// praxisSelected mirrors maas-controller: absent MaasTenantConfig defaults to
+// Praxis (3.6 default dataplane). Only an explicit IPP annotation opts out.
+func praxisSelected(live tenantResolution) bool {
+	return live.missingConfig || live.selected
+}
+
+// tenantNamespace reports whether namespace belongs to a tenant. A
+// single-namespace controller serves only tenant namespaces, and a namespace an
+// AITenant claims is a tenant's even before maas-controller creates its
+// MaasTenantConfig. A namespace no tenant claims is served only through Gateway
+// attachments.
+func (r *Reconciler) tenantNamespace(ctx context.Context, namespace string) (bool, error) {
+	if r.Namespace != "" {
+		return true, nil
+	}
+	return r.namespaceClaimedByAITenant(ctx, namespace)
+}
+
 // providerTenantReadinessMessage explains why provider transport is waiting
 // for the Praxis tenant handoff to become ready. An empty message means the
 // tenant gate is open.
 func providerTenantReadinessMessage(live tenantResolution) string {
 	switch {
-	case live.missingConfig:
-		return "MaasTenantConfig/default-tenant is missing"
 	case live.mtc == nil:
+		if live.missingConfig {
+			return "MaasTenantConfig/default-tenant is missing; waiting for maas-controller to create it"
+		}
 		return "MaasTenantConfig/default-tenant is not resolvable"
 	case !live.mtc.GetDeletionTimestamp().IsZero():
 		return "MaasTenantConfig/default-tenant is being deleted"
@@ -1521,7 +1560,7 @@ func (r *Reconciler) liveTenantResolution(ctx context.Context, namespace string)
 	mtc := tenant.NewMaasTenantConfig()
 	if err := reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: tenant.MaasTenantConfigInstanceName}, mtc); err != nil {
 		if apierrors.IsNotFound(err) {
-			return tenantResolution{missingConfig: true}, nil
+			return tenantResolution{missingConfig: true, selected: true}, nil
 		}
 		return tenantResolution{}, fmt.Errorf("live get MaasTenantConfig %s/%s: %w", namespace, tenant.MaasTenantConfigInstanceName, err)
 	}
@@ -1556,7 +1595,7 @@ func (r *Reconciler) livePraxisBeforeWrite(ctx context.Context, namespace string
 	if err != nil {
 		return false, err
 	}
-	if live.missingConfig || !live.selected || live.status != tenant.PayloadProcessingStatusSteady || live.mtc == nil || live.aitenant == nil {
+	if !praxisSelected(live) || live.status != tenant.PayloadProcessingStatusSteady || live.mtc == nil || live.aitenant == nil {
 		return false, nil
 	}
 	if !live.mtc.GetDeletionTimestamp().IsZero() || !live.aitenant.GetDeletionTimestamp().IsZero() {
