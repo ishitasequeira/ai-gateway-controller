@@ -1005,20 +1005,31 @@ func TestModelIneligibleForImplicitAttachmentIsTenantNotResolved(t *testing.T) {
 	}
 }
 
+// TestProviderOutsideTenantNamespacesReportsItsOwnConfiguration pins the split
+// between the two provider status paths. A namespace no AITenant claims has no
+// tenant-local transport, so its provider reports its own configuration and is
+// not claimed. Once a tenant claims the namespace the provider becomes the
+// controller's to own: it gains the cleanup finalizer before the tenant gate
+// and waits for MaasTenantConfig instead of reporting stale local state.
 func TestProviderOutsideTenantNamespacesReportsItsOwnConfiguration(t *testing.T) {
 	provider, secret := attachmentProvider("team")
 	r := attachmentReconciler(t, provider, secret)
-	providerStatus := func() (string, string) {
+	getProvider := func() v1alpha1.ExternalProvider {
 		t.Helper()
 		var got v1alpha1.ExternalProvider
 		if err := r.Get(context.Background(), client.ObjectKeyFromObject(provider), &got); err != nil {
 			t.Fatal(err)
 		}
+		return got
+	}
+	providerStatus := func() (string, string, string) {
+		t.Helper()
+		got := getProvider()
 		condition := apiMeta.FindStatusCondition(got.Status.Conditions, conditionReady)
 		if condition == nil {
 			t.Fatalf("provider status = %#v", got.Status)
 		}
-		return got.Status.Phase, condition.Reason
+		return got.Status.Phase, condition.Reason, condition.Message
 	}
 	reconcileProvider := func() {
 		t.Helper()
@@ -1026,8 +1037,14 @@ func TestProviderOutsideTenantNamespacesReportsItsOwnConfiguration(t *testing.T)
 			t.Fatal(err)
 		}
 	}
-	if phase, reason := providerStatus(); phase != resolver.PhaseReady || reason != reasonValidated {
+	// No AITenant claims "team", so the provider is served only through Gateway
+	// attachments: its status describes its own Secret reference, and there is
+	// no tenant transport to claim or clean up.
+	if phase, reason, _ := providerStatus(); phase != resolver.PhaseReady || reason != reasonValidated {
 		t.Fatalf("provider = %s/%s, want Ready/%s", phase, reason, reasonValidated)
+	}
+	if got := getProvider(); controllerutil.ContainsFinalizer(&got, externalProviderFinalizer) {
+		t.Fatalf("standalone provider was claimed: finalizers = %v", got.Finalizers)
 	}
 	// Without tenant-local transport it is no input to a tenant's own models.
 	if inputs, err := r.providerInputs(context.Background(), "team"); err != nil || len(inputs) != 0 {
@@ -1037,21 +1054,25 @@ func TestProviderOutsideTenantNamespacesReportsItsOwnConfiguration(t *testing.T)
 		t.Fatal(err)
 	}
 	reconcileProvider()
-	if phase, _ := providerStatus(); phase != providerPhaseFailed {
+	if phase, _, _ := providerStatus(); phase != providerPhaseFailed {
 		t.Fatalf("provider without its Secret = %s, want %s", phase, providerPhaseFailed)
 	}
-	// A provider a tenant served keeps waiting for that tenant's MaasTenantConfig.
-	var got v1alpha1.ExternalProvider
-	if err := r.Get(context.Background(), client.ObjectKeyFromObject(provider), &got); err != nil {
-		t.Fatal(err)
-	}
-	controllerutil.AddFinalizer(&got, externalProviderFinalizer)
-	if err := r.Update(context.Background(), &got); err != nil {
+	// A tenant claim moves the same provider to the owned path. maas-controller
+	// has not created the MaasTenantConfig yet, which is Praxis-default, so the
+	// provider is claimed and waits rather than reporting its own configuration.
+	if err := r.Create(context.Background(), controllerAITenant("tenant", "models-as-a-service", "team", "gateway", "gateway-system")); err != nil {
 		t.Fatal(err)
 	}
 	reconcileProvider()
-	if phase, reason := providerStatus(); phase != providerPhasePending || reason != reasonTenantNotReady {
+	if got := getProvider(); !controllerutil.ContainsFinalizer(&got, externalProviderFinalizer) {
+		t.Fatalf("tenant provider was not claimed: finalizers = %v", got.Finalizers)
+	}
+	phase, reason, message := providerStatus()
+	if phase != providerPhasePending || reason != reasonTenantNotReady {
 		t.Fatalf("tenant provider without its MaasTenantConfig = %s/%s, want Pending/%s", phase, reason, reasonTenantNotReady)
+	}
+	if !strings.Contains(message, "MaasTenantConfig/default-tenant is missing") {
+		t.Fatalf("provider message = %q, want it to name the missing MaasTenantConfig", message)
 	}
 }
 

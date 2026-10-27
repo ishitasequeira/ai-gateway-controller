@@ -65,6 +65,45 @@ behavior remain outside this change in issue #106. Partial provider withdrawal
 ordering remains a separate issue tracked in
 [#108](https://github.com/opendatahub-io/ai-gateway-controller/issues/108).
 
+### ExternalProvider status ownership
+
+Provider status has one writer per namespace, and that writer follows the
+namespace's serving dataplane. In 3.6 Praxis is the default, so an absent
+`MaasTenantConfig/default-tenant` means Praxis, exactly as maas-controller
+reads it; only an explicit `ipp` selector hands the namespace back to IPP. A
+provider therefore cannot be left unclaimed while `maas-controller` has not yet
+created the tenant configuration (for example during install or a namespace
+handoff), because IPP writes provider status cluster-wide and does not consult
+`MaasTenantConfig`.
+
+A namespace is a tenant's when the controller runs scoped to one namespace or
+an `AITenant` claims it (`status.tenantNamespace`). In such a namespace the
+provider is claimed with the `externalProviderFinalizer`
+(`inference.opendatahub.io/external-provider-cleanup`) before any tenant
+readiness gate, so ownership does not depend on the tenant becoming steady. It
+then reports `Pending`/`TenantNotReady` while the `MaasTenantConfig` is missing
+or the tenant is not steady, and `Ready`/`Validated` once credentials, transport
+and the tenant resolve. A namespace no tenant claims has no tenant-local
+transport to wait for; it is served only through Gateway attachments, and the
+provider reports its own configuration: `Ready`/`Validated` when its Secret
+reference is valid, `Failed` otherwise. Such a provider keeps no finalizer,
+since there is no tenant transport to clean up. Once a claim arrives (an
+`AITenant` is created for the namespace), the next reconcile moves it to the
+tenant path and the `Pending` gate above.
+
+A tenant resolution failure (an unreadable `AITenant`, or one whose ownership is
+inconsistent with the tenant configuration) claims the provider and reports
+`Pending`/`TenantNotReady` before returning the error. Returning a bare error
+would leave the provider with neither the finalizer nor a status writer while
+IPP remains free to write status; the requeue retries the resolution.
+
+An explicit IPP selection is the existing handoff, unchanged in direction:
+remove the Praxis transport except the backends the namespace's attachment
+routes still use, remove the finalizer, and write no status. IPP resumes as the
+writer for that namespace on rollback. Because ownership is re-derived from the
+`MaasTenantConfig` the controller already watches, switching a namespace
+between Praxis and IPP converges without deleting controller pods.
+
 ### API translation opt-in compatibility
 
 `MaasTenantConfig.spec.apiTranslation.enabled` is an opt-in rendering switch.
