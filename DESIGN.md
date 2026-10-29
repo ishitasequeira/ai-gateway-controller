@@ -695,7 +695,7 @@ ai-gateway-controller/
 | `--consumer-portal-manifest-path` | `/config/manifests/consumer-portal/base` | Kustomize entrypoint for the consumer portal auth proxy |
 | `--authorino-namespace` | `kuadrant-system` | Authorino namespace allowed through the auth proxy NetworkPolicy |
 | `--leader-elect` | `false` | Enable when running multiple replicas |
-| `--metrics-bind-address`, `--health-probe-bind-address` | `:8080`, `:8081` | Standard controller-runtime endpoints |
+| `--metrics-bind-address`, `--metrics-secure`, `--health-probe-bind-address` | `:8443`, `true`, `:8081` | Standard controller-runtime endpoints. Defaults are deliberately not restated in `config/self/manager/manager.yaml` — see the note there |
 
 ## Tooling & conventions
 

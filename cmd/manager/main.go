@@ -121,9 +121,30 @@ func main() {
 		os.Exit(1)
 	}
 	opts.BindFlags(flag.CommandLine)
-	flag.Parse()
+
+	// Tolerate flags this build does not define. This Deployment's args and its
+	// image are resolved at different times — the operator vendors the args from
+	// a pinned ai-gateway-controller commit but pairs them with an image built
+	// from a separate branch — so "newer manifest, older image" is a normal
+	// upgrade state rather than a programming error (RHAI-15815). Dropping the
+	// unknown flag and continuing on built-in defaults keeps the control plane
+	// up; exiting takes the data plane down with it.
+	args, droppedFlags := dropUnknownFlags(flag.CommandLine, os.Args[1:])
+	// flag.CommandLine is an ExitOnError FlagSet, so Parse reports failures by
+	// terminating the process; there is no error value to act on here. Malformed
+	// values for known flags therefore still fail fast, as they should.
+	_ = flag.CommandLine.Parse(args)
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+	if len(droppedFlags) > 0 {
+		// Logged after SetLogger: ctrl.Log is a null sink until then. Only flag
+		// names are recorded — a value may be a credential, and the log is read
+		// by anyone who can see the pod.
+		setupLog.Error(nil,
+			"ignoring flags this build does not define — the deployed manifest is newer "+
+				"than this image, continuing on built-in defaults",
+			"droppedFlags", droppedFlags, "droppedCount", len(droppedFlags), "buildVersion", buildVersion)
+	}
 	if err := inferencev1alpha1.AddToScheme(clientgoscheme.Scheme); err != nil {
 		setupLog.Error(err, "unable to register inference API scheme")
 		os.Exit(1)
