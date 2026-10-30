@@ -46,7 +46,9 @@ SKIP_DEPLOYMENT=${SKIP_DEPLOYMENT:-false}
 SKIP_VALIDATION=${SKIP_VALIDATION:-false}
 SKIP_AUTH_CHECK=${SKIP_AUTH_CHECK:-true}
 INSECURE_HTTP=${INSECURE_HTTP:-false}
-EXTERNAL_OIDC=false
+# The group-test lane defaults to no external OIDC; override EXTERNAL_OIDC=true
+# to run the OIDC mode (portal tests) against the same deployment flow.
+EXTERNAL_OIDC=${EXTERNAL_OIDC:-false}
 
 export MAAS_API_IMAGE
 export MAAS_CONTROLLER_IMAGE
@@ -55,6 +57,7 @@ export AI_GATEWAY_CONTROLLER_IMAGE
 export OPERATOR_CATALOG=${OPERATOR_CATALOG:-}
 export OPERATOR_IMAGE=${OPERATOR_IMAGE:-}
 DEPLOY_MODE=${DEPLOY_MODE:-kustomize}
+export OLM_BUNDLE_UNPACK_RETRY="${OLM_BUNDLE_UNPACK_RETRY:-true}"
 export POLICY_ENGINE="${POLICY_ENGINE:-rhcl}"
 export RHCL_NAMESPACE="${RHCL_NAMESPACE:-kuadrant-system}"
 export RHCL_STARTING_CSV="${RHCL_STARTING_CSV:-}"
@@ -129,8 +132,14 @@ ensure_gateway_allows_model_namespace() {
     }
     # shellcheck disable=SC1091
     source "$helpers"
-    local infra_ns
-    infra_ns="$(derive_infra_namespace "${DEPLOYMENT_NAMESPACE:-opendatahub}")"
+    # deploy.sh leaves the Gateway at from: All, which already admits the model namespace.
+    local current_from
+    current_from="$(oc get gateway "${GATEWAY_NAME}" -n "${GATEWAY_NAMESPACE}" \
+        -o jsonpath='{.spec.listeners[0].allowedRoutes.namespaces.from}' 2>/dev/null || true)"
+    if [[ "$current_from" == "All" ]]; then
+        echo "Gateway ${GATEWAY_NAMESPACE}/${GATEWAY_NAME} already allows HTTPRoutes from all namespaces"
+        return 0
+    fi
     local current
     current="$(oc get gateway "${GATEWAY_NAME}" -n "${GATEWAY_NAMESPACE}" \
         -o jsonpath='{.spec.listeners[0].allowedRoutes.namespaces.selector.matchExpressions[0].values}' 2>/dev/null || true)"
@@ -138,8 +147,15 @@ ensure_gateway_allows_model_namespace() {
         echo "Gateway ${GATEWAY_NAMESPACE}/${GATEWAY_NAME} already allows HTTPRoutes from ${model_ns}"
         return 0
     fi
+    # maas-api's HTTPRoute lives in the infra namespace, so the selector must keep it.
+    local app_ns="${DEPLOYMENT_NAMESPACE:-opendatahub}" infra_ns
+    case "$app_ns" in
+        redhat-ods-applications) infra_ns="redhat-ai-gateway-infra" ;;
+        opendatahub) infra_ns="odh-ai-gateway-infra" ;;
+        *) infra_ns="$app_ns" ;;
+    esac
     echo "Patching gateway allowedRoutes to include ${model_ns} (was: ${current:-<unset>}) ..."
-    ALLOWED_ROUTE_NAMESPACES="${DEPLOYMENT_NAMESPACE:-opendatahub},${infra_ns},${model_ns}" \
+    ALLOWED_ROUTE_NAMESPACES="${app_ns},${infra_ns},${model_ns}" \
         patch_gateway_allowed_routes "${GATEWAY_NAME}" "${GATEWAY_NAMESPACE}"
 }
 
@@ -182,7 +198,7 @@ setup_vars_for_tests() {
     export CLUSTER_DOMAIN="$(oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}')"
     [[ -z "$CLUSTER_DOMAIN" ]] && { echo "ERROR: Failed to detect cluster domain"; exit 1; }
     export HOST="maas.${CLUSTER_DOMAIN}"
-    export EXTERNAL_OIDC=false
+    export EXTERNAL_OIDC
 
     if [[ "$INSECURE_HTTP" == "true" ]]; then
         export MAAS_API_BASE_URL="http://${HOST}/maas-api"

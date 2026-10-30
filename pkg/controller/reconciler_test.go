@@ -13,6 +13,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -125,7 +126,8 @@ func TestEnableExternalModelRoutesScopesHeaderPhaseFilterToGeneratedRoutes(t *te
 	if err := r.enableExternalModelRoutes(context.Background(), "tenant-a", "tenant-a", "test-gateway", "gateway-system", routes[:1]); err != nil {
 		t.Fatal(err)
 	}
-	assertOpenAIOnlyRouteModes(t, nestedSlice(t, applied.Object, "spec", "configPatches"), "STREAMED")
+	// stream_usage_inject needs the complete body with translation off too.
+	assertOpenAIOnlyRouteModes(t, nestedSlice(t, applied.Object, "spec", "configPatches"), "BUFFERED")
 	routes[0].APITranslationEnabled = true
 	if err := r.enableExternalModelRoutes(context.Background(), "tenant-a", "tenant-a", "test-gateway", "gateway-system", routes[:1]); err != nil {
 		t.Fatal(err)
@@ -3560,6 +3562,118 @@ func TestAmbiguousPrePRDestinationRuleIsPreserved(t *testing.T) {
 	gotOwned.SetGroupVersionKind(schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1", Kind: "DestinationRule"})
 	if err := r.Get(context.Background(), client.ObjectKeyFromObject(&owned), gotOwned); !apierrors.IsNotFound(err) {
 		t.Fatalf("owned DestinationRule cleanup error = %v, want NotFound", err)
+	}
+}
+
+func TestBlockedHomeTenantMigrationLeavesModelAndProviderStatusToIPP(t *testing.T) {
+	r, model := reconcilerFixture(t)
+	ctx := context.Background()
+	mtc := tenant.NewMaasTenantConfig()
+	if err := r.Get(ctx, client.ObjectKey{Namespace: "tenant-a", Name: tenant.MaasTenantConfigInstanceName}, mtc); err != nil {
+		t.Fatal(err)
+	}
+	annotations := mtc.GetAnnotations()
+	delete(annotations, tenant.AnnotationPayloadProcessingStatus)
+	mtc.SetAnnotations(annotations)
+	if err := r.Update(ctx, mtc); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: client.ObjectKey{Namespace: "tenant-a", Name: "provider"}}); err != nil {
+		t.Fatalf("ReconcileProvider: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	var provider v1alpha1.ExternalProvider
+	if err := r.Get(ctx, client.ObjectKey{Namespace: "tenant-a", Name: "provider"}, &provider); err != nil {
+		t.Fatal(err)
+	}
+	if len(provider.Status.Conditions) > 0 || len(provider.Finalizers) > 0 {
+		t.Fatalf("provider IPP still serves was changed: finalizers %v, status %#v", provider.Finalizers, provider.Status)
+	}
+	var got v1alpha1.ExternalModel
+	if err := r.Get(ctx, client.ObjectKeyFromObject(model), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != "" || len(got.Status.Conditions) > 0 || len(got.Finalizers) > 0 {
+		t.Fatalf("model IPP still serves was changed: finalizers %v, status %#v", got.Finalizers, got.Status)
+	}
+}
+
+func TestHomeModelWithoutResolvedProviderIsNotReadyWhileSiblingsServe(t *testing.T) {
+	r, model := reconcilerFixture(t)
+	ctx := context.Background()
+	orphan := &v1alpha1.ExternalModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "orphan", Namespace: "tenant-a", UID: "orphan-uid"},
+		Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
+			Ref: v1alpha1.ExternalProviderReference{Name: "ghost"}, TargetModel: "gpt", APIFormat: "openai-chat", Path: "/v1/chat/completions",
+		}}},
+	}
+	if err := r.Create(ctx, orphan); err != nil {
+		t.Fatal(err)
+	}
+	// As if it had been served before its provider was deleted.
+	orphan.Status.HTTPRouteName = modelRouteName(orphan.Name)
+	if err := r.Status().Update(ctx, orphan); err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range []*v1alpha1.ExternalModel{model, orphan} {
+		if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(m)}); err != nil {
+			t.Fatalf("Reconcile %s: %v", m.Name, err)
+		}
+	}
+	var got v1alpha1.ExternalModel
+	if err := r.Get(ctx, client.ObjectKeyFromObject(orphan), &got); err != nil {
+		t.Fatal(err)
+	}
+	ready := apiMeta.FindStatusCondition(got.Status.Conditions, conditionReady)
+	if got.Status.Phase != "Failed" || ready == nil || ready.Reason != reasonProviderNotReady ||
+		!strings.Contains(ready.Message, "provider ghost: external provider not found") || got.Status.HTTPRouteName != "" {
+		t.Fatalf("model without a resolved provider = %#v", got.Status)
+	}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(model), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != resolver.PhaseReady || got.Status.HTTPRouteName != modelRouteName(model.Name) {
+		t.Fatalf("sibling model = %#v", got.Status)
+	}
+	for _, candidate := range overlayEnvelope(t, r, "tenant-a").Overlay.Candidates {
+		if strings.Contains(candidate.StableID, "orphan") {
+			t.Fatalf("overlay carries a candidate for the model without a provider: %#v", candidate)
+		}
+	}
+}
+
+func TestProviderRequestingPlaintextTransportFails(t *testing.T) {
+	r, _ := reconcilerFixture(t)
+	ctx := context.Background()
+	var provider v1alpha1.ExternalProvider
+	if err := r.Get(ctx, client.ObjectKey{Namespace: "tenant-a", Name: "provider"}, &provider); err != nil {
+		t.Fatal(err)
+	}
+	provider.Annotations = map[string]string{resolver.ProviderTLSAnnotation: "false", resolver.ProviderPortAnnotation: "8080"}
+	if err := r.Update(ctx, &provider); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&provider)}); err != nil {
+		t.Fatalf("ReconcileProvider: %v", err)
+	}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(&provider), &provider); err != nil {
+		t.Fatal(err)
+	}
+	ready := apiMeta.FindStatusCondition(provider.Status.Conditions, conditionReady)
+	if provider.Status.Phase != providerPhaseFailed || ready == nil || !strings.Contains(ready.Message, "plaintext transport") {
+		t.Fatalf("plaintext provider status = %#v", provider.Status)
+	}
+}
+
+func TestSortModelsByName(t *testing.T) {
+	models := []v1alpha1.ExternalModel{
+		{ObjectMeta: metav1.ObjectMeta{Name: "c"}}, {ObjectMeta: metav1.ObjectMeta{Name: "a"}}, {ObjectMeta: metav1.ObjectMeta{Name: "b"}},
+	}
+	sortModelsByName(models)
+	if models[0].Name != "a" || models[1].Name != "b" || models[2].Name != "c" {
+		t.Fatalf("sorted models = %s, %s, %s", models[0].Name, models[1].Name, models[2].Name)
 	}
 }
 

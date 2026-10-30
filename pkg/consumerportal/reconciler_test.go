@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -34,6 +35,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -65,6 +67,10 @@ func testScheme() *runtime.Scheme {
 		{tenant.MaasTenantConfigGVK.Group, tenant.MaasTenantConfigGVK.Version, tenant.MaasTenantConfigGVK.Kind},
 		{tenant.AITenantGVK.Group, tenant.AITenantGVK.Version, tenant.AITenantGVK.Kind},
 		{gvkGateway.Group, gvkGateway.Version, gvkGateway.Kind},
+		{gvkHTTPRoute.Group, gvkHTTPRoute.Version, gvkHTTPRoute.Kind},
+		{gvkReferenceGrant.Group, gvkReferenceGrant.Version, gvkReferenceGrant.Kind},
+		{gvkAuthPolicy.Group, gvkAuthPolicy.Version, gvkAuthPolicy.Kind},
+		{gvkDestinationRule.Group, gvkDestinationRule.Version, gvkDestinationRule.Kind},
 	} {
 		gv := tenant.AITenantGVK.GroupVersion()
 		gv.Group, gv.Version = gvk.group, gvk.version
@@ -148,6 +154,26 @@ func adminCredentialsSecret() *corev1.Secret {
 	return &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: CredentialsSecretName, Namespace: testInfraNamespace}}
 }
 
+func dashboardService() *corev1.Service {
+	return &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+		Name: PortalServiceName, Namespace: DefaultDashboardNamespace,
+	}}
+}
+
+func newConsumerPortalObject(gvk schema.GroupVersionKind, name, namespace string, managed bool) *unstructured.Unstructured {
+	object := &unstructured.Unstructured{}
+	object.SetGroupVersionKind(gvk)
+	object.SetName(name)
+	object.SetNamespace(namespace)
+	labels := map[string]string{"app.kubernetes.io/part-of": "maas-consumer-portal"}
+	if managed {
+		labels[tenant.LabelManagedBy] = tenant.ManagedByAIGatewayController
+		labels[LabelPortalInstance] = testInfraNamespace
+	}
+	object.SetLabels(labels)
+	return object
+}
+
 func managedProxyDeployment() *appsv1.Deployment {
 	return &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
 		Name:      AuthProxyName,
@@ -156,14 +182,33 @@ func managedProxyDeployment() *appsv1.Deployment {
 	}}
 }
 
-// recorder short-circuits server-side apply (unsupported by the fake client)
-// and records which kinds were applied, read, and deleted.
+// recorder records which kinds were applied, read, and deleted while letting
+// the fake client persist every operation.
 type recorder struct {
 	mu      sync.Mutex
 	objects map[string]*unstructured.Unstructured
 	applied []string
 	gets    []string
 	deleted []string
+}
+
+func setRouteReady(route *unstructured.Unstructured) {
+	setRouteConditions(route, true, true)
+}
+
+func setRouteConditions(route *unstructured.Unstructured, accepted, resolved bool) {
+	status := func(value bool) string {
+		if value {
+			return "True"
+		}
+		return "False"
+	}
+	route.Object["status"] = map[string]any{"parents": []any{map[string]any{
+		"conditions": []any{
+			map[string]any{"type": "Accepted", "status": status(accepted)},
+			map[string]any{"type": "ResolvedRefs", "status": status(resolved)},
+		},
+	}}}
 }
 
 func (r *recorder) funcs() interceptor.Funcs {
@@ -179,6 +224,20 @@ func (r *recorder) funcs() interceptor.Funcs {
 					r.objects[u.GetKind()] = u.DeepCopy()
 				}
 				r.mu.Unlock()
+				existing, ok := obj.DeepCopyObject().(client.Object)
+				if !ok {
+					return fmt.Errorf("applied object %T is not a client object", obj)
+				}
+				err := c.Get(ctx, client.ObjectKeyFromObject(obj), existing)
+				if apierrors.IsNotFound(err) {
+					if route, ok := obj.(*unstructured.Unstructured); ok && route.GetKind() == "HTTPRoute" {
+						setRouteReady(route)
+					}
+					return c.Create(ctx, obj)
+				}
+				if err != nil {
+					return err
+				}
 				return nil
 			}
 			return c.Patch(ctx, obj, patch, opts...)
@@ -238,6 +297,7 @@ func TestReconcileAppliesAuthProxyForDefaultTenant(t *testing.T) {
 		newAITenant(aitenantOpts{issuer: testIssuer}),
 		newGateway(httpsListener(testHostname)),
 		adminCredentialsSecret(),
+		dashboardService(),
 	)
 
 	res := reconcileMTC(t, r)
@@ -247,8 +307,15 @@ func TestReconcileAppliesAuthProxyForDefaultTenant(t *testing.T) {
 	}
 	sort.Strings(rec.applied)
 	want := []string{
+		"AuthPolicy/" + testInfraNamespace + "/maas-consumer-portal-oauth2-anonymous",
+		"AuthPolicy/" + testInfraNamespace + "/maas-consumer-portal-session",
 		"Deployment/" + testInfraNamespace + "/" + AuthProxyName,
+		"DestinationRule/" + testGatewayNamespace + "/maas-consumer-portal-auth-proxy-backend-tls",
+		"DestinationRule/" + testGatewayNamespace + "/maas-consumer-portal-backend-tls",
+		"HTTPRoute/" + testInfraNamespace + "/" + PortalRouteName,
+		"HTTPRoute/" + testInfraNamespace + "/" + OAuthRouteName,
 		"NetworkPolicy/" + testInfraNamespace + "/" + AuthProxyName,
+		"ReferenceGrant/" + DefaultDashboardNamespace + "/maas-consumer-portal",
 		"Service/" + testInfraNamespace + "/" + AuthProxyName,
 		"ServiceAccount/" + testInfraNamespace + "/" + AuthProxyName,
 	}
@@ -275,6 +342,7 @@ func TestReconcileWaitsForCredentialsSecret(t *testing.T) {
 		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
 		newAITenant(aitenantOpts{issuer: testIssuer}),
 		newGateway(httpsListener(testHostname)),
+		dashboardService(),
 	)
 
 	res := reconcileMTC(t, r)
@@ -350,6 +418,94 @@ func TestCookieExpire(t *testing.T) {
 	}
 }
 
+func TestReconcileWaitsForDashboardService(t *testing.T) {
+	r, rec := newReconciler(t,
+		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+		newAITenant(aitenantOpts{issuer: testIssuer}),
+		newGateway(httpsListener(testHostname)),
+		adminCredentialsSecret(),
+	)
+
+	res := reconcileMTC(t, r)
+
+	if res.RequeueAfter != constants.NotReadyRequeueInterval {
+		t.Errorf("RequeueAfter = %v, want %v", res.RequeueAfter, constants.NotReadyRequeueInterval)
+	}
+	if len(rec.applied) != 0 {
+		t.Errorf("applied %v without the dashboard Service", rec.applied)
+	}
+	if controllerutil.ContainsFinalizer(getMTC(t, r.Client), CleanupFinalizer) {
+		t.Error("finalizer added before the dashboard Service existed")
+	}
+}
+
+// dsci returns a DSCInitialization singleton fixture carrying the given
+// applicationsNamespace.
+func dsci(applicationsNamespace string) *unstructured.Unstructured {
+	object := &unstructured.Unstructured{}
+	object.SetGroupVersionKind(gvkDSCI)
+	object.SetName("default-dsci")
+	object.SetNamespace("opendatahub")
+	_ = unstructured.SetNestedField(object.Object, applicationsNamespace, "spec", "applicationsNamespace")
+	return object
+}
+
+func TestDashboardNamespaceFollowsDSCI(t *testing.T) {
+	// A DSCI with a non-default applicationsNamespace relocates the Service
+	// gate: the dashboard Service in DefaultDashboardNamespace no longer
+	// satisfies it.
+	r, rec := newReconciler(t,
+		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+		newAITenant(aitenantOpts{issuer: testIssuer}),
+		newGateway(httpsListener(testHostname)),
+		adminCredentialsSecret(),
+		dashboardService(),
+		dsci("odh-applications"),
+	)
+	res := reconcileMTC(t, r)
+	if res.RequeueAfter != constants.NotReadyRequeueInterval {
+		t.Errorf("RequeueAfter = %v, want %v (Service only exists in the default namespace)", res.RequeueAfter, constants.NotReadyRequeueInterval)
+	}
+	if len(rec.applied) != 0 {
+		t.Errorf("applied %v without the dashboard Service in the DSCI namespace", rec.applied)
+	}
+
+	// With the Service in the DSCI namespace the gate passes.
+	dsciService := dashboardService()
+	dsciService.Namespace = "odh-applications"
+	r, rec = newReconciler(t,
+		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+		newAITenant(aitenantOpts{issuer: testIssuer}),
+		newGateway(httpsListener(testHostname)),
+		adminCredentialsSecret(),
+		dsciService,
+		dsci("odh-applications"),
+	)
+	res = reconcileMTC(t, r)
+	if res.RequeueAfter == constants.NotReadyRequeueInterval && len(rec.applied) == 0 {
+		t.Error("still requeuing with the dashboard Service present in the DSCI namespace")
+	}
+}
+
+func TestDashboardNamespaceFlagOverridesDSCI(t *testing.T) {
+	r, _ := newReconciler(t,
+		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+		newAITenant(aitenantOpts{issuer: testIssuer}),
+		newGateway(httpsListener(testHostname)),
+		adminCredentialsSecret(),
+		dashboardService(),
+		dsci("odh-applications"),
+	)
+	r.DashboardNamespace = DefaultDashboardNamespace
+	ns, err := r.dashboardNamespace(context.Background())
+	if err != nil {
+		t.Fatalf("dashboardNamespace: %v", err)
+	}
+	if ns != DefaultDashboardNamespace {
+		t.Errorf("dashboardNamespace = %q with the flag set, want %q", ns, DefaultDashboardNamespace)
+	}
+}
+
 func TestReconcileRequeuesUntilPrerequisitesExist(t *testing.T) {
 	cases := map[string][]client.Object{
 		"AITenant not ready": {
@@ -365,6 +521,7 @@ func TestReconcileRequeuesUntilPrerequisitesExist(t *testing.T) {
 			newAITenant(aitenantOpts{issuer: testIssuer}),
 			newGateway(httpsListener("*.apps.example.com")),
 			adminCredentialsSecret(),
+			dashboardService(),
 		},
 	}
 	for name, objects := range cases {
@@ -399,6 +556,12 @@ func TestReconcileRemovesAuthProxyWhenNotWanted(t *testing.T) {
 		},
 		"non-default tenant": {
 			mtc:      withFinalizer(newMTC("team-a", testInfraNamespace)),
+			aitenant: newAITenant(aitenantOpts{issuer: testIssuer}),
+		},
+		// Once deployed, the dashboard Service's removal is the off-signal:
+		// the portal is torn down instead of left serving errors.
+		"dashboard Service deleted after deploy": {
+			mtc:      withFinalizer(newMTC(tenant.DefaultAITenantName, testInfraNamespace)),
 			aitenant: newAITenant(aitenantOpts{issuer: testIssuer}),
 		},
 	}
@@ -448,11 +611,184 @@ func TestCleanupLeavesUnmanagedObjects(t *testing.T) {
 	foreign.Labels = map[string]string{tenant.LabelManagedBy: "someone-else"}
 	r, _ := newReconciler(t, foreign)
 
-	if err := r.cleanup(context.Background(), testInfraNamespace); err != nil {
+	if err := r.cleanup(context.Background(), testInfraNamespace, testInfraNamespace); err != nil {
 		t.Fatalf("cleanup: %v", err)
 	}
 	if err := r.Client.Get(context.Background(), types.NamespacedName{Namespace: testInfraNamespace, Name: AuthProxyName}, &appsv1.Deployment{}); err != nil {
 		t.Errorf("unmanaged Deployment was deleted: %v", err)
+	}
+}
+
+func TestRoutesReadyRequiresAcceptedAndResolvedRoutes(t *testing.T) {
+	newRoute := func(name string, accepted, resolved bool) *unstructured.Unstructured {
+		route := newConsumerPortalObject(gvkHTTPRoute, name, testInfraNamespace, true)
+		setRouteConditions(route, accepted, resolved)
+		return route
+	}
+	cases := map[string]struct {
+		accepted  bool
+		resolved  bool
+		wantReady bool
+	}{
+		"ready":            {accepted: true, resolved: true, wantReady: true},
+		"not accepted":     {accepted: false, resolved: true},
+		"unresolved pipes": {accepted: true, resolved: false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			r, _ := newReconciler(t,
+				newRoute(PortalRouteName, tc.accepted, tc.resolved),
+				newRoute(OAuthRouteName, true, true),
+			)
+			ready, err := r.routesReady(context.Background(), testInfraNamespace)
+			if err != nil {
+				t.Fatalf("routesReady: %v", err)
+			}
+			if ready != tc.wantReady {
+				t.Errorf("routesReady = %v, want %v", ready, tc.wantReady)
+			}
+		})
+	}
+}
+
+func TestRoutesReadyTreatsMissingRouteAsNotReady(t *testing.T) {
+	// No HTTPRoutes exist: right after the first apply the route can be
+	// absent from the API server (or a stale cache), which must requeue on
+	// the not-ready interval, not fail the reconcile with an error.
+	r, _ := newReconciler(t,
+		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+	)
+	ready, err := r.routesReady(context.Background(), testInfraNamespace)
+	if err != nil {
+		t.Fatalf("routesReady: %v", err)
+	}
+	if ready {
+		t.Error("routesReady = true with no routes, want false")
+	}
+}
+
+func TestRoutesReadyRejectsStaleGenerationConditions(t *testing.T) {
+	// After a spec change, the previous True conditions remain until the
+	// Gateway controller processes the new generation; they must not satisfy
+	// the readiness check.
+	route := newConsumerPortalObject(gvkHTTPRoute, PortalRouteName, testInfraNamespace, true)
+	route.SetGeneration(2)
+	setRouteConditions(route, true, true)
+	parents, found, err := unstructured.NestedSlice(route.Object, "status", "parents")
+	if err != nil || !found || len(parents) == 0 {
+		t.Fatalf("route has no status parents (found=%v err=%v)", found, err)
+	}
+	parent, ok := parents[0].(map[string]any)
+	if !ok {
+		t.Fatal("status parent is not a map")
+	}
+	conditions, _, _ := unstructured.NestedSlice(parent, "conditions")
+	if len(conditions) == 0 {
+		t.Fatal("status parent has no conditions")
+	}
+	condition, ok := conditions[0].(map[string]any)
+	if !ok {
+		t.Fatal("condition is not a map")
+	}
+	condition["observedGeneration"] = int64(1)
+	r, _ := newReconciler(t, route)
+	ready, err := r.routesReady(context.Background(), testInfraNamespace)
+	if err != nil {
+		t.Fatalf("routesReady: %v", err)
+	}
+	if ready {
+		t.Error("routesReady = true with conditions from an older generation, want false")
+	}
+}
+
+func TestCleanupKeepsOtherPortalInstances(t *testing.T) {
+	// The portal labels every object with its MaasTenantConfig namespace;
+	// disabling one instance must not delete another instance's objects,
+	// which can live in the same or cross namespaces.
+	ours := newConsumerPortalObject(gvkReferenceGrant, PortalRouteName, DefaultDashboardNamespace, true)
+	theirs := newConsumerPortalObject(gvkReferenceGrant, "other-instance-grant", DefaultDashboardNamespace, true)
+	theirs.SetLabels(map[string]string{
+		"app.kubernetes.io/part-of": "maas-consumer-portal",
+		tenant.LabelManagedBy:       tenant.ManagedByAIGatewayController,
+		LabelPortalInstance:         "other-tenant",
+	})
+	r, _ := newReconciler(t, ours, theirs)
+	if err := r.cleanup(context.Background(), testInfraNamespace, testInfraNamespace); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	current := &unstructured.Unstructured{}
+	current.SetGroupVersionKind(gvkReferenceGrant)
+	if err := r.Client.Get(context.Background(), client.ObjectKeyFromObject(ours), current); !apierrors.IsNotFound(err) {
+		t.Errorf("own ReferenceGrant still exists (err=%v)", err)
+	}
+	if err := r.Client.Get(context.Background(), client.ObjectKeyFromObject(theirs), current); err != nil {
+		t.Errorf("other instance's ReferenceGrant deleted: %v", err)
+	}
+}
+
+func TestPruneStaleGrantsRemovesOnlyOldNamespace(t *testing.T) {
+	current := newConsumerPortalObject(gvkReferenceGrant, PortalRouteName, "new-dashboard-ns", true)
+	stale := newConsumerPortalObject(gvkReferenceGrant, PortalRouteName, "old-dashboard-ns", true)
+	theirs := newConsumerPortalObject(gvkReferenceGrant, "other-instance-grant", "old-dashboard-ns", true)
+	theirs.SetLabels(map[string]string{
+		"app.kubernetes.io/part-of": "maas-consumer-portal",
+		tenant.LabelManagedBy:       tenant.ManagedByAIGatewayController,
+		LabelPortalInstance:         "other-tenant",
+	})
+	r, _ := newReconciler(t, current, stale, theirs)
+	if err := r.pruneStaleGrants(context.Background(), testInfraNamespace, "new-dashboard-ns"); err != nil {
+		t.Fatalf("pruneStaleGrants: %v", err)
+	}
+	check := func(obj *unstructured.Unstructured, wantGone bool) {
+		got := &unstructured.Unstructured{}
+		got.SetGroupVersionKind(gvkReferenceGrant)
+		err := r.Client.Get(context.Background(), client.ObjectKeyFromObject(obj), got)
+		if wantGone && !apierrors.IsNotFound(err) {
+			t.Errorf("ReferenceGrant in %s still exists (err=%v)", obj.GetNamespace(), err)
+		}
+		if !wantGone && err != nil {
+			t.Errorf("ReferenceGrant in %s deleted: %v", obj.GetNamespace(), err)
+		}
+	}
+	check(stale, true)
+	check(current, false)
+	check(theirs, false)
+}
+
+func TestCleanupDeletesManagedConsumerPortalObjects(t *testing.T) {
+	objects := []client.Object{
+		newConsumerPortalObject(gvkHTTPRoute, PortalRouteName, testInfraNamespace, true),
+		newConsumerPortalObject(gvkHTTPRoute, OAuthRouteName, testInfraNamespace, true),
+		newConsumerPortalObject(gvkReferenceGrant, PortalRouteName, DefaultDashboardNamespace, true),
+		newConsumerPortalObject(gvkAuthPolicy, PortalRouteName, testInfraNamespace, true),
+		newConsumerPortalObject(gvkAuthPolicy, OAuthRouteName, testInfraNamespace, true),
+		newConsumerPortalObject(gvkDestinationRule, PortalRouteName, testGatewayNamespace, true),
+		newConsumerPortalObject(gvkDestinationRule, AuthProxyName, testGatewayNamespace, true),
+		newConsumerPortalObject(gvkHTTPRoute, "unmanaged", testInfraNamespace, false),
+	}
+	r, _ := newReconciler(t, objects...)
+
+	if err := r.cleanup(context.Background(), testInfraNamespace, testInfraNamespace); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	for _, object := range objects[:len(objects)-1] {
+		current := &unstructured.Unstructured{}
+		source, ok := object.(*unstructured.Unstructured)
+		if !ok {
+			t.Fatalf("cleanup object is %T, want unstructured", object)
+		}
+		current.SetGroupVersionKind(source.GroupVersionKind())
+		err := r.Client.Get(context.Background(), client.ObjectKeyFromObject(object), current)
+		if !apierrors.IsNotFound(err) {
+			t.Errorf("managed %s %s still exists (err=%v)", current.GetKind(), client.ObjectKeyFromObject(object), err)
+		}
+	}
+	current := &unstructured.Unstructured{}
+	current.SetGroupVersionKind(gvkHTTPRoute)
+	if err := r.Client.Get(context.Background(), types.NamespacedName{
+		Namespace: testInfraNamespace, Name: "unmanaged",
+	}, current); err != nil {
+		t.Errorf("unmanaged HTTPRoute was deleted: %v", err)
 	}
 }
 
@@ -506,6 +842,7 @@ func TestReconcileRollsProxyWhenTrustedCABundleChanges(t *testing.T) {
 			newAITenant(aitenantOpts{issuer: testIssuer}),
 			newGateway(httpsListener(testHostname)),
 			adminCredentialsSecret(),
+			dashboardService(),
 			trustedCABundle(content),
 		}
 	}
@@ -537,12 +874,14 @@ func TestReconcileOmitsCABundleHashWithoutBundleContent(t *testing.T) {
 			newAITenant(aitenantOpts{issuer: testIssuer}),
 			newGateway(httpsListener(testHostname)),
 			adminCredentialsSecret(),
+			dashboardService(),
 		},
 		"empty bundle": {
 			newMTC(tenant.DefaultAITenantName, testInfraNamespace),
 			newAITenant(aitenantOpts{issuer: testIssuer}),
 			newGateway(httpsListener(testHostname)),
 			adminCredentialsSecret(),
+			dashboardService(),
 			emptyBundle,
 		},
 	}
@@ -579,6 +918,47 @@ func TestMaasTenantConfigForCABundleFiltersConfigMaps(t *testing.T) {
 	otherNamespace.SetNamespace("other-namespace")
 	if reqs := r.maasTenantConfigForCABundle(context.Background(), otherNamespace); len(reqs) != 0 {
 		t.Errorf("other ConfigMap namespace mapped to %v", reqs)
+	}
+}
+
+func TestMaasTenantConfigForPortalServiceFiltersNames(t *testing.T) {
+	r, _ := newReconciler(t, newMTC(tenant.DefaultAITenantName, testInfraNamespace))
+	service := &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+		Name: PortalServiceName, Namespace: DefaultDashboardNamespace,
+	}}
+	if reqs := r.maasTenantConfigForPortalService(context.Background(), service); len(reqs) != 1 {
+		t.Fatalf("maas-portal Service mapped to %v, want the MaasTenantConfig", reqs)
+	}
+	other := service.DeepCopy()
+	other.SetName("other-service")
+	if reqs := r.maasTenantConfigForPortalService(context.Background(), other); len(reqs) != 0 {
+		t.Errorf("other Service name mapped to %v", reqs)
+	}
+}
+
+func TestMaasTenantConfigForDSCIEnqueuesAllConfigs(t *testing.T) {
+	r, _ := newReconciler(t, newMTC(tenant.DefaultAITenantName, testInfraNamespace))
+	if reqs := r.maasTenantConfigForDSCI(context.Background(), dsci("odh-applications")); len(reqs) != 1 {
+		t.Fatalf("DSCI mapped to %v, want the MaasTenantConfig", reqs)
+	}
+}
+
+func TestMaasTenantConfigForPortalRouteFiltersNamesAndNamespace(t *testing.T) {
+	r, _ := newReconciler(t, newMTC(tenant.DefaultAITenantName, testInfraNamespace))
+	route := newConsumerPortalObject(gvkHTTPRoute, PortalRouteName, testInfraNamespace, false)
+
+	if reqs := r.maasTenantConfigForPortalRoute(context.Background(), route); len(reqs) != 1 {
+		t.Fatalf("portal route mapped to %v, want the MaasTenantConfig", reqs)
+	}
+	otherName := route.DeepCopy()
+	otherName.SetName("other-route")
+	if reqs := r.maasTenantConfigForPortalRoute(context.Background(), otherName); len(reqs) != 0 {
+		t.Errorf("other route name mapped to %v", reqs)
+	}
+	otherNamespace := route.DeepCopy()
+	otherNamespace.SetNamespace("other-namespace")
+	if reqs := r.maasTenantConfigForPortalRoute(context.Background(), otherNamespace); len(reqs) != 0 {
+		t.Errorf("route in a foreign namespace mapped to %v", reqs)
 	}
 }
 
@@ -625,6 +1005,7 @@ func TestReconcileBuildsCredentialsFromTenantClientSecret(t *testing.T) {
 		withClientSecretRef(newAITenant(aitenantOpts{issuer: testIssuer})),
 		newGateway(httpsListener(testHostname)),
 		tenantClientSecret("s3cret"),
+		dashboardService(),
 	)
 
 	reconcileMTC(t, r)
@@ -662,6 +1043,7 @@ func TestReconcileKeepsCookieSecretAndRestartsOnRotation(t *testing.T) {
 			withClientSecretRef(newAITenant(aitenantOpts{issuer: testIssuer})),
 			newGateway(httpsListener(testHostname)),
 			tenantClientSecret(secret), existing.DeepCopy(),
+			dashboardService(),
 		}
 	}
 
@@ -699,7 +1081,7 @@ func TestCleanupDeletesOnlyManagedCredentials(t *testing.T) {
 		Labels: map[string]string{tenant.LabelManagedBy: tenant.ManagedByAIGatewayController},
 	}}
 	r, _ := newReconciler(t, managed)
-	if err := r.cleanup(context.Background(), testInfraNamespace); err != nil {
+	if err := r.cleanup(context.Background(), testInfraNamespace, testInfraNamespace); err != nil {
 		t.Fatalf("cleanup: %v", err)
 	}
 	if err := r.Client.Get(context.Background(), types.NamespacedName{Namespace: testInfraNamespace, Name: CredentialsSecretName}, &corev1.Secret{}); !apierrors.IsNotFound(err) {
@@ -707,7 +1089,7 @@ func TestCleanupDeletesOnlyManagedCredentials(t *testing.T) {
 	}
 
 	r, _ = newReconciler(t, adminCredentialsSecret())
-	if err := r.cleanup(context.Background(), testInfraNamespace); err != nil {
+	if err := r.cleanup(context.Background(), testInfraNamespace, testInfraNamespace); err != nil {
 		t.Fatalf("cleanup: %v", err)
 	}
 	if err := r.Client.Get(context.Background(), types.NamespacedName{Namespace: testInfraNamespace, Name: CredentialsSecretName}, &corev1.Secret{}); err != nil {

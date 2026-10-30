@@ -36,6 +36,15 @@ func PayloadProcessingStatus(mtc *unstructured.Unstructured) string {
 	return annotations[AnnotationPayloadProcessingStatus]
 }
 
+// LegacyServes reports whether maas-controller's legacy IPP still serves the
+// tenant: IPP is selected, or Praxis is selected but the handoff has not
+// started. With Praxis selected, an absent status means maas-controller has
+// not cleaned up IPP yet, or its migration gate blocks the switch; IPP keeps
+// serving the tenant's models and reporting their status meanwhile.
+func LegacyServes(mtc *unstructured.Unstructured) bool {
+	return !UsesPraxis(mtc) || PayloadProcessingStatus(mtc) == ""
+}
+
 // EnsurePraxisMayDeploy decides whether praxis may render/apply for mtc.
 //
 //	steady           → ready (resume / steady-state)

@@ -208,8 +208,10 @@ func (r *Reconciler) mayAttachImplicitly(ctx context.Context, model *v1alpha1.Ex
 // defaultTenantGateway returns the Gateway of the default tenant (AITenant
 // models-as-a-service), which serves implicit attachments. ok is false unless
 // exactly one default AITenant publishes a Gateway. ipp reports a default
-// tenant that selects IPP: its controller serves models of every namespace
-// itself, so implicit attachments are left to it.
+// tenant that IPP still serves (tenant.LegacyServes): it selects IPP, or its
+// Praxis handoff has not started, for example while the MaaS migration gate
+// blocks it. IPP serves models of every namespace itself and reports their
+// status, so implicit attachments are left to it.
 func (r *Reconciler) defaultTenantGateway(ctx context.Context) (gateway v1alpha1.NamespacedObjectReference, ok, ipp bool, err error) {
 	list := &unstructured.UnstructuredList{}
 	list.SetGroupVersionKind(tenant.AITenantGVK.GroupVersion().WithKind("AITenantList"))
@@ -234,7 +236,7 @@ func (r *Reconciler) defaultTenantGateway(ctx context.Context) (gateway v1alpha1
 	if tenantNamespace, found := tenant.ConfigNamespace(owner); found {
 		mtc := tenant.NewMaasTenantConfig()
 		if err := r.Get(ctx, client.ObjectKey{Namespace: tenantNamespace, Name: tenant.MaasTenantConfigInstanceName}, mtc); err == nil {
-			ipp = !tenant.UsesPraxis(mtc)
+			ipp = tenant.LegacyServes(mtc)
 		} else if !apierrors.IsNotFound(err) {
 			return gateway, false, false, fmt.Errorf("get MaasTenantConfig %s/%s: %w", tenantNamespace, tenant.MaasTenantConfigInstanceName, err)
 		}
@@ -580,6 +582,12 @@ func (r *Reconciler) writeAttachedStatus(ctx context.Context, model *v1alpha1.Ex
 		}
 		message := fmt.Sprintf("Gateway %s: %s", gatewayKey(res.gateway), res.message)
 		applyModelStatus(model, phase, false, res.reason, message, "")
+		// A failed model also drops a route another writer named, such as a
+		// removed IPP route; a pending one keeps it, as that writer may still
+		// serve the model.
+		if phase == modelPhaseFailed && r.staleRouteName(ctx, model) {
+			model.Status.HTTPRouteName = ""
+		}
 		return r.patchModelStatus(ctx, old, model)
 	}
 	routeName := ""
@@ -926,12 +934,19 @@ func (r *Reconciler) resolveAttachedModel(ctx context.Context, t attachmentTenan
 	}
 	providerPtrs := make([]*v1alpha1.ExternalProvider, 0, len(providers.Items))
 	for i := range providers.Items {
-		if !providers.Items[i].DeletionTimestamp.IsZero() || r.validateProvider(ctx, &providers.Items[i]) != nil {
+		if !providers.Items[i].DeletionTimestamp.IsZero() {
 			continue
 		}
-		ready := providers.Items[i].DeepCopy()
-		ready.Status.Phase = resolver.PhaseReady
-		providerPtrs = append(providerPtrs, ready)
+		// The provider's own configuration decides, not the status another
+		// writer may have left. An invalid provider is kept as Failed, so the
+		// model reports why it cannot be used rather than that it is missing.
+		checked := providers.Items[i].DeepCopy()
+		checked.Status.Phase, checked.Status.Conditions = resolver.PhaseReady, nil
+		if err := r.validateProvider(ctx, checked); err != nil {
+			checked.Status.Phase = providerPhaseFailed
+			setCondition(&checked.Status.Conditions, conditionReady, metav1.ConditionFalse, reasonReconcileFailed, err.Error())
+		}
+		providerPtrs = append(providerPtrs, checked)
 	}
 	foreign, unready, err := r.foreignProviders(ctx, m.Namespace, []*v1alpha1.ExternalModel{m})
 	if err != nil {
@@ -953,7 +968,13 @@ func (r *Reconciler) resolveAttachedModel(ctx context.Context, t attachmentTenan
 		switch {
 		case errors.Is(err, resolver.ErrNoRoutes) && denied != "":
 			candidate.reason, candidate.message = reasonRefNotPermitted, denied
-		case errors.Is(err, resolver.ErrNoRoutes) || errors.Is(err, errCredentialNotReady):
+		case errors.Is(err, resolver.ErrNoRoutes):
+			candidate.reason = reasonProviderNotReady
+			if reason, message, ok := unroutedStatus(set, m.Namespace+"/"+m.Name); ok {
+				// The skipped references, not only that none resolved.
+				candidate.reason, candidate.message = reason, message
+			}
+		case errors.Is(err, errCredentialNotReady):
 			candidate.reason = reasonProviderNotReady
 		}
 		return nil

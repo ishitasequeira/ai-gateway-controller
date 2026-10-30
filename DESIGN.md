@@ -86,7 +86,9 @@ or the tenant is not steady, and `Ready`/`Validated` once credentials, transport
 and the tenant resolve. A namespace no tenant claims has no tenant-local
 transport to wait for; it is served only through Gateway attachments, and the
 provider reports its own configuration: `Ready`/`Validated` when its Secret
-reference is valid, `Failed` otherwise. Such a provider keeps no finalizer,
+reference is valid, `Failed` otherwise, and nothing while IPP still serves the
+default tenant (`tenant.LegacyServes`), since that IPP serves the namespace's
+models and reports their providers' status. Such a provider keeps no finalizer,
 since there is no tenant transport to clean up. Once a claim arrives (an
 `AITenant` is created for the namespace), the next reconcile moves it to the
 tenant path and the `Pending` gate above.
@@ -100,7 +102,11 @@ IPP remains free to write status; the requeue retries the resolution.
 An explicit IPP selection is the existing handoff, unchanged in direction:
 remove the Praxis transport except the backends the namespace's attachment
 routes still use, remove the finalizer, and write no status. IPP resumes as the
-writer for that namespace on rollback. Because ownership is re-derived from the
+writer for that namespace on rollback. A Praxis selection whose handoff has not
+started (no `payload-processing-status`) is likewise left to IPP: the provider
+is neither claimed nor given a status until maas-controller writes
+`cleanup-complete`. Because
+ownership is re-derived from the
 `MaasTenantConfig` the controller already watches, switching a namespace
 between Praxis and IPP converges without deleting controller pods.
 
@@ -314,7 +320,11 @@ doc comment for the full state machine this mirrors. In short:
     assumed to run legacy IPP); blocked when praxis is selected (wait for
     legacy cleanup). Brand-new tenants are seeded with `cleanup-complete`
     at `MaasTenantConfig` creation time so their first deploy is never
-    blocked by absent.
+    blocked by absent. While praxis is selected and the status is absent,
+    for example because the MaaS migration gate keeps an upgraded tenant on
+    IPP, IPP still serves the tenant: this controller writes no
+    ExternalModel or ExternalProvider status for it (`tenant.LegacyServes`),
+    since MaaS reads a model that is not Ready as unhealthy.
 - Claiming for praxis (`EnsurePraxisMayDeploy` / `claimPraxisSteady`) writes
   `steady` via an optimistic-concurrency `Update`. Legacy's mirror claim
   deletes the annotation back to absent. Concurrent claims on the same
@@ -370,14 +380,16 @@ compatibility one-pager; this records how it is implemented.
   attachment to a tenant that is not steady. Unlike an explicit binding, the
   implicit attachment follows the default tenant: while no single default
   `AITenant` publishes a Gateway it is removed and the model is `Pending`
-  (`TenantNotResolved`). A default tenant selecting IPP leaves the model to its
+  (`TenantNotResolved`). A default tenant that IPP still serves (it selects
+  IPP, or selects Praxis before its handoff starts) leaves the model to its
   IPP, which serves every namespace: only the implicit attachment and its
   `status.gateways` result are removed. Adding `gatewayRefs` or a
   `MaasTenantConfig` to the namespace replaces the implicit attachment and
   removes its objects. A provider in a namespace with no `MaasTenantConfig`
   that no tenant has served reports only its own configuration and Secret
-  (`Ready` or `Failed`): attachments apply its transport, and it serves a
-  tenant's own models only once that tenant has applied it.
+  (`Ready` or `Failed`), and nothing while IPP serves the default tenant:
+  attachments apply its transport, and it serves a tenant's own models only
+  once that tenant has applied it.
 - **Extra attachments** resolve Gateway → owning `AITenant`
   (`status.gatewayRef`) → its `MaasTenantConfig` (`GatewayNotManaged`,
   `AmbiguousTenant`) and are gated per tenant by the handshake above: Praxis and
@@ -393,7 +405,12 @@ compatibility one-pager; this records how it is implemented.
   attachment, otherwise it reports the first failing one in `gatewayRefs`
   order. `httpRouteName` names a single attachment's route, is empty for
   several, and is cleared while an extra attachment is not Ready; a home route
-  keeps its existing behavior. Removing a Gateway removes its result; removing every
+  keeps its existing behavior. A `Failed` model also drops a route name another
+  writer recorded, such as a removed IPP route, and a home route that no
+  longer exists. A failed attachment's reason lists each skipped provider
+  reference, as the tenant-local path does, and a tenant-namespace model whose
+  references all fail is not Ready while other models of the namespace serve.
+  Removing a Gateway removes its result; removing every
   `gatewayRefs` entry removes them all.
 - **Authorization.** The attachment's HTTPRoute is created in the model
   namespace first and the Gateway enforces its listener `allowedRoutes`.
@@ -528,6 +545,15 @@ TLS on port 4180 with a service-ca certificate, trusts
 `odh-trusted-ca-bundle` for the OIDC issuer, and accepts traffic only from the
 tenant Gateway and Authorino. Its OIDC callback is
 `https://<Gateway HTTPS listener hostname>/oauth2/callback`.
+
+The same reconciliation creates the `maas-consumer-portal` and
+`maas-consumer-portal-oauth2` HTTPRoutes on the default Gateway, a
+ReferenceGrant for the dashboard Service, backend TLS DestinationRules, and
+route-scoped AuthPolicies. The portal slice is applied only after
+`maas-portal` exists in the dashboard namespace, and readiness requires both
+routes to report `Accepted` and `ResolvedRefs`. Authorino validates browser
+sessions by calling the proxy's `/oauth2/auth` endpoint directly and redirects
+unauthenticated portal requests to `/oauth2/start`.
 
 The proxy reads its client and cookie secrets from
 `maas-consumer-portal-auth-proxy-creds` in the same namespace. Until that Secret
@@ -694,6 +720,7 @@ ai-gateway-controller/
 | `--kube-auth-proxy-image` | `RELATED_IMAGE_ODH_KUBE_AUTH_PROXY_IMAGE`, else `quay.io/opendatahub/odh-kube-auth-proxy:odh-stable` | Consumer portal auth proxy image |
 | `--consumer-portal-manifest-path` | `/config/manifests/consumer-portal/base` | Kustomize entrypoint for the consumer portal auth proxy |
 | `--authorino-namespace` | `kuadrant-system` | Authorino namespace allowed through the auth proxy NetworkPolicy |
+| `--consumer-portal-dashboard-namespace` | `redhat-ods-applications` | Namespace containing the consumer portal Service |
 | `--leader-elect` | `false` | Enable when running multiple replicas |
 | `--metrics-bind-address`, `--metrics-secure`, `--health-probe-bind-address` | `:8443`, `true`, `:8081` | Standard controller-runtime endpoints. Defaults are deliberately not restated in `config/self/manager/manager.yaml` — see the note there |
 

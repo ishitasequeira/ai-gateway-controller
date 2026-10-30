@@ -41,6 +41,13 @@ type extprocCredential struct {
 
 const extprocConfigHashAnnotation = "ai-gateway-controller.opendatahub.io/extproc-config-sha256"
 
+// extprocMaxBodyBytes bounds the request bodies Praxis buffers: the
+// translation-enabled ExternalModel server limit, the request JSON the
+// selected-provider translator retains, and the stream_usage_inject buffer.
+// The translator limit is also the selected-upstream request body limit, so a
+// smaller value rejects long-context requests to every provider with 413.
+const extprocMaxBodyBytes = 10485760
+
 // configureSharedExtProc renders the shared post-auth chain from the
 // authoritative MaasTenantConfig permission. The translation filters are
 // restricted to Anthropic Messages requests and do not change the dedicated
@@ -148,8 +155,12 @@ func configureSharedExtProcResponseMode(resources []unstructured.Unstructured, t
 	return nil
 }
 
-// sharedExtProcConfig adds the registered Anthropic-client → Chat
-// Completions-backend filters only when the tenant permits translation.
+// sharedExtProcConfig injects stream_options.include_usage into streamed Chat
+// Completions requests, so the final chunk reports token usage and token rate
+// limits count streams, as IPP did. It then adds the registered
+// Anthropic-client → Chat Completions-backend filters only when the tenant
+// permits translation; the injection runs first and does not touch the
+// Messages requests they translate.
 // The ordered chain validates the Messages envelope, translates buffered JSON,
 // converts SSE responses, strips the client Anthropic key, then rewrites the
 // exact Messages path. The tenant's permission also selects the shared ipp
@@ -170,6 +181,7 @@ func sharedExtProcConfig(apiTranslation bool) string {
 	b.WriteString("  - name: ipp\n")
 	b.WriteString("    filters:\n")
 	b.WriteString("      - filter: request_id\n")
+	writeStreamUsageInject(&b)
 	if apiTranslation {
 		b.WriteString("      - filter: anthropic_messages_request\n")
 		b.WriteString("        on_invalid: reject\n")
@@ -208,6 +220,13 @@ func sharedExtProcConfig(apiTranslation bool) string {
 	b.WriteString("\ninsecure_options:\n")
 	b.WriteString("  allow_unbounded_body: true\n")
 	return b.String()
+}
+
+// writeStreamUsageInject renders the stream_usage_inject filter. It needs the
+// complete request body, which both chains receive in BUFFERED mode.
+func writeStreamUsageInject(b *strings.Builder) {
+	b.WriteString("      - filter: stream_usage_inject\n")
+	fmt.Fprintf(b, "        max_body_bytes: %d\n", extprocMaxBodyBytes)
 }
 
 // configureExternalModelExtProc completes the dedicated ExternalModel ExtProc
@@ -311,9 +330,9 @@ func configureExternalModelExtProc(resources []unstructured.Unstructured, tenant
 	return nil
 }
 
-// configureExternalModelRequestOrdering removes early body delivery. The route
-// uses BUFFERED mode when translation is enabled, so Envoy supplies a complete
-// body without deferring its header response.
+// configureExternalModelRequestOrdering removes early body delivery. The routes
+// use BUFFERED request mode, so Envoy supplies a complete body without
+// deferring its header response.
 func configureExternalModelRequestOrdering(resources []unstructured.Unstructured, tenantID string) error {
 	wantFilter := PayloadProcessingExternalModelFilterNameForTenant(tenantID)
 	filterFound := false
@@ -424,7 +443,7 @@ func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extpro
 	// translation disabled, omit the translation and provider-profile filters
 	// and retain main's unbounded-body setting.
 	if apiTranslationEnabled {
-		b.WriteString("  max_body_bytes: 10485760\n")
+		fmt.Fprintf(&b, "  max_body_bytes: %d\n", extprocMaxBodyBytes)
 	}
 	b.WriteString("  tls:\n    mode: self_signed\n\n")
 	b.WriteString("filter_chains:\n  - name: post-auth\n    filters:\n      - filter: intelligent_route\n")
@@ -437,12 +456,15 @@ func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extpro
 		fmt.Fprintf(&b, "%q", cluster)
 	}
 	b.WriteString("]\n        reload: {enabled: true, debounce_ms: 500}\n")
+	// Streamed requests to every provider report usage, so token rate
+	// limits count them. The Anthropic translator maps include_usage.
+	writeStreamUsageInject(&b)
 	if apiTranslationEnabled {
 		b.WriteString("      - filter: openai_chat_completions_to_anthropic_stream\n")
 		b.WriteString("        max_partial_event_bytes: 1048576\n        max_tool_blocks: 256\n")
 		b.WriteString("      - filter: openai_chat_completions_to_anthropic\n")
 		b.WriteString("        api_translation_enabled: true\n")
-		b.WriteString("        max_body_bytes: 1048576\n")
+		fmt.Fprintf(&b, "        max_body_bytes: %d\n", extprocMaxBodyBytes)
 	}
 	if len(credentials) > 0 {
 		b.WriteString("      - filter: credential_inject\n        credentials:\n")

@@ -1156,11 +1156,13 @@ def wait_externalmodel_revision(expected_clusters, label, *, changed_from=None, 
             all(not any(field in candidate for field in provider_profile_fields)
                 for candidate in profile_candidates)
         )
-        body_limit_state_matches = (
-            "max_body_bytes: 1048576" in snapshot["extproc_config"]
+        # The translator's limit is the selected-upstream request limit; it
+        # matches the server limit so long-context requests are not rejected.
+        body_limit_state_matches = "filter: stream_usage_inject" in snapshot["extproc_config"] and (
+            "api_translation_enabled: true\n        max_body_bytes: 10485760" in snapshot["extproc_config"]
             and translation_stream_filter_present
             if api_translation_enabled else
-            "max_body_bytes" not in snapshot["extproc_config"]
+            "\n  max_body_bytes:" not in snapshot["extproc_config"]
             and "allow_unbounded_body: true" in snapshot["extproc_config"]
             and not translation_stream_filter_present
         )

@@ -1,7 +1,7 @@
 # Pinned models-as-a-service source for ai-gateway-controller e2e.
 #
-# Latest main as of 2026-10-16 (ccce775): includes subscription list poll fix (#1680)
-# and streaming chat/completions smoke E2E (#1684).
+# Latest main as of 2026-10-30 (7879675): includes the TokenRateLimitPolicy update conflict
+# retry (#1758) and standardized e2e wait timeouts (#1759).
 #
 # Validate e2e when bumping this pin. E2E also deploys the MaaS images built from this
 # commit (test/e2e/scripts/maas-image-defaults.sh), so pin a models-as-a-service main commit
@@ -9,6 +9,6 @@
 # Override for one-off runs without editing this file:
 #   MAAS_COMMIT=<sha> ./test/e2e/scripts/prow_run_ai_gateway_controller_test.sh
 maas_repo=https://github.com/opendatahub-io/models-as-a-service
-maas_commit=ccce7752af146eb3de9e99df107c26f414878726
+maas_commit=7879675aa66d002425c7b32375d6d0156eaa0c56
 maas_ref=main
-updated_at=2026-10-16T13:45:00Z
+updated_at=2026-10-30T12:15:00Z

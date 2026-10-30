@@ -57,9 +57,9 @@ func TestConfigureExternalModelExtProcProjectsReferencesAndTrustedHandoff(t *tes
 		"filter: intelligent_route",
 		"filter: credential_inject",
 		"provider_hop_clusters: [\"provider-provider-a\", \"provider-provider-b\"]",
-		"max_body_bytes: 10485760",
-		"api_translation_enabled: true",
-		"max_body_bytes: 1048576",
+		"  max_body_bytes: 10485760\n",
+		"filter: stream_usage_inject\n        max_body_bytes: 10485760\n",
+		"api_translation_enabled: true\n        max_body_bytes: 10485760\n",
 		"strategy: bearer_token",
 		"a-secret",
 		"b-secret",
@@ -70,6 +70,7 @@ func TestConfigureExternalModelExtProcProjectsReferencesAndTrustedHandoff(t *tes
 	}
 	profiled := []string{
 		"filter: intelligent_route",
+		"filter: stream_usage_inject",
 		"filter: openai_chat_completions_to_anthropic_stream",
 		"filter: openai_chat_completions_to_anthropic\n",
 		"filter: credential_inject",
@@ -146,6 +147,8 @@ filter_chains:
         model_header: X-Gateway-Model-Name
         provider_hop_clusters: ["provider-openai"]
         reload: {enabled: true, debounce_ms: 500}
+      - filter: stream_usage_inject
+        max_body_bytes: 10485760
 
 insecure_options:
   allow_unbounded_body: true
@@ -293,12 +296,18 @@ func TestSharedExtProcConfigDefaultOff(t *testing.T) {
 	if !strings.Contains(config, "filter: request_id") {
 		t.Fatalf("default shared chain lost request_id:\n%s", config)
 	}
+	// Internal models are served through the shared chain: their streams must
+	// report usage, as IPP's include_usage injection made them do.
+	if !strings.Contains(config, "filter: request_id\n      - filter: stream_usage_inject\n        max_body_bytes: 10485760\n") {
+		t.Fatalf("default shared chain does not inject stream usage:\n%s", config)
+	}
 }
 
 func TestSharedExtProcConfigUsesRegisteredOrderedMessagesFilters(t *testing.T) {
 	config := sharedExtProcConfig(true)
 	ordered := []string{
 		"filter: request_id",
+		"filter: stream_usage_inject",
 		"filter: anthropic_messages_request",
 		"filter: anthropic_messages_to_chat_completions",
 		"filter: anthropic_messages_to_chat_completions_stream",
@@ -476,10 +485,13 @@ func TestTranslationSettingsToggleWithoutStaleRenderedState(t *testing.T) {
 			strings.Contains(externalConfig, "openai_chat_completions_to_anthropic\n") != enabled {
 			t.Fatalf("ExternalModel translation filters stale for enabled=%t:\n%s", enabled, externalConfig)
 		}
-		if enabled && (!strings.Contains(externalConfig, "max_body_bytes: 1048576") || strings.Contains(externalConfig, "allow_unbounded_body: true")) {
+		if !strings.Contains(externalConfig, "filter: stream_usage_inject") {
+			t.Fatalf("ExternalModel chain lost stream_usage_inject for enabled=%t:\n%s", enabled, externalConfig)
+		}
+		if enabled && (!strings.Contains(externalConfig, "\n  max_body_bytes: 10485760\n") || strings.Contains(externalConfig, "allow_unbounded_body: true")) {
 			t.Fatalf("translation-on body limits are not rendered for enabled=true:\n%s", externalConfig)
 		}
-		if !enabled && (strings.Contains(externalConfig, "max_body_bytes") || !strings.Contains(externalConfig, "allow_unbounded_body: true")) {
+		if !enabled && (strings.Contains(externalConfig, "\n  max_body_bytes:") || !strings.Contains(externalConfig, "allow_unbounded_body: true")) {
 			t.Fatalf("translation-off body limits are stale for enabled=false:\n%s", externalConfig)
 		}
 	}
