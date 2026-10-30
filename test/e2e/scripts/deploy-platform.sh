@@ -77,15 +77,14 @@ deploy_maas_platform() {
     [[ -n "${AI_GATEWAY_OPERATOR_IMAGE:-}" ]] && echo "Using custom ai-gateway-operator image: ${AI_GATEWAY_OPERATOR_IMAGE} (requires DEPLOY_MODE=operator)"
     echo "Deployment mode: ${DEPLOY_MODE}"
 
-    echo "Installing cert-manager and LeaderWorkerSet operators..."
-    if ! bash "${MAAS_CHECKOUT_ROOT}/.github/hack/install-cert-manager-and-lws.sh"; then
-        echo "❌ ERROR: cert-manager/LWS installation failed"
-        exit 1
-    fi
+    # cert-manager and LeaderWorkerSet are chart dependencies of the shared-deps
+    # install that deploy.sh performs (scripts/setup-shared-deps.sh, profile=maas).
+    # The standalone installer that used to live at .github/hack/ is gone upstream
+    # as of the 7879675 pin; installing them here as well would only duplicate it.
 
     if [[ "${DEPLOY_MODE}" == "kustomize" ]]; then
         echo "Installing OpenDataHub operator..."
-        if ! bash "${MAAS_CHECKOUT_ROOT}/.github/hack/install-odh.sh"; then
+        if ! bash "${MAAS_CHECKOUT_ROOT}/scripts/installers/install-odh.sh"; then
             echo "❌ ERROR: ODH installation failed"
             exit 1
         fi
