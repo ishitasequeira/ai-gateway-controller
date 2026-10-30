@@ -106,7 +106,9 @@ _ensure_maas_checkout() {
 
 _ensure_maas_script_perms() {
   # Shallow fetch and Python patches rewrite scripts without the executable bit.
-  find "${MAAS_CHECKOUT_ROOT}/scripts" "${MAAS_CHECKOUT_ROOT}/.github/hack" \
+  # .github/hack/ existed until the 7879675 pin and is gone upstream; scripts/
+  # covers its replacements (scripts/installers/).
+  find "${MAAS_CHECKOUT_ROOT}/scripts" \
     "${MAAS_CHECKOUT_ROOT}/test/e2e/scripts" \
     -name '*.sh' -exec chmod +x {} + 2>/dev/null || true
 }

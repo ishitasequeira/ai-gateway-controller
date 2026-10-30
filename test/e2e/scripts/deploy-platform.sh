@@ -77,20 +77,18 @@ deploy_maas_platform() {
     [[ -n "${AI_GATEWAY_OPERATOR_IMAGE:-}" ]] && echo "Using custom ai-gateway-operator image: ${AI_GATEWAY_OPERATOR_IMAGE} (requires DEPLOY_MODE=operator)"
     echo "Deployment mode: ${DEPLOY_MODE}"
 
-    # cert-manager and LeaderWorkerSet are chart dependencies of the shared-deps
-    # install that deploy.sh performs (scripts/setup-shared-deps.sh, profile=maas).
-    # The standalone installer that used to live at .github/hack/ is gone upstream
-    # as of the 7879675 pin; installing them here as well would only duplicate it.
-
-    if [[ "${DEPLOY_MODE}" == "kustomize" ]]; then
-        echo "Installing OpenDataHub operator..."
-        if ! bash "${MAAS_CHECKOUT_ROOT}/scripts/installers/install-odh.sh"; then
-            echo "❌ ERROR: ODH installation failed"
-            exit 1
-        fi
-    else
-        echo "Skipping standalone ODH install (DEPLOY_MODE=${DEPLOY_MODE}; deploy.sh installs ODH + DSC directly)"
-    fi
+    # Nothing is installed directly here: deploy.sh's shared-dependencies phase
+    # (scripts/setup-shared-deps.sh, profile=maas) installs the ODH/RHOAI operator,
+    # cert-manager, LeaderWorkerSet, Kuadrant, DSCI and DSC from the pinned
+    # odh-gitops chart, for both deployment modes. It honours OPERATOR_CATALOG,
+    # OPERATOR_CHANNEL and OPERATOR_IMAGE, which are forwarded to deploy.sh below.
+    #
+    # Both standalone installers that used to live at .github/hack/ are gone
+    # upstream as of the 7879675 pin. Do not repoint them at
+    # scripts/installers/install-odh.sh: that one is a dev-only path that
+    # shallow-clones opendatahub-operator main and runs "make manifests", so it
+    # needs a newer Go than the CI builder image ships and it ignores
+    # OPERATOR_CATALOG/OPERATOR_IMAGE entirely.
 
     if [[ "${EXTERNAL_OIDC}" == "true" ]]; then
         echo "External OIDC enabled (Keycloak via deploy.sh --enable-keycloak, realm tenant-a defaults)..."
