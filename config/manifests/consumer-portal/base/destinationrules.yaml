@@ -1,0 +1,35 @@
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: maas-consumer-portal-backend-tls
+  labels:
+    app.kubernetes.io/name: maas-consumer-portal
+    app.kubernetes.io/part-of: maas-consumer-portal
+spec:
+  host: CONSUMER_PORTAL_PORTAL_SERVICE_FQDN
+  trafficPolicy:
+    portLevelSettings:
+      - port:
+          number: 8443
+        tls:
+          mode: SIMPLE
+          caCertificates: /var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt
+          sni: CONSUMER_PORTAL_PORTAL_SERVICE_FQDN
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: maas-consumer-portal-auth-proxy-backend-tls
+  labels:
+    app.kubernetes.io/name: maas-consumer-portal-auth-proxy
+    app.kubernetes.io/part-of: maas-consumer-portal
+spec:
+  host: CONSUMER_PORTAL_PROXY_SERVICE_FQDN
+  trafficPolicy:
+    portLevelSettings:
+      - port:
+          number: 4180
+        tls:
+          mode: SIMPLE
+          caCertificates: /var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt
+          sni: CONSUMER_PORTAL_PROXY_SERVICE_FQDN

@@ -2200,3 +2200,108 @@ func TestDeletingModelRemovesExtraAttachmentsWhileItsHomeWaits(t *testing.T) {
 		t.Fatalf("finalizers = %v, want only the home finalizer", got.Finalizers)
 	}
 }
+
+// blockedDefaultTenantObjects returns a default tenant that selects Praxis by
+// default but whose handoff has not started: maas-controller's migration gate
+// keeps it on IPP, so it has no payload-processing-status.
+func blockedDefaultTenantObjects() (ait, mtc *unstructured.Unstructured) {
+	ait = controllerAITenant(tenant.DefaultAITenantName, "models-as-a-service", "models-as-a-service", defaultGateway.Name, defaultGateway.Namespace)
+	mtc = controllerMaasTenantConfig("models-as-a-service", tenant.DefaultAITenantName, "models-as-a-service", "")
+	annotations := mtc.GetAnnotations()
+	delete(annotations, tenant.AnnotationPayloadProcessingType)
+	delete(annotations, tenant.AnnotationPayloadProcessingStatus)
+	mtc.SetAnnotations(annotations)
+	return ait, mtc
+}
+
+func TestBlockedDefaultTenantMigrationLeavesIPPServedModelsAlone(t *testing.T) {
+	ait, mtc := blockedDefaultTenantObjects()
+	r, model := implicitAttachmentFixture(t, ait, mtc)
+	if got := getModel(t, r, model); got.Status.Phase != "" || len(got.Status.Conditions) > 0 || len(got.Status.Gateways) > 0 || len(got.Finalizers) > 0 {
+		t.Fatalf("model IPP still serves was changed: finalizers %v, status %#v", got.Finalizers, got.Status)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(model, defaultGateway)); !apierrors.IsNotFound(err) {
+		t.Fatalf("attached to a default tenant IPP still serves: %v", err)
+	}
+	var provider v1alpha1.ExternalProvider
+	if err := r.Get(context.Background(), types.NamespacedName{Namespace: "team", Name: "openai"}, &provider); err != nil {
+		t.Fatal(err)
+	}
+	if provider.Status.Phase != "" || len(provider.Status.Conditions) > 0 {
+		t.Fatalf("provider IPP still reports was given status %#v", provider.Status)
+	}
+
+	// A not-ready result written earlier is removed, so MaaS reads IPP's
+	// route again; IPP's own status is left as it is.
+	written := getModel(t, r, model)
+	written.Status.Phase, written.Status.HTTPRouteName = resolver.PhaseReady, "chat"
+	written.Status.Conditions = []metav1.Condition{{Type: conditionReady, Status: metav1.ConditionTrue, Reason: "Reconciled", LastTransitionTime: metav1.Now()}}
+	written.Status.Gateways = []v1alpha1.ExternalModelGatewayStatus{{NamespacedObjectReference: defaultGateway, Conditions: []metav1.Condition{{
+		Type: conditionReady, Status: metav1.ConditionFalse, Reason: reasonTenantNotSteady, LastTransitionTime: metav1.Now(),
+	}}}}
+	if err := r.Status().Update(context.Background(), written); err != nil {
+		t.Fatal(err)
+	}
+	reconcileModel(t, r, model)
+	got := getModel(t, r, model)
+	if len(got.Status.Gateways) > 0 || got.Status.HTTPRouteName != "chat" || got.Status.Phase != resolver.PhaseReady || readyReason(got) != "Reconciled" {
+		t.Fatalf("status after a blocked handoff = %#v", got.Status)
+	}
+}
+
+func TestDefaultTenantEventsEnqueueProvidersOutsideTenants(t *testing.T) {
+	outside, outsideSecret := attachmentProvider("team")
+	inside, insideSecret := attachmentProvider("tenant-b")
+	ait, mtc := blockedDefaultTenantObjects()
+	objects := append([]client.Object{ait, mtc, outside, outsideSecret, inside, insideSecret},
+		attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := controllerTestClient(t, objects...)
+	outsideRequest := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(outside)}
+	if got := r.tenantProviders(context.Background(), mtc); !slices.Contains(got, outsideRequest) || slices.Contains(got, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(inside)}) {
+		t.Fatalf("default tenant config event enqueued %v, want the provider outside tenant namespaces only", got)
+	}
+	if got := r.aitenantProviders(context.Background(), ait); !slices.Contains(got, outsideRequest) {
+		t.Fatalf("default AITenant event enqueued %v, want %v", got, outsideRequest)
+	}
+	tenantB := controllerMaasTenantConfig("tenant-b", "tenant-b", "models-as-a-service", "praxis")
+	if got := r.tenantProviders(context.Background(), tenantB); slices.Contains(got, outsideRequest) {
+		t.Fatalf("another tenant's event enqueued %v", got)
+	}
+}
+
+func TestAttachedModelReportsWhyNoProviderResolved(t *testing.T) {
+	r, model := servedImplicitFixture(t)
+	plain, plainSecret := attachmentProvider("team")
+	plain.Name, plain.UID = "plain", "provider-plain"
+	plain.Annotations = map[string]string{resolver.ProviderTLSAnnotation: "false"}
+	for _, object := range []client.Object{plain, plainSecret} {
+		if err := r.Create(context.Background(), object); err != nil && !apierrors.IsAlreadyExists(err) {
+			t.Fatal(err)
+		}
+	}
+	got := getModel(t, r, model)
+	got.Spec.ExternalProviderRefs = []v1alpha1.ExternalProviderRef{
+		{Ref: v1alpha1.ExternalProviderReference{Name: "ghost"}, TargetModel: "gpt-4o", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
+		{Ref: v1alpha1.ExternalProviderReference{Name: "plain"}, TargetModel: "gpt-4o", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
+	}
+	if err := r.Update(context.Background(), got); err != nil {
+		t.Fatal(err)
+	}
+	// A route name IPP recorded before the migration does not exist any more.
+	got = getModel(t, r, model)
+	got.Status.HTTPRouteName = "chat"
+	if err := r.Status().Update(context.Background(), got); err != nil {
+		t.Fatal(err)
+	}
+	reconcileModel(t, r, model)
+	got = getModel(t, r, model)
+	result := apiMeta.FindStatusCondition(gatewayResult(t, got, defaultGateway).Conditions, conditionReady)
+	if got.Status.Phase != modelPhaseFailed || result == nil || result.Reason != reasonProviderNotReady ||
+		!strings.Contains(result.Message, "provider ghost: external provider not found") ||
+		!strings.Contains(result.Message, "provider plain: provider phase \"Failed\" is not Ready: "+resolver.ProviderTLSAnnotation) {
+		t.Fatalf("attachment result = %#v, status = %#v", result, got.Status)
+	}
+	if got.Status.HTTPRouteName != "" {
+		t.Fatalf("failed model keeps httpRouteName %q", got.Status.HTTPRouteName)
+	}
+}

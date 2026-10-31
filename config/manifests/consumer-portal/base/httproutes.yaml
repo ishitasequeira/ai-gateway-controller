@@ -1,0 +1,63 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: maas-consumer-portal
+  labels:
+    app.kubernetes.io/name: maas-consumer-portal
+    app.kubernetes.io/part-of: maas-consumer-portal
+spec:
+  hostnames:
+    - CONSUMER_PORTAL_HOSTNAME
+  parentRefs:
+    - name: CONSUMER_PORTAL_GATEWAY_NAME
+      namespace: CONSUMER_PORTAL_GATEWAY_NAMESPACE
+      sectionName: https
+  rules:
+    - matches:
+        - path:
+            type: Exact
+            value: /maas-portal
+      filters:
+        - type: RequestRedirect
+          requestRedirect:
+            path:
+              type: ReplaceFullPath
+              replaceFullPath: /maas-portal/
+            statusCode: 302
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /maas-portal
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /
+      backendRefs:
+        - name: maas-portal
+          namespace: CONSUMER_PORTAL_DASHBOARD_NAMESPACE
+          port: 8443
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: maas-consumer-portal-oauth2
+  labels:
+    app.kubernetes.io/name: maas-consumer-portal-oauth2
+    app.kubernetes.io/part-of: maas-consumer-portal
+spec:
+  hostnames:
+    - CONSUMER_PORTAL_HOSTNAME
+  parentRefs:
+    - name: CONSUMER_PORTAL_GATEWAY_NAME
+      namespace: CONSUMER_PORTAL_GATEWAY_NAMESPACE
+      sectionName: https
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /oauth2
+      backendRefs:
+        - name: maas-consumer-portal-auth-proxy
+          port: 4180

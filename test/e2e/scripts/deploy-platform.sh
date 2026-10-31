@@ -2,7 +2,8 @@
 # =============================================================================
 # MaaS Platform Deployment
 # =============================================================================
-# Installs cert-manager, ODH operator, and deploys MaaS via deploy.sh.
+# Deploys MaaS via deploy.sh, which also installs its shared dependencies
+# (cert-manager, LeaderWorkerSet, RHCL, ODH operator, DSC).
 # Can be sourced by prow_run_smoke_test.sh or run standalone.
 # =============================================================================
 

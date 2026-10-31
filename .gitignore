@@ -38,3 +38,7 @@ evidence/
 # Local OpenShift state, rendered manifests, credentials, and run evidence.
 .openshift-state/
 test/openshift-env/.state/
+
+# local build artifacts / editor scratch
+/manager
+/component-architecture.json

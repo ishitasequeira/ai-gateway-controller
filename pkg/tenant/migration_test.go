@@ -170,3 +170,31 @@ func TestMarkPayloadProcessingCleanupComplete(t *testing.T) {
 		t.Fatalf("status = %q, want %q", v, PayloadProcessingStatusCleanupComplete)
 	}
 }
+
+func TestLegacyServes(t *testing.T) {
+	for _, tc := range []struct {
+		backend, status string
+		want            bool
+	}{
+		{backend: PayloadProcessingBackendIPP, want: true},
+		{backend: PayloadProcessingBackendIPP, status: PayloadProcessingStatusCleanupComplete, want: true},
+		// Praxis selected, handoff not started: maas-controller's gate may block it.
+		{backend: "", want: true},
+		{backend: PayloadProcessingBackendPraxis, want: true},
+		{backend: PayloadProcessingBackendPraxis, status: PayloadProcessingStatusCleanupComplete, want: false},
+		{backend: "", status: PayloadProcessingStatusSteady, want: false},
+	} {
+		mtc := NewMaasTenantConfig()
+		annotations := map[string]string{}
+		if tc.backend != "" {
+			annotations[AnnotationPayloadProcessingType] = tc.backend
+		}
+		if tc.status != "" {
+			annotations[AnnotationPayloadProcessingStatus] = tc.status
+		}
+		mtc.SetAnnotations(annotations)
+		if got := LegacyServes(mtc); got != tc.want {
+			t.Errorf("LegacyServes(type=%q, status=%q) = %t, want %t", tc.backend, tc.status, got, tc.want)
+		}
+	}
+}

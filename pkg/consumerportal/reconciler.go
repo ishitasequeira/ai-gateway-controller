@@ -32,6 +32,7 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	meta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -63,12 +64,23 @@ const (
 )
 
 var (
-	gvkGateway       = schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "Gateway"}
-	authProxyObjects = []schema.GroupVersionKind{
+	gvkGateway         = schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "Gateway"}
+	gvkHTTPRoute       = schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"}
+	gvkReferenceGrant  = schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1beta1", Kind: "ReferenceGrant"}
+	gvkAuthPolicy      = schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1", Kind: "AuthPolicy"}
+	gvkDestinationRule = schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1", Kind: "DestinationRule"}
+	gvkDSCI            = schema.GroupVersionKind{Group: "dscinitialization.opendatahub.io", Version: "v2", Kind: "DSCInitialization"}
+	authProxyObjects   = []schema.GroupVersionKind{
 		{Group: "apps", Version: "v1", Kind: "Deployment"},
 		{Version: "v1", Kind: "Service"},
 		{Version: "v1", Kind: "ServiceAccount"},
 		{Group: "networking.k8s.io", Version: "v1", Kind: "NetworkPolicy"},
+	}
+	consumerPortalObjects = []schema.GroupVersionKind{
+		gvkHTTPRoute,
+		gvkReferenceGrant,
+		gvkAuthPolicy,
+		gvkDestinationRule,
 	}
 )
 
@@ -84,6 +96,10 @@ type Reconciler struct {
 	Image string
 	// AuthorinoNamespace is allowed through the auth proxy NetworkPolicy.
 	AuthorinoNamespace string
+	// DashboardNamespace overrides the dashboard namespace resolution; empty
+	// means read DSCInitialization spec.applicationsNamespace, falling back to
+	// DefaultDashboardNamespace.
+	DashboardNamespace string
 	// ResyncInterval is the RequeueAfter used once the proxy is applied.
 	ResyncInterval time.Duration
 }
@@ -91,7 +107,11 @@ type Reconciler struct {
 // SetupWithManager watches MaasTenantConfig (primary) and the default
 // AITenant, which carries the OIDC settings and the Gateway reference.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	dsci := &unstructured.Unstructured{}
+	dsci.SetGroupVersionKind(gvkDSCI)
+	httpRoute := &unstructured.Unstructured{}
+	httpRoute.SetGroupVersionKind(gvkHTTPRoute)
+	builder := ctrl.NewControllerManagedBy(mgr).
 		Named("consumer-portal").
 		For(tenant.NewMaasTenantConfig()).
 		Watches(tenant.NewAITenant(), handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForAITenant)).
@@ -99,7 +119,22 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		WatchesMetadata(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForSecret)).
 		// Metadata-only, so ConfigMap data is never cached.
 		WatchesMetadata(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForCABundle)).
-		Complete(r)
+		// The dashboard's maas-portal Service opening the route gate is an
+		// event, not something to poll for.
+		WatchesMetadata(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForPortalService)).
+		// Portal route status (Accepted/ResolvedRefs) drives readiness.
+		Watches(httpRoute, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForPortalRoute))
+	// The DSCI watch only works when its CRD is installed: without it the
+	// informer cannot sync and manager startup fails. Clusters without a DSCI
+	// keep the default dashboard namespace (the reconciler's APIReader read
+	// has the same fallback), and the not-ready requeue picks up a CRD that
+	// appears later.
+	if _, err := mgr.GetRESTMapper().RESTMapping(gvkDSCI.GroupKind(), gvkDSCI.Version); err == nil {
+		builder = builder.Watches(dsci, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForDSCI))
+	} else {
+		r.Log.Info("DSCInitialization is not installed; skipping its watch and keeping the default dashboard namespace")
+	}
+	return builder.Complete(r)
 }
 
 func (r *Reconciler) maasTenantConfigForAITenant(_ context.Context, obj client.Object) []reconcile.Request {
@@ -170,6 +205,65 @@ func (r *Reconciler) maasTenantConfigForCABundle(ctx context.Context, obj client
 	return requests
 }
 
+// maasTenantConfigForPortalService maps the dashboard's maas-portal Service
+// to every MaasTenantConfig: the dashboard namespace is derived from the DSCI
+// rather than from any single tenant, so a Service event cannot be mapped to
+// one tenant. The name filter keeps the watch quiet.
+func (r *Reconciler) maasTenantConfigForPortalService(ctx context.Context, obj client.Object) []reconcile.Request {
+	if obj.GetName() != PortalServiceName {
+		return nil
+	}
+	return r.allMaasTenantConfigs(ctx)
+}
+
+// maasTenantConfigForDSCI maps DSCInitialization changes to every
+// MaasTenantConfig: the applicationsNamespace selects each portal's dashboard
+// namespace, so any DSCI edit can move the Service gate or the ReferenceGrant.
+func (r *Reconciler) maasTenantConfigForDSCI(ctx context.Context, _ client.Object) []reconcile.Request {
+	return r.allMaasTenantConfigs(ctx)
+}
+
+// maasTenantConfigForPortalRoute maps the portal HTTPRoutes' status changes
+// (Accepted/ResolvedRefs) to the MaasTenantConfigs in whose infrastructure
+// namespace the routes live.
+func (r *Reconciler) maasTenantConfigForPortalRoute(ctx context.Context, obj client.Object) []reconcile.Request {
+	if obj.GetName() != PortalRouteName && obj.GetName() != OAuthRouteName {
+		return nil
+	}
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(tenant.MaasTenantConfigGVK.GroupVersion().WithKind(tenant.MaasTenantConfigGVK.Kind + "List"))
+	if err := r.Client.List(ctx, list); err != nil {
+		return nil
+	}
+	requests := []reconcile.Request{}
+	for i := range list.Items {
+		mtc := &list.Items[i]
+		if InfraNamespace(mtc) == obj.GetNamespace() {
+			requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{
+				Namespace: mtc.GetNamespace(),
+				Name:      mtc.GetName(),
+			}})
+		}
+	}
+	return requests
+}
+
+func (r *Reconciler) allMaasTenantConfigs(ctx context.Context) []reconcile.Request {
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(tenant.MaasTenantConfigGVK.GroupVersion().WithKind(tenant.MaasTenantConfigGVK.Kind + "List"))
+	if err := r.Client.List(ctx, list); err != nil {
+		return nil
+	}
+	requests := make([]reconcile.Request, 0, len(list.Items))
+	for i := range list.Items {
+		requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{
+			Namespace: list.Items[i].GetNamespace(),
+			Name:      list.Items[i].GetName(),
+		}})
+	}
+	return requests
+}
+
 // Reconcile applies the auth proxy when the default AITenant is ready, has a
 // Gateway, enables the consumer portal, and configures OIDC. Otherwise it
 // removes any proxy it previously created.
@@ -226,6 +320,32 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 	}
 
+	dashboardNamespace, err := r.dashboardNamespace(ctx)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.APIReader.Get(ctx, client.ObjectKey{
+		Namespace: dashboardNamespace,
+		Name:      PortalServiceName,
+	}, &corev1.Service{}); err != nil {
+		if apierrors.IsNotFound(err) {
+			// The dashboard Service doubles as the portal's on-signal. Before
+			// the first deploy it simply is not there yet; once this
+			// reconciler owns a deployment, its removal means the dashboard
+			// side switched the portal off, and everything this controller
+			// deployed is torn down rather than left serving errors.
+			if controllerutil.ContainsFinalizer(mtc, CleanupFinalizer) {
+				log.Info("consumer portal Service is gone; removing the portal",
+					"namespace", dashboardNamespace, "name", PortalServiceName)
+				return ctrl.Result{}, r.disable(ctx, mtc, infraNamespace)
+			}
+			log.Info("consumer portal Service does not exist yet; will retry",
+				"namespace", dashboardNamespace, "name", PortalServiceName)
+			return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
+		}
+		return ctrl.Result{}, fmt.Errorf("get Service %s/%s: %w", dashboardNamespace, PortalServiceName, err)
+	}
+
 	if err := r.ensureFinalizer(ctx, mtc); err != nil {
 		return ctrl.Result{}, fmt.Errorf("ensure finalizer: %w", err)
 	}
@@ -251,6 +371,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 	resources := Render(rendered, Params{
 		Namespace:          infraNamespace,
+		DashboardNamespace: dashboardNamespace,
+		Instance:           mtc.GetNamespace(),
 		Image:              r.Image,
 		OIDCIssuerURL:      issuerURL,
 		Hostname:           hostname,
@@ -267,6 +389,22 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, fmt.Errorf("apply: %w", err)
 	}
 
+	// A dashboard-namespace change (e.g. a DSCI edit) leaves the previous
+	// ReferenceGrant behind: it authorizes a route backend that no longer
+	// matches. Prune this instance's grants outside the current namespace.
+	if err := r.pruneStaleGrants(ctx, mtc.GetNamespace(), dashboardNamespace); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	ready, err = r.routesReady(ctx, infraNamespace)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !ready {
+		log.Info("consumer portal routes are not ready yet; will retry", "namespace", infraNamespace)
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
+	}
+
 	log.Info("consumer portal auth proxy applied", "namespace", infraNamespace, "hostname", hostname)
 	return ctrl.Result{RequeueAfter: r.ResyncInterval}, nil
 }
@@ -278,7 +416,7 @@ func (r *Reconciler) disable(ctx context.Context, mtc *unstructured.Unstructured
 		return nil
 	}
 	if infraNamespace != "" {
-		if err := r.cleanup(ctx, infraNamespace); err != nil {
+		if err := r.cleanup(ctx, mtc.GetNamespace(), infraNamespace); err != nil {
 			return err
 		}
 	}
@@ -292,9 +430,152 @@ func (r *Reconciler) disable(ctx context.Context, mtc *unstructured.Unstructured
 	return nil
 }
 
+// dashboardNamespace returns the namespace containing the consumer portal
+// dashboard Service: the flag when set, otherwise the DSCInitialization
+// singleton's spec.applicationsNamespace, otherwise DefaultDashboardNamespace.
+// The flag exists as an escape hatch for layouts without a DSCI; the DSCI is
+// the source of truth because it is what places the dashboard operand (and
+// its Service) in a given applications namespace.
+func (r *Reconciler) dashboardNamespace(ctx context.Context) (string, error) {
+	if r.DashboardNamespace != "" {
+		return r.DashboardNamespace, nil
+	}
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(gvkDSCI.GroupVersion().WithKind(gvkDSCI.Kind + "List"))
+	if err := r.APIReader.List(ctx, list); err != nil {
+		// A cluster without the DSCI CRD or without a DSCI simply keeps the
+		// default; the portal then waits for a Service there.
+		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+			return DefaultDashboardNamespace, nil
+		}
+		return "", fmt.Errorf("list DSCInitializations: %w", err)
+	}
+	for i := range list.Items {
+		ns, found, err := unstructured.NestedString(list.Items[i].Object, "spec", "applicationsNamespace")
+		if err == nil && found && ns != "" {
+			return ns, nil
+		}
+	}
+	return DefaultDashboardNamespace, nil
+}
+
+func (r *Reconciler) routesReady(ctx context.Context, namespace string) (bool, error) {
+	for _, name := range []string{PortalRouteName, OAuthRouteName} {
+		route := &unstructured.Unstructured{}
+		route.SetGroupVersionKind(gvkHTTPRoute)
+		// APIReader bypasses the informer cache: the routes were applied
+		// moments earlier in this reconcile, so a cached Get could still
+		// return NotFound and wrongly report a reconcile error.
+		if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, route); err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, fmt.Errorf("get HTTPRoute %s/%s: %w", namespace, name, err)
+		}
+		if !routeAccepted(route) || !routeReferencesResolved(route) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func routeAccepted(route *unstructured.Unstructured) bool {
+	return routeConditionTrue(route, "Accepted")
+}
+
+func routeReferencesResolved(route *unstructured.Unstructured) bool {
+	return routeConditionTrue(route, "ResolvedRefs")
+}
+
+func routeConditionTrue(route *unstructured.Unstructured, conditionType string) bool {
+	parents, _, _ := unstructured.NestedSlice(route.Object, "status", "parents")
+	for _, parent := range parents {
+		parentMap, ok := parent.(map[string]any)
+		if !ok {
+			continue
+		}
+		conditions, _, _ := unstructured.NestedSlice(parentMap, "conditions")
+		for _, condition := range conditions {
+			conditionMap, ok := condition.(map[string]any)
+			if !ok {
+				continue
+			}
+			gotType, _, _ := unstructured.NestedString(conditionMap, "type")
+			gotStatus, _, _ := unstructured.NestedString(conditionMap, "status")
+			// Gateway API status-staleness check: after a spec change the
+			// previous True conditions remain until the Gateway controller
+			// processes the new generation, so only conditions observed for
+			// the current generation count.
+			observedGeneration, _, _ := unstructured.NestedInt64(conditionMap, "observedGeneration")
+			if observedGeneration != 0 && observedGeneration != route.GetGeneration() {
+				continue
+			}
+			if gotType == conditionType && gotStatus == "True" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// pruneStaleGrants deletes this instance's ReferenceGrants outside the given
+// dashboard namespace. A dashboard-namespace change otherwise leaves the old
+// grant behind, still authorizing cross-namespace references to a backend the
+// portal no longer uses.
+func (r *Reconciler) pruneStaleGrants(ctx context.Context, instance, keepNamespace string) error {
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(gvkReferenceGrant.GroupVersion().WithKind(gvkReferenceGrant.Kind + "List"))
+	// APIReader: same stale-cache concern as cleanup.
+	if err := r.APIReader.List(ctx, list, client.MatchingLabels{
+		tenant.LabelManagedBy: tenant.ManagedByAIGatewayController,
+		LabelPortalInstance:   instance,
+	}); err != nil {
+		if meta.IsNoMatchError(err) {
+			return nil
+		}
+		return fmt.Errorf("list ReferenceGrants: %w", err)
+	}
+	for i := range list.Items {
+		if list.Items[i].GetNamespace() == keepNamespace {
+			continue
+		}
+		if err := r.Client.Delete(ctx, &list.Items[i]); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete stale ReferenceGrant %s/%s: %w",
+				list.Items[i].GetNamespace(), list.Items[i].GetName(), err)
+		}
+	}
+	return nil
+}
+
 // cleanup deletes the auth proxy resources this controller owns. Objects
-// without the ai-gateway-controller managed-by label are left alone.
-func (r *Reconciler) cleanup(ctx context.Context, namespace string) error {
+// without the ai-gateway-controller managed-by label or belonging to another
+// portal instance are left alone.
+func (r *Reconciler) cleanup(ctx context.Context, instance, namespace string) error {
+	for _, gvk := range consumerPortalObjects {
+		list := &unstructured.UnstructuredList{}
+		list.SetGroupVersionKind(gvk.GroupVersion().WithKind(gvk.Kind + "List"))
+		// APIReader bypasses the informer cache: a lagging cache could omit
+		// objects applied moments earlier, remove the finalizer, and leave an
+		// active route or ReferenceGrant behind.
+		if err := r.APIReader.List(ctx, list, client.MatchingLabels{
+			tenant.LabelManagedBy:       tenant.ManagedByAIGatewayController,
+			"app.kubernetes.io/part-of": "maas-consumer-portal",
+			LabelPortalInstance:         instance,
+		}); err != nil {
+			// A kind with no CRD installed (Kuadrant AuthPolicy, Istio
+			// DestinationRule) has no objects to delete; failing here would
+			// block finalizer removal and hang the MaasTenantConfig.
+			if meta.IsNoMatchError(err) {
+				continue
+			}
+			return fmt.Errorf("list %s objects: %w", gvk.Kind, err)
+		}
+		for i := range list.Items {
+			if err := r.Client.Delete(ctx, &list.Items[i]); err != nil && !apierrors.IsNotFound(err) {
+				return fmt.Errorf("delete %s %s/%s: %w", gvk.Kind, list.Items[i].GetNamespace(), list.Items[i].GetName(), err)
+			}
+		}
+	}
 	for _, gvk := range authProxyObjects {
 		obj := &unstructured.Unstructured{}
 		obj.SetGroupVersionKind(gvk)

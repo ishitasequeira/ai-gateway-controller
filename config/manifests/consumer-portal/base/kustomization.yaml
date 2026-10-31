@@ -8,3 +8,7 @@ resources:
   - deployment.yaml
   - service.yaml
   - networkpolicy.yaml
+  - httproutes.yaml
+  - referencegrant.yaml
+  - destinationrules.yaml
+  - authpolicies.yaml

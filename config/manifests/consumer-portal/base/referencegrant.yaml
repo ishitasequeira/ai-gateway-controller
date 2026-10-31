@@ -1,0 +1,16 @@
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: maas-consumer-portal
+  labels:
+    app.kubernetes.io/name: maas-consumer-portal
+    app.kubernetes.io/part-of: maas-consumer-portal
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: CONSUMER_PORTAL_INFRA_NAMESPACE
+  to:
+    - group: ""
+      kind: Service
+      name: maas-portal

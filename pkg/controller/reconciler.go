@@ -156,7 +156,11 @@ func (r *Reconciler) secretProviders(ctx context.Context, obj client.Object) []r
 }
 
 func (r *Reconciler) tenantProviders(ctx context.Context, mtc *unstructured.Unstructured) []reconcile.Request {
-	return r.providersInNamespace(ctx, mtc.GetNamespace())
+	requests := r.providersInNamespace(ctx, mtc.GetNamespace())
+	if name, _, ok := tenant.OwningAITenantRef(mtc); ok && name == tenant.DefaultAITenantName {
+		requests = append(requests, r.providersOutsideTenants(ctx)...)
+	}
+	return requests
 }
 
 func (r *Reconciler) aitenantProviders(ctx context.Context, ait *unstructured.Unstructured) []reconcile.Request {
@@ -164,7 +168,42 @@ func (r *Reconciler) aitenantProviders(ctx context.Context, ait *unstructured.Un
 	if ns == "" {
 		ns = ait.GetNamespace()
 	}
-	return r.providersInNamespace(ctx, ns)
+	requests := r.providersInNamespace(ctx, ns)
+	if ait.GetName() == tenant.DefaultAITenantName {
+		requests = append(requests, r.providersOutsideTenants(ctx)...)
+	}
+	return requests
+}
+
+// providersOutsideTenants enqueues the providers of namespaces without a
+// MaasTenantConfig. Whether their status is reported follows the default
+// tenant, which serves their models through implicit attachments.
+func (r *Reconciler) providersOutsideTenants(ctx context.Context) []reconcile.Request {
+	if r.Namespace != "" {
+		return nil
+	}
+	configs := &unstructured.UnstructuredList{}
+	configs.SetGroupVersionKind(tenant.MaasTenantConfigGVK.GroupVersion().WithKind("MaasTenantConfigList"))
+	if err := r.List(ctx, configs); err != nil {
+		r.Log.Error(err, "list MaasTenantConfigs for default tenant event")
+		return nil
+	}
+	tenantNamespaces := make(map[string]bool, len(configs.Items))
+	for i := range configs.Items {
+		tenantNamespaces[configs.Items[i].GetNamespace()] = true
+	}
+	var providers v1alpha1.ExternalProviderList
+	if err := r.List(ctx, &providers); err != nil {
+		r.Log.Error(err, "list providers for default tenant event")
+		return nil
+	}
+	var requests []reconcile.Request
+	for i := range providers.Items {
+		if ns := providers.Items[i].Namespace; r.namespaceAllowed(ns) && !tenantNamespaces[ns] {
+			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&providers.Items[i])})
+		}
+	}
+	return requests
 }
 
 func (r *Reconciler) providersInNamespace(ctx context.Context, namespace string) []reconcile.Request {
@@ -294,10 +333,11 @@ func (r *Reconciler) modelsReferencingProviders(ctx context.Context, namespace s
 	return requests
 }
 
-// providerInputs returns only providers whose persisted readiness covers their
-// current spec. ExternalProvider reconciliation is the sole writer of that
-// status and of provider transport resources. A provider only Validated
-// outside tenant namespaces has no tenant-local transport.
+// providerInputs returns only providers whose persisted status covers their
+// current spec; the resolver routes only the Ready ones. ExternalProvider
+// reconciliation is the sole writer of that status and of provider transport
+// resources. A provider only Validated outside tenant namespaces has no
+// tenant-local transport.
 func (r *Reconciler) providerInputs(ctx context.Context, namespace string) ([]*v1alpha1.ExternalProvider, error) {
 	var providers v1alpha1.ExternalProviderList
 	if err := r.List(ctx, &providers, client.InNamespace(namespace)); err != nil {
@@ -307,10 +347,12 @@ func (r *Reconciler) providerInputs(ctx context.Context, namespace string) ([]*v
 	for i := range providers.Items {
 		p := &providers.Items[i]
 		ready := apiMeta.FindStatusCondition(p.Status.Conditions, conditionReady)
-		if !p.DeletionTimestamp.IsZero() || p.Status.Phase != resolver.PhaseReady || p.Status.ObservedGeneration != p.Generation ||
-			ready != nil && ready.Reason == reasonValidated {
+		if !p.DeletionTimestamp.IsZero() || p.Status.ObservedGeneration != p.Generation ||
+			p.Status.Phase == resolver.PhaseReady && ready != nil && ready.Reason == reasonValidated {
 			continue
 		}
+		// A current status that is not Ready is kept: the resolver skips the
+		// provider and reports that status, rather than a missing provider.
 		providerPtrs = append(providerPtrs, p)
 	}
 	return providerPtrs, nil
@@ -375,6 +417,12 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 		}
 		return reconcile.Result{}, nil
 	}
+	if !live.missingConfig && live.status == "" {
+		// Praxis is selected but the handoff has not started (see
+		// tenant.LegacyServes): IPP still serves this namespace and owns
+		// provider status until maas-controller writes cleanup-complete.
+		return reconcile.Result{}, nil
+	}
 	validationErr := r.validateProvider(ctx, &provider)
 	if validationErr == nil {
 		validationErr = r.validateProviderCredential(ctx, &provider)
@@ -382,14 +430,19 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 	if live.missingConfig && !controllerutil.ContainsFinalizer(&provider, externalProviderFinalizer) {
 		// A namespace no tenant claims is served only through Gateway
 		// attachments: its provider has no tenant-local transport, so only its
-		// own configuration is reported. A tenant namespace whose
-		// MaasTenantConfig maas-controller has not created yet falls through
-		// and is claimed below.
+		// own configuration is reported. While IPP serves the default tenant,
+		// it serves this namespace's models and reports their providers'
+		// status instead. A tenant namespace whose MaasTenantConfig
+		// maas-controller has not created yet falls through and is claimed
+		// below.
 		tenantNamespace, err := r.tenantNamespace(ctx, provider.Namespace)
 		if err != nil {
 			return reconcile.Result{}, err
 		}
 		if !tenantNamespace {
+			if _, _, ipp, err := r.defaultTenantGateway(ctx); err != nil || ipp {
+				return reconcile.Result{}, err
+			}
 			if validationErr != nil {
 				return reconcile.Result{}, r.updateProviderStatus(ctx, &provider, providerPhaseFailed, reasonReconcileFailed, validationErr.Error())
 			}
@@ -552,6 +605,7 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 	if err := r.List(ctx, &models, client.InNamespace(req.Namespace)); err != nil {
 		return reconcile.Result{}, err
 	}
+	sortModelsByName(models.Items)
 	providerPtrs, err := r.providerInputs(ctx, req.Namespace)
 	if err != nil {
 		return reconcile.Result{}, err
@@ -670,6 +724,11 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 		// keep serving.
 		return reconcile.Result{}, report(false, reasonProviderNotReady, message, nil)
 	}
+	if reason, message, unrouted := unroutedStatus(set, req.String()); unrouted {
+		// Other models of the namespace are served, but none of this model's
+		// references resolved: it has no route or overlay candidate.
+		return reconcile.Result{}, report(false, reason, message, nil)
+	}
 
 	message := fmt.Sprintf("distributed routing overlay digest %s generation %d", result.Envelope.Revision.Value, result.Envelope.Provenance.SourceGeneration)
 	if err := report(true, reasonReconciled, message, &result.Envelope); err != nil {
@@ -692,26 +751,11 @@ func (r *Reconciler) handleHomeRouteResolutionError(
 	message := routeErr.Error()
 	if errors.Is(routeErr, resolver.ErrNoRoutes) {
 		reason = reasonProviderNotReady
-		var skips []string
-		for _, modelRoutes := range set.Models {
-			if modelRoutes.ModelRef != namespace+"/"+modelName {
-				continue
-			}
-			for _, skip := range modelRoutes.Skips {
-				skips = append(skips, fmt.Sprintf("provider %s: %s", skip.ProviderRef, skip.Message))
-				if skip.Reason == resolver.SkipRefNotPermitted {
-					reason = reasonRefNotPermitted
-				}
-			}
-		}
-		if len(skips) > 0 {
-			message = "no routable ExternalModel provider remains: " + strings.Join(skips, "; ")
+		if unroutedReason, unroutedMessage, ok := unroutedStatus(set, namespace+"/"+modelName); ok {
+			reason, message = unroutedReason, unroutedMessage
 		}
 		policyExcluded := translationPolicyExcludedModels(set)
 		if len(policyExcluded) > 0 {
-			if policyExcluded[namespace+"/"+modelName] {
-				reason = reasonTranslationDisabled
-			}
 			valid, err := r.livePraxisBeforeWrite(ctx, namespace, modelTenant)
 			if err != nil {
 				return reconcile.Result{}, err
@@ -737,6 +781,31 @@ func (r *Reconciler) handleHomeRouteResolutionError(
 		return reconcile.Result{}, err
 	}
 	return reconcile.Result{}, routeErr
+}
+
+// unroutedStatus explains a model the route set leaves with no route: every
+// skipped provider reference with the resolver's message. ok is false when
+// the model has a route, or when no reference was skipped.
+func unroutedStatus(set *resolver.ResolvedRouteSet, modelRef string) (reason, message string, ok bool) {
+	if set == nil {
+		return "", "", false
+	}
+	i := slices.IndexFunc(set.Models, func(m resolver.ModelRoutes) bool { return m.ModelRef == modelRef })
+	if i < 0 || len(set.Models[i].Routes) > 0 || len(set.Models[i].Skips) == 0 {
+		return "", "", false
+	}
+	reason = reasonProviderNotReady
+	skips := make([]string, 0, len(set.Models[i].Skips))
+	for _, skip := range set.Models[i].Skips {
+		skips = append(skips, fmt.Sprintf("provider %s: %s", skip.ProviderRef, skip.Message))
+		if skip.Reason == resolver.SkipRefNotPermitted {
+			reason = reasonRefNotPermitted
+		}
+	}
+	if translationPolicyExcludedModels(set)[modelRef] {
+		reason = reasonTranslationDisabled
+	}
+	return reason, "no routable ExternalModel provider remains: " + strings.Join(skips, "; "), true
 }
 
 type modelTenantContext struct {
@@ -796,6 +865,13 @@ func (r *Reconciler) prepareModelTenant(ctx context.Context, model *v1alpha1.Ext
 		if err := r.cleanupUnselectedModel(ctx, model); err != nil {
 			return modelTenantContext{}, false, err
 		}
+		return modelTenantContext{}, false, nil
+	}
+	if live.status == "" && len(model.Spec.GatewayRefs) == 0 {
+		// Praxis is selected but the handoff has not started (see
+		// tenant.LegacyServes): IPP still serves the model and reports its
+		// status. A Pending status here would compete with IPP's, and MaaS
+		// treats a model that is not Ready as unhealthy.
 		return modelTenantContext{}, false, nil
 	}
 	if live.aitenant == nil {
@@ -1069,6 +1145,7 @@ func (r *Reconciler) resolveRemainingHomeModels(
 	if err := r.List(ctx, &models, client.InNamespace(deleted.Namespace)); err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("list remaining ExternalModels for deletion: %w", err)
 	}
+	sortModelsByName(models.Items)
 	modelPtrs := make([]*v1alpha1.ExternalModel, 0, len(models.Items))
 	modelOwners := make(map[string]*v1alpha1.ExternalModel, len(models.Items))
 	for i := range models.Items {
@@ -1636,6 +1713,9 @@ func (r *Reconciler) validateProvider(_ context.Context, p *v1alpha1.ExternalPro
 	if _, err := resolver.ProviderPort(p); err != nil {
 		return err
 	}
+	if err := resolver.ValidateProviderTLS(p); err != nil {
+		return err
+	}
 	authType := resolver.AuthType(strings.ToLower(strings.TrimSpace(p.Spec.Auth.Type)))
 	if authType != "apikey" {
 		if authType == "" {
@@ -1926,7 +2006,6 @@ func (r *Reconciler) writeExternalModelRoutes(ctx context.Context, tenantID, mod
 		namespace, name string
 		count           int
 		streamResponse  bool
-		bufferRequest   bool
 	}
 	enabled := make([]routeRules, 0, len(models)+len(attached))
 	for _, model := range models {
@@ -1938,7 +2017,7 @@ func (r *Reconciler) writeExternalModelRoutes(ctx context.Context, tenantID, mod
 		if err != nil || !found {
 			return fmt.Errorf("ExternalModel %s route renderer did not produce HTTPRoute rules", model)
 		}
-		enabled = append(enabled, routeRules{modelNamespace, modelRouteName(model), len(rules), routesNeedTranslation(byModel[model]), routesUseTranslation(byModel[model])})
+		enabled = append(enabled, routeRules{modelNamespace, modelRouteName(model), len(rules), routesNeedTranslation(byModel[model])})
 	}
 	for _, a := range attached {
 		httpRoute := modelHTTPRouteSet(a.routes, a.model.Namespace, gatewayName, gatewayNamespace)
@@ -1946,16 +2025,12 @@ func (r *Reconciler) writeExternalModelRoutes(ctx context.Context, tenantID, mod
 		if err != nil || !found {
 			return fmt.Errorf("attached ExternalModel %s/%s route renderer did not produce HTTPRoute rules", a.model.Namespace, a.model.Name)
 		}
-		enabled = append(enabled, routeRules{a.model.Namespace, a.routeName, len(rules), routesNeedTranslation(a.routes), routesUseTranslation(a.routes)})
+		enabled = append(enabled, routeRules{a.model.Namespace, a.routeName, len(rules), routesNeedTranslation(a.routes)})
 	}
 	for _, route := range enabled {
 		responseMode := "NONE"
 		if route.streamResponse {
 			responseMode = "STREAMED"
-		}
-		requestMode := "STREAMED"
-		if route.bufferRequest {
-			requestMode = "BUFFERED"
 		}
 		for index := 0; index < route.count; index++ {
 			kept = append(kept, map[string]any{
@@ -1998,9 +2073,11 @@ func (r *Reconciler) writeExternalModelRoutes(ctx context.Context, tenantID, mod
 							"overrides": map[string]any{
 								"processing_mode": map[string]any{
 									"request_header_mode": "SEND",
-									// Buffer translated requests so Envoy sends one complete body message,
-									// including when trailers follow. Flag-off keeps its existing mode.
-									"request_body_mode":    requestMode,
+									// Buffer every request so Envoy sends one complete body message,
+									// including when trailers follow: stream_usage_inject and the
+									// translation filters need the whole JSON body. The pre-auth
+									// processor already buffers it.
+									"request_body_mode":    "BUFFERED",
 									"response_header_mode": "SEND",
 									// Envoy chooses the response processing mode before the
 									// provider is selected. Stream all rules for a model that
@@ -2185,6 +2262,9 @@ func (r *Reconciler) updateModelStatus(ctx context.Context, m *v1alpha1.External
 	} else {
 		m.Status.Phase = "Failed"
 		setCondition(&m.Status.Conditions, conditionOverlayDistributed, metav1.ConditionFalse, reason, message)
+		if r.staleRouteName(ctx, m) {
+			m.Status.HTTPRouteName = ""
+		}
 	}
 	setCondition(&m.Status.Conditions, conditionReady, boolStatus(ready), reason, message)
 	if equality.Semantic.DeepEqual(old.Status, m.Status) {
@@ -2209,6 +2289,40 @@ func boolStatus(ready bool) metav1.ConditionStatus {
 	}
 	return metav1.ConditionFalse
 }
+
+// staleRouteName reports whether a model that is not Ready names an HTTPRoute
+// that does not serve it: any route but its home route, such as the route of
+// a removed IPP or of a withdrawn attachment, or a home route that was
+// removed. A home route this controller retains keeps its name. The route is
+// read live: it may have been deleted earlier in this reconcile.
+func (r *Reconciler) staleRouteName(ctx context.Context, m *v1alpha1.ExternalModel) bool {
+	name := m.Status.HTTPRouteName
+	if name == "" {
+		return false
+	}
+	if name != modelRouteName(m.Name) {
+		return true
+	}
+	var reader client.Reader = r.Client
+	if r.APIReader != nil {
+		reader = r.APIReader
+	}
+	err := reader.Get(ctx, client.ObjectKey{Namespace: m.Namespace, Name: name}, newHTTPRoute())
+	if err != nil && !apierrors.IsNotFound(err) {
+		r.Log.Error(err, "check home HTTPRoute for model status", "model", client.ObjectKeyFromObject(m))
+	}
+	return apierrors.IsNotFound(err)
+}
+
+// sortModelsByName orders a namespace's models by name before they are
+// resolved. The informer cache lists them in no stable order and the resolver
+// keeps its input order, so equal inputs would otherwise publish the same
+// overlay content under a new digest, and each rewrite re-triggers every model
+// of the tenant.
+func sortModelsByName(models []v1alpha1.ExternalModel) {
+	slices.SortFunc(models, func(a, b v1alpha1.ExternalModel) int { return strings.Compare(a.Name, b.Name) })
+}
+
 func modelRouteName(model string) string {
 	return modelRoutePrefix + strings.ToLower(strings.ReplaceAll(model, "/", "-"))
 }
@@ -2372,15 +2486,6 @@ func modelHTTPRouteRuleCount(routes []resolver.Route) int {
 func routesNeedTranslation(routes []resolver.Route) bool {
 	for _, route := range routes {
 		if route.APIFormat == "messages" {
-			return true
-		}
-	}
-	return false
-}
-
-func routesUseTranslation(routes []resolver.Route) bool {
-	for _, route := range routes {
-		if route.APITranslationEnabled {
 			return true
 		}
 	}

@@ -19,6 +19,8 @@ import (
 	"strconv"
 	"strings"
 
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
+
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
 )
 
@@ -27,6 +29,12 @@ const (
 	// endpoint.
 	ProviderPortAnnotation = "inference.opendatahub.io/port"
 	defaultProviderPort    = int64(443)
+
+	// ProviderTLSAnnotation is the ExternalProvider annotation that IPP reads
+	// to disable TLS origination with "false". Provider transport is always
+	// TLS, and every provider sends a credential, so plaintext is rejected,
+	// as IPP rejects it for a provider with auth.
+	ProviderTLSAnnotation = "inference.opendatahub.io/tls"
 )
 
 // SkipReason classifies why a single provider ref was excluded from a
@@ -144,6 +152,28 @@ func ProviderPort(provider *v1alpha1.ExternalProvider) (int64, error) {
 		return 0, fmt.Errorf("%s must be an integer from 1 to 65535", ProviderPortAnnotation)
 	}
 	return port, nil
+}
+
+// ValidateProviderTLS rejects an ExternalProvider that asks for plaintext
+// transport. Serving it over TLS anyway would fail every request while the
+// model reports Ready.
+func ValidateProviderTLS(provider *v1alpha1.ExternalProvider) error {
+	if provider == nil || provider.Annotations == nil {
+		return nil
+	}
+	raw, found := provider.Annotations[ProviderTLSAnnotation]
+	if !found {
+		return nil
+	}
+	switch strings.TrimSpace(raw) {
+	case "true":
+		return nil
+	case "false":
+		return fmt.Errorf("%s: \"false\" is not supported: plaintext transport would send the provider credential in cleartext; "+
+			"serve the endpoint over TLS (%s selects a port other than 443)", ProviderTLSAnnotation, ProviderPortAnnotation)
+	default:
+		return fmt.Errorf("%s must be \"true\" or \"false\"", ProviderTLSAnnotation)
+	}
 }
 
 // AuthType returns the auth strategy of a CRD auth.type. "simple", which the
@@ -339,8 +369,12 @@ func resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalPro
 				continue
 			}
 			if prov.Status.Phase != PhaseReady {
-				mr.Skips = append(mr.Skips, newSkip(base,
-					SkipProviderNotReady, fmt.Sprintf("provider phase %q is not Ready", prov.Status.Phase)))
+				message := fmt.Sprintf("provider phase %q is not Ready", prov.Status.Phase)
+				if ready := apimeta.FindStatusCondition(prov.Status.Conditions, "Ready"); ready != nil && ready.Message != "" {
+					// The provider's own reason, so the model status explains it.
+					message += ": " + ready.Message
+				}
+				mr.Skips = append(mr.Skips, newSkip(base, SkipProviderNotReady, message))
 				continue
 			}
 

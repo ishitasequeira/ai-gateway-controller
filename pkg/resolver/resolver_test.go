@@ -772,3 +772,34 @@ func TestResolveTwoModelsOneProvider(t *testing.T) {
 		t.Fatalf("cluster = %q, want provider-shared-prov", routes[0].Cluster)
 	}
 }
+
+func TestValidateProviderTLSRejectsPlaintext(t *testing.T) {
+	for value, wantErr := range map[string]string{
+		"":      "",
+		"true":  "",
+		"false": "plaintext transport",
+		"no":    `must be "true" or "false"`,
+	} {
+		p := provider("ns1", "p", PhaseReady, "p.example.com", nil)
+		if value != "" {
+			p.Annotations = map[string]string{ProviderTLSAnnotation: value}
+		}
+		err := ValidateProviderTLS(p)
+		if wantErr == "" && err != nil || wantErr != "" && (err == nil || !strings.Contains(err.Error(), wantErr)) {
+			t.Errorf("ValidateProviderTLS(%q) = %v, want %q", value, err, wantErr)
+		}
+	}
+}
+
+func TestResolve_NotReadySkipCarriesProviderReason(t *testing.T) {
+	p := provider("ns1", "p", "Failed", "p.example.com", nil)
+	p.Status.Conditions = []metav1.Condition{{Type: "Ready", Status: metav1.ConditionFalse, Reason: "ReconcileFailed", Message: "endpoint is invalid"}}
+	set, err := Resolve([]*v1alpha1.ExternalModel{model("ns1", "m", ref("p", "t", "/v1"))}, []*v1alpha1.ExternalProvider{p})
+	if !errors.Is(err, ErrNoRoutes) {
+		t.Fatalf("Resolve error = %v, want ErrNoRoutes", err)
+	}
+	if skips := set.Models[0].Skips; len(skips) != 1 || skips[0].Reason != SkipProviderNotReady ||
+		skips[0].Message != `provider phase "Failed" is not Ready: endpoint is invalid` {
+		t.Fatalf("skips = %#v", skips)
+	}
+}
