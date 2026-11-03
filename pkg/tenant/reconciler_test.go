@@ -39,6 +39,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
+	aigatewayv1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/aigateway/v1alpha1"
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/constants"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/envelope"
@@ -62,10 +63,15 @@ func mtcSchemeForTests() *runtime.Scheme {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
 	_ = v1alpha1.AddToScheme(scheme)
+	_ = aigatewayv1alpha1.AddToScheme(scheme)
 	scheme.AddKnownTypeWithName(MaasTenantConfigGVK, &unstructured.Unstructured{})
 	scheme.AddKnownTypeWithName(MaasTenantConfigGVK.GroupVersion().WithKind("MaasTenantConfigList"), &unstructured.UnstructuredList{})
 	scheme.AddKnownTypeWithName(AITenantGVK, &unstructured.Unstructured{})
 	scheme.AddKnownTypeWithName(AITenantGVK.GroupVersion().WithKind(AITenantGVK.Kind+"List"), &unstructured.UnstructuredList{})
+	scheme.AddKnownTypeWithName(MaaSSubscriptionGVK, &unstructured.Unstructured{})
+	scheme.AddKnownTypeWithName(MaaSSubscriptionGVK.GroupVersion().WithKind(MaaSSubscriptionGVK.Kind+"List"), &unstructured.UnstructuredList{})
+	scheme.AddKnownTypeWithName(MaaSModelRefGVK, &unstructured.Unstructured{})
+	scheme.AddKnownTypeWithName(MaaSModelRefGVK.GroupVersion().WithKind(MaaSModelRefGVK.Kind+"List"), &unstructured.UnstructuredList{})
 	scheme.AddKnownTypeWithName(gvkGateway, &unstructured.Unstructured{})
 	scheme.AddKnownTypeWithName(gvkGateway.GroupVersion().WithKind("GatewayList"), &unstructured.UnstructuredList{})
 	return scheme
@@ -1465,6 +1471,42 @@ func TestReconcileDeleteForceRemovesFinalizerAfterDeletionTimeout(t *testing.T) 
 	}
 	if mtcPatches != 1 {
 		t.Fatalf("mtcPatches = %d, want 1 (force-removing the cleanup finalizer)", mtcPatches)
+	}
+}
+
+func TestEnqueueMaasTenantConfigForModelRef(t *testing.T) {
+	model := &unstructured.Unstructured{}
+	model.SetGroupVersionKind(MaaSModelRefGVK)
+	model.SetName("granite")
+	model.SetNamespace("models")
+	subscription := subscriptionWithGuardrails("team", nil, []any{
+		map[string]any{"name": "granite", "namespace": "models"},
+	})
+	other := subscriptionWithGuardrails("other", nil, []any{
+		map[string]any{"name": "granite", "namespace": "elsewhere"},
+	})
+	other.SetNamespace("tenant-b")
+	r := &Reconciler{Client: fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(subscription, other).Build()}
+
+	requests := r.enqueueMaasTenantConfigForModelRef(context.Background(), model)
+	if len(requests) != 1 || requests[0].Namespace != "tenant-a" || requests[0].Name != MaasTenantConfigInstanceName {
+		t.Fatalf("model namespace event enqueued %#v, want tenant-a/%s", requests, MaasTenantConfigInstanceName)
+	}
+}
+
+func TestEnqueueModelRefInTenantNamespace(t *testing.T) {
+	model := &unstructured.Unstructured{}
+	model.SetGroupVersionKind(MaaSModelRefGVK)
+	model.SetName("qwen")
+	model.SetNamespace("tenant-a")
+	mtc := NewMaasTenantConfig()
+	mtc.SetName(MaasTenantConfigInstanceName)
+	mtc.SetNamespace("tenant-a")
+	r := &Reconciler{Client: fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(mtc).Build()}
+
+	requests := r.enqueueMaasTenantConfigForModelRef(context.Background(), model)
+	if len(requests) != 1 || requests[0].Namespace != "tenant-a" || requests[0].Name != MaasTenantConfigInstanceName {
+		t.Fatalf("tenant-namespace model ref enqueued %#v, want tenant-a/%s", requests, MaasTenantConfigInstanceName)
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -87,7 +88,9 @@ func (m maasFixture) existingPraxisTenant(t *testing.T, namespace string) {
 			}},
 		},
 	}}
-	require.NoError(t, m.client.Create(t.Context(), gateway))
+	if err := m.client.Create(t.Context(), gateway); err != nil && !apierrors.IsAlreadyExists(err) {
+		require.NoError(t, err)
+	}
 
 	ait := tenant.NewAITenant()
 	ait.SetName(namespace)

@@ -111,16 +111,17 @@ const (
 // guardrails proposal's binding status fragment.
 const reasonPolicyAccepted = "PolicyAccepted"
 
+// reasonTimeoutBelowMinimum refuses a policy whose provider timeout is
+// positive and shorter than 1ms. Praxis records that timeout as timeout_ms
+// and rejects zero, so rendering the duration would stall the post-auth rollout.
+const reasonTimeoutBelowMinimum = "TimeoutBelowMinimum"
+
 // providerIndexKey indexes each AIGuardrail by the NemoGuardrails it
 // references, formatted as "<namespace>/<name>".
 //
-// The other reconcilers in this repo map a watch event by listing candidates
-// in the event's own namespace and filtering in memory (see
-// pkg/controller/reconciler.go secretModels). That shape does not work here: a
-// NemoGuardrails in one namespace may be referenced by AIGuardrails in every
-// other namespace, so the equivalent list would be cluster-wide and would run
-// on every provider event. The index keeps the fan-out proportional to the
-// number of policies actually bound to the provider that changed.
+
+// AIGuardrail indexes NemoGuardrails by the namespace and name of the
+// referenced resource, formatted as "<namespace>/<name>".
 const providerIndexKey = ".spec.provider.nemo.ref"
 
 // consumerMode is a NemoGuardrails spec.allowedConsumers.namespaces.from

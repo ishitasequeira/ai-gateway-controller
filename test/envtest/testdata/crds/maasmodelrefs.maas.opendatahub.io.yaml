@@ -1,0 +1,21 @@
+# Stub so envtest can start the model-ref watch. maas-controller owns the real CRD.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: maasmodelrefs.maas.opendatahub.io
+spec:
+  group: maas.opendatahub.io
+  names:
+    kind: MaaSModelRef
+    listKind: MaaSModelRefList
+    plural: maasmodelrefs
+    singular: maasmodelref
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          x-kubernetes-preserve-unknown-fields: true

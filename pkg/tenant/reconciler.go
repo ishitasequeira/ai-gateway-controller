@@ -33,11 +33,13 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	aigatewayv1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/aigateway/v1alpha1"
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/constants"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/envelope"
@@ -123,6 +125,11 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&v1alpha1.ExternalProvider{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace)).
 		WatchesMetadata(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace)).
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForRoutingOverlay)).
+		Watches(&aigatewayv1alpha1.AIGuardrail{},
+			handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace),
+			builder.WithPredicates(nemoCalloutChanged())).
+		Watches(newMaaSSubscription(), handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace)).
+		Watches(newMaaSModelRef(), handler.EnqueueRequestsFromMapFunc(r.enqueueMaasTenantConfigForModelRef)).
 		Complete(r)
 }
 
@@ -143,11 +150,42 @@ func (r *Reconciler) maasTenantConfigForNamespace(_ context.Context, obj client.
 	}}}
 }
 
-// enqueueMaasTenantConfigForAITenant maps an AITenant event to the
-// MaasTenantConfig it owns, via status.tenantNamespace (see
-// ConfigNamespace) — avoiding any need to duplicate maas-controller's
-// TenantNamespaceForAITenant naming convention, which depends on a
-// configurable default tenant namespace this controller does not know.
+// enqueueMaasTenantConfigForModelRef picks the tenant to update when a model ref changes.
+// A model ref in the tenant namespace updates that tenant. One stored with the model
+// updates each tenant whose subscription points at it, not a tenant config in the model namespace.
+func (r *Reconciler) enqueueMaasTenantConfigForModelRef(ctx context.Context, obj client.Object) []reconcile.Request {
+	seen := map[string]bool{}
+	var requests []reconcile.Request
+	add := func(namespace string) {
+		if namespace == "" || seen[namespace] {
+			return
+		}
+		seen[namespace] = true
+		requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      MaasTenantConfigInstanceName,
+		}})
+	}
+	if obj.GetNamespace() != "" {
+		mtc := NewMaasTenantConfig()
+		err := r.Client.Get(ctx, client.ObjectKey{Namespace: obj.GetNamespace(), Name: MaasTenantConfigInstanceName}, mtc)
+		if err == nil || !apierrors.IsNotFound(err) {
+			add(obj.GetNamespace())
+		}
+	}
+	naming, err := subscriptionNamespacesNaming(ctx, r.Client, obj.GetNamespace(), obj.GetName())
+	if err != nil {
+		r.Log.Error(err, "list MaaSSubscriptions for MaaSModelRef watch")
+		return requests
+	}
+	for _, namespace := range naming {
+		add(namespace)
+	}
+	return requests
+}
+
+// enqueueMaasTenantConfigForAITenant updates the tenant named by status.tenantNamespace.
+// The AI Tenant object itself can live in a different namespace.
 func (r *Reconciler) enqueueMaasTenantConfigForAITenant(_ context.Context, obj client.Object) []reconcile.Request {
 	u, ok := obj.(*unstructured.Unstructured)
 	if !ok {
@@ -457,6 +495,25 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		}
 		labels[managedByLabel] = render.FieldOwner
 		resources[i].SetLabels(labels)
+	}
+	callouts, err := acceptedNemoCallouts(ctx, r.Client, tenantNamespace)
+	if errors.Is(err, errStaleBinding) {
+		log.Info("guardrail status is behind its spec; keeping the checks already published", "error", err)
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
+	}
+	if err != nil && !softCalloutErr(err) {
+		return ctrl.Result{}, err
+	}
+	if err != nil {
+		log.Error(err, "guardrail catalog is incomplete; affected checks fail closed and the rest are published")
+	}
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+	bindNemoPodSelectors(ctx, reader, callouts)
+	if err := configureNemoCallouts(resources, tenantID, gatewayNamespace, callouts); err != nil {
+		return ctrl.Result{}, fmt.Errorf("compile NeMo callouts: %w", err)
 	}
 	if err := r.waitForForeignOwnership(ctx, resources); err != nil {
 		log.Info("praxis-extproc resources are still owned by another controller; waiting for handoff", "error", err)
