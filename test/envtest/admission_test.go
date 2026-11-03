@@ -29,7 +29,9 @@ func testGuardrailTimeoutAdmission(t *testing.T, c client.Client) {
 		message string
 	}{
 		{name: "seconds", timeout: "30s", want: 30 * time.Second},
+		{name: "millisecond", timeout: "1ms", want: time.Millisecond},
 		{name: "fractional", timeout: "250ms", want: 250 * time.Millisecond},
+		{name: "sub-millisecond", timeout: "500us", wantErr: true, message: "timeout must be at least 1ms"},
 		{name: "compound", timeout: "1h2m3s", want: time.Hour + 2*time.Minute + 3*time.Second},
 		{name: "days", timeout: "1d", wantErr: true},
 		{name: "long-units", timeout: "3hours", wantErr: true},

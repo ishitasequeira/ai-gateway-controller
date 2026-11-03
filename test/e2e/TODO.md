@@ -42,7 +42,7 @@ Some e2e fixes from the vendored branch (`ci/maas-e2e-konflux-group-test`) are *
 | **Upstream MaaS PR** (preferred) | Fix belongs in shared MaaS tests (praxis log skip, `_poll_status` flakes, duplicate-header warmup) | All MaaS consumers benefit; slower until merged |
 | **aigc post-fetch patch** (`patch-maas-tests-for-aigc.sh`, not added yet) | Short-term CI unblock while upstream PR is open | Duplicated logic; must re-apply after every lock bump |
 
-**Current choice:** MaaS source @ `090cc5d`, including the [#1546](https://github.com/opendatahub-io/models-as-a-service/pull/1546) short TRLP subscription IDs and the [#1537](https://github.com/opendatahub-io/models-as-a-service/pull/1537) rate-grouping test. Deploy patches stay in `patch-maas-deploy-for-aigc.sh`. IPP migration **workarounds remain removed** from aigc (no pod labeling / managed-by stamp / MaasTenantConfig retry loop).
+**Current choice:** MaaS source @ `7879675` (see `test/maas-e2e.lock`), including the [#1546](https://github.com/opendatahub-io/models-as-a-service/pull/1546) short TRLP subscription IDs and the [#1537](https://github.com/opendatahub-io/models-as-a-service/pull/1537) rate-grouping test. Deploy patches stay in `patch-maas-deploy-for-aigc.sh`. IPP migration **workarounds remain removed** from aigc (no pod labeling / managed-by stamp / MaasTenantConfig retry loop).
 
 ---
 
@@ -57,7 +57,7 @@ Some fixes landed in upstream MaaS `main` @ `5ece7d3` (#1493); IPP backend-swap 
 | **`_poll_status`** | Parallel workers churn `maas-gateway-auth` → empty 401/403 flakes | **Upstream (#1493):** re-check gateway AuthPolicy on transient empty 401/403 during poll |
 | **Duplicate subscription headers** | `test_duplicate_subscription_headers_ignored` warmup 403 under load | **Upstream (#1493):** post-mint delay + warmup poll hardening |
 | **`deploy.sh`** | Kustomize e2e has no `maas-controller/` source tree | **aigc:** `patch-maas-deploy-for-aigc.sh` after fetch (keep until upstream accepts `deployment/` only) |
-| **`deploy-models.sh`** | Waits for all Kuadrant AuthPolicies (flakes when aigc adds policies) | **aigc:** patch scopes wait to `managed-by=maas-controller` label |
+| **`deploy-models.sh`** | Waits for all Kuadrant AuthPolicies (flakes when aigc adds policies) | **Upstream (#1759):** waits only for AuthPolicies targeting `$gateway_name`; the aigc patch that scoped it to the `managed-by=maas-controller` label was retired when the pin moved to `7879675` |
 | **llmisvc controller CPU** | Since [#1594](https://github.com/opendatahub-io/models-as-a-service/pull/1594) the parallel pass queues new LLMInferenceServices behind the shipped 100m `llmisvc-controller-manager`; models stay `WaitingForGateway` past test timeouts | **aigc:** `deploy-platform.sh` raises its CPU like upstream [#1598](https://github.com/opendatahub-io/models-as-a-service/pull/1598) (aigc keeps its own copy of the script) |
 | **`validate-deployment.sh`** | BBR model URL is gateway-root; path-based HTTPRoute needs path prefix | **Upstream (maas-billing):** `E2E_MODEL_PATH` / `E2E_MODEL_REF` in `validate-deployment.sh`; **aigc:** `ensure_gateway_allows_model_namespace` in prow runner |
 | **`prow_run_*` prerequisites** | Empty `PRAXIS_EXTPROC_IMAGE` + `set -e` silent exit | **aigc-only** in `prow_run_ai_gateway_controller_test.sh` |

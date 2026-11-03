@@ -31,6 +31,11 @@ rules:
 - apiGroups: ["maas.opendatahub.io"]
   resources: ["aitenants"]
   verbs: ["get", "list", "watch"]
+# Read and watch subscriptions and model refs so a guardrail list change
+# updates the tenant. This controller does not write them.
+- apiGroups: ["maas.opendatahub.io"]
+  resources: ["maassubscriptions", "maasmodelrefs"]
+  verbs: ["get", "list", "watch"]
 # Resources rendered from the vendored overlay, one set per praxis tenant.
 - apiGroups: [""]
   resources: ["services", "serviceaccounts", "configmaps"]

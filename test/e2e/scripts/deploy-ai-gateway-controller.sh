@@ -81,14 +81,18 @@ _tenant_config_namespace() {
 }
 
 _apply_ai_gateway_controller() {
-  local work_dir
+  local work_dir params rendered
   work_dir="$(mktemp -d -t aigc-kustomize.XXXXXXXXXX)"
 
   cp -a "${PROJECT_ROOT}/config/self" "${work_dir}/self"
-  sed -i "s|^ai-gateway-controller-image=.*|ai-gateway-controller-image=${AI_GATEWAY_CONTROLLER_IMAGE}|" \
-    "${work_dir}/self/default/params.env"
-  sed -i "s|^praxis-extproc-image=.*|praxis-extproc-image=${PRAXIS_EXTPROC_IMAGE}|" \
-    "${work_dir}/self/default/params.env"
+  # BSD sed (macOS) requires a backup suffix for -i; write a new file instead.
+  params="${work_dir}/self/default/params.env"
+  rendered="$(mktemp)"
+  sed \
+    -e "s|^ai-gateway-controller-image=.*|ai-gateway-controller-image=${AI_GATEWAY_CONTROLLER_IMAGE}|" \
+    -e "s|^praxis-extproc-image=.*|praxis-extproc-image=${PRAXIS_EXTPROC_IMAGE}|" \
+    "${params}" > "${rendered}"
+  mv "${rendered}" "${params}"
 
   if command -v kustomize >/dev/null 2>&1; then
     kustomize build "${work_dir}/self/default"

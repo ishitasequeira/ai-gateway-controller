@@ -11,4 +11,5 @@ resources:
   - httproutes.yaml
   - referencegrant.yaml
   - destinationrules.yaml
+  - envoyfilter.yaml
   - authpolicies.yaml

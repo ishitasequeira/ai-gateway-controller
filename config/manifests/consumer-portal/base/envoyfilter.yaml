@@ -1,0 +1,78 @@
+# Controller-owned consumer portal filter patches. This file is not vendored
+# from praxis-extproc: the bypass ships with the portal routes it exempts, in
+# the same manifests, so it is created and removed together with them
+# (pattern: external-model-envoy-filter.yaml).
+#
+# RHAI-18745: /maas-portal and /oauth2 must not be payload-processed or token
+# limited, matching the /maas-api and /v1/* management-endpoint exemptions.
+# The patches disable both ext_proc filters per-route. Istio names Gateway API
+# route rules "<namespace>.<HTTPRoute-name>.<rule-index>"; the infra namespace
+# is substituted at render time.
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: maas-consumer-portal-extproc-bypass
+  labels:
+    app.kubernetes.io/name: maas-consumer-portal
+    app.kubernetes.io/part-of: maas-consumer-portal
+spec:
+  # Same priority as the payload-processing and external-model filters: these
+  # are MERGE patches on routes the other filters do not touch, so ordering
+  # relative to them does not matter, but staying positive keeps them after
+  # Kuadrant's default-priority (0) EnvoyFilter.
+  priority: 10
+  workloadSelector:
+    labels:
+      gateway.networking.k8s.io/gateway-name: CONSUMER_PORTAL_GATEWAY_NAME
+  configPatches:
+    - applyTo: HTTP_ROUTE
+      match:
+        context: GATEWAY
+        routeConfiguration:
+          vhost:
+            route:
+              name: "CONSUMER_PORTAL_INFRA_NAMESPACE.maas-consumer-portal.0"
+      patch:
+        operation: MERGE
+        value:
+          typed_per_filter_config:
+            envoy.filters.http.ext_proc.ipp-pre:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute
+              disabled: true
+            envoy.filters.http.ext_proc.ipp:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute
+              disabled: true
+    - applyTo: HTTP_ROUTE
+      match:
+        context: GATEWAY
+        routeConfiguration:
+          vhost:
+            route:
+              name: "CONSUMER_PORTAL_INFRA_NAMESPACE.maas-consumer-portal.1"
+      patch:
+        operation: MERGE
+        value:
+          typed_per_filter_config:
+            envoy.filters.http.ext_proc.ipp-pre:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute
+              disabled: true
+            envoy.filters.http.ext_proc.ipp:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute
+              disabled: true
+    - applyTo: HTTP_ROUTE
+      match:
+        context: GATEWAY
+        routeConfiguration:
+          vhost:
+            route:
+              name: "CONSUMER_PORTAL_INFRA_NAMESPACE.maas-consumer-portal-oauth2.0"
+      patch:
+        operation: MERGE
+        value:
+          typed_per_filter_config:
+            envoy.filters.http.ext_proc.ipp-pre:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute
+              disabled: true
+            envoy.filters.http.ext_proc.ipp:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute
+              disabled: true
