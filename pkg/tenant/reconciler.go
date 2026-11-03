@@ -365,16 +365,33 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		return result, err
 	}
 
+	// The maas-api HTTPRoute lives in the tenant's infrastructure namespace,
+	// and the EnvoyFilter's route-name matches must be qualified with it
+	// (Istio names Gateway API route rules
+	// "<namespace>.<HTTPRoute-name>.<rule-index>"). maas-controller normally
+	// publishes it on the MaasTenantConfig status before it waits on this
+	// controller's EnvoyFilter. If it is not set (an upgrade path where the
+	// status is not republished promptly, for example), the praxis dataplane
+	// must still be rendered and applied: the bypass patches silently no-op
+	// with unqualified names, and the requeue below re-applies the filter
+	// with qualified names once the status appears.
+	infraNamespace, _, _ := unstructured.NestedString(mtc.Object, "status", "infraNamespace")
+	missingInfraNamespace := infraNamespace == ""
+	if missingInfraNamespace {
+		log.Info("MaasTenantConfig status.infraNamespace is not set; applying the praxis dataplane with unqualified maas-api bypass names; will re-apply once it is published")
+	}
+
 	rendered, err := render.Build(r.ManifestPath)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("render: %w", err)
 	}
 
 	resources := render.PostRender(rendered, render.Params{
-		Namespace:        gatewayNamespace,
-		GatewayName:      gatewayName,
-		Image:            r.Image,
-		MaaSAPIRouteName: ResourceName(r.MaaSAPIRouteNameBase, tenantID),
+		Namespace:             gatewayNamespace,
+		GatewayName:           gatewayName,
+		Image:                 r.Image,
+		MaaSAPIRouteName:      ResourceName(r.MaaSAPIRouteNameBase, tenantID),
+		MaaSAPIRouteNamespace: infraNamespace,
 	})
 
 	resources, err = Rename(resources, tenantID, gatewayNamespace)
@@ -488,6 +505,11 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 
 	log.Info("praxis-extproc install applied",
 		"tenantID", tenantID, "namespace", gatewayNamespace, "gatewayName", gatewayName)
+	if missingInfraNamespace {
+		// The bypass route names were rendered unqualified; re-apply once the
+		// MaasTenantConfig publishes its infrastructure namespace.
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
+	}
 	return ctrl.Result{RequeueAfter: r.ResyncInterval}, nil
 }
 
