@@ -69,6 +69,7 @@ var (
 	gvkReferenceGrant  = schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1beta1", Kind: "ReferenceGrant"}
 	gvkAuthPolicy      = schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1", Kind: "AuthPolicy"}
 	gvkDestinationRule = schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1", Kind: "DestinationRule"}
+	gvkEnvoyFilter     = schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1alpha3", Kind: "EnvoyFilter"}
 	gvkDSCI            = schema.GroupVersionKind{Group: "dscinitialization.opendatahub.io", Version: "v2", Kind: "DSCInitialization"}
 	authProxyObjects   = []schema.GroupVersionKind{
 		{Group: "apps", Version: "v1", Kind: "Deployment"},
@@ -81,6 +82,7 @@ var (
 		gvkReferenceGrant,
 		gvkAuthPolicy,
 		gvkDestinationRule,
+		gvkEnvoyFilter,
 	}
 )
 

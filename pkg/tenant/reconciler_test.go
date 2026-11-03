@@ -332,6 +332,9 @@ func newMTC(namespace, tenantName, payloadProcessingType, aitenantName, aitenant
 		LabelManagedByAITenant: "true",
 		LabelTenantName:        tenantName,
 	})
+	// The tenant reconcile waits for the infrastructure namespace before
+	// rendering: maas-controller publishes it on the status early in bring-up.
+	_ = unstructured.SetNestedField(u.Object, "test-infra-ns", "status", "infraNamespace")
 	return u
 }
 
