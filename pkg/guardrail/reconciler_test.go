@@ -776,6 +776,38 @@ func TestReconcileDeniesInvalidAllowedConsumers(t *testing.T) {
 	}
 }
 
+// TestReconcileRefusesSubMillisecondTimeout covers a timeout Praxis would
+// render as timeout_ms 0. The provider is ready; the policy is still refused
+// before that endpoint is published, and 1ms remains acceptable.
+func TestReconcileRefusesSubMillisecondTimeout(t *testing.T) {
+	guardrail := newGuardrail(consumerNS, nemoName, providerNS)
+	guardrail.Spec.Provider.Timeout.Duration = 500 * time.Microsecond
+	f := newStandardFixture(guardrail, newNemo(providerNS, nemoName, map[string]any{"from": "All"}))
+
+	res := f.reconcile(t, consumerNS)
+	got := f.reload(t, consumerNS)
+	requireCondition(t, got, ConditionAccepted, metav1.ConditionFalse, reasonTimeoutBelowMinimum)
+	if got.Status.BindingRevision != "" || got.Status.ProviderEndpoint != "" {
+		t.Fatalf("revision %q endpoint %q, want both empty on a refused timeout", got.Status.BindingRevision, got.Status.ProviderEndpoint)
+	}
+	if res.RequeueAfter != f.reconciler.ResyncInterval {
+		t.Fatalf("RequeueAfter = %v, want the resync interval %v", res.RequeueAfter, f.reconciler.ResyncInterval)
+	}
+	if events := len(f.events); events != 1 {
+		t.Fatalf("%d events emitted, want 1 for the transition to refused", events)
+	}
+
+	accepted := newGuardrail(consumerNS, nemoName, providerNS)
+	accepted.Spec.Provider.Timeout.Duration = time.Millisecond
+	f = newStandardFixture(accepted, newNemo(providerNS, nemoName, map[string]any{"from": "All"}))
+	f.reconcile(t, consumerNS)
+	got = f.reload(t, consumerNS)
+	requireCondition(t, got, ConditionAccepted, metav1.ConditionTrue, reasonPolicyAccepted)
+	if got.Status.ProviderEndpoint == "" {
+		t.Fatal("1ms timeout was refused")
+	}
+}
+
 // TestReconcileRefusesChecksTheProviderCannotSatisfy covers the Compatible
 // gate end to end, and pins two things the unit tests cannot see.
 //

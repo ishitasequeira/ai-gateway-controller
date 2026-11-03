@@ -1,0 +1,42 @@
+filter_chains:
+- filters:
+  - filter: request_id
+  - conditions:
+    - when:
+        headers:
+          x-aigateway-guardrail-bd49b1378d8b306181fce650a99c2fc04c77358c549a24219db357c8632ded43: "true"
+    filter: ai_guardrails
+    phase:
+      request: true
+      response: false
+    provider:
+      endpoint: http://nemo.nemo-infra.svc.cluster.local/v1/checks
+      guardrails:
+        config_ids:
+        - pii-v1
+      timeout_ms: 5000
+      type: nemo
+  - conditions:
+    - when:
+        headers:
+          x-aigateway-guardrail-bd49b1378d8b306181fce650a99c2fc04c77358c549a24219db357c8632ded43: "true"
+    filter: ai_guardrails
+    phase:
+      request: false
+      response: true
+    provider:
+      endpoint: http://nemo.nemo-infra.svc.cluster.local/v1/checks
+      guardrails:
+        config_ids:
+        - pii-v1
+      timeout_ms: 5000
+      type: nemo
+  - filter: headers
+    request_remove:
+    - x-aigateway-guardrail-bd49b1378d8b306181fce650a99c2fc04c77358c549a24219db357c8632ded43
+  name: ipp
+insecure_options:
+  allow_private_upstreams: true
+  allow_unbounded_body: true
+server:
+  grpc_address: 0.0.0.0:9004

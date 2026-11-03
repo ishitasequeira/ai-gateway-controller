@@ -68,10 +68,11 @@ func TestEvaluateNemoReadyGatesOnTheDiscoveredEndpoint(t *testing.T) {
 			provider: withStatus(map[string]any{"endpoint": "nemo.provider-ns.svc.cluster.local"}),
 		},
 		{
-			// ExtProc must not be handed a plaintext target for a server
-			// whose whole point is an authenticated channel.
-			name:     "endpoint is http, not https",
-			provider: withStatus(map[string]any{"endpoint": "http://" + nemoName + "." + providerNS + ".svc.cluster.local"}),
+			// Auth off: TrustyAI publishes the same Service URL with http.
+			name:         "endpoint is http",
+			provider:     withStatus(map[string]any{"endpoint": "http://" + nemoName + "." + providerNS + ".svc.cluster.local"}),
+			wantReady:    true,
+			wantEndpoint: "http://" + nemoName + "." + providerNS + ".svc.cluster.local",
 		},
 		{
 			name:     "endpoint has a scheme but no host",
@@ -123,6 +124,26 @@ func TestEvaluateNemoReadyGatesOnTheDiscoveredEndpoint(t *testing.T) {
 			wantReady:    true,
 			wantEndpoint: nemoEndpoint,
 		},
+		{
+			// No endpoint published: the server is its plain http Service
+			// on port 80 in the published workload namespace. TrustyAI names
+			// that Service <custom-resource namespace>-<custom-resource name>.
+			name:         "workload namespace published, no endpoint",
+			provider:     withStatus(map[string]any{"workloadNamespace": "nemo-workloads"}),
+			wantReady:    true,
+			wantEndpoint: "http://" + providerNS + "-" + nemoName + ".nemo-workloads.svc.cluster.local",
+		},
+		{
+			name:     "invalid workload namespace",
+			provider: withStatus(map[string]any{"workloadNamespace": "evil.example.com#"}),
+		},
+		{
+			// A published https endpoint wins over the derived one.
+			name:         "endpoint and workload namespace published",
+			provider:     withStatus(map[string]any{"endpoint": nemoEndpoint, "workloadNamespace": providerNS}),
+			wantReady:    true,
+			wantEndpoint: nemoEndpoint,
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -171,7 +192,7 @@ func TestEvaluateNemoReadyDoesNotEchoTheRejectedEndpoint(t *testing.T) {
 
 			got := evaluateNemoReady(provider)
 			if got.Ready {
-				t.Fatal("accepted an endpoint that is not a plain absolute https base URL")
+				t.Fatal("accepted an endpoint that is not a plain absolute http or https base URL")
 			}
 			if got.Endpoint != "" {
 				t.Errorf("endpoint = %q, want it withheld on refusal", got.Endpoint)

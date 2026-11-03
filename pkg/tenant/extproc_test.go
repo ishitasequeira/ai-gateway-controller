@@ -1,6 +1,7 @@
 package tenant
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -142,6 +143,31 @@ func TestExternalModelConfigMatchesMainWhenTranslationIsOff(t *testing.T) {
 filter_chains:
   - name: post-auth
     filters:
+      - filter: headers
+        request_remove:
+          - authorization
+          - x-api-key
+          - x-origin-cluster
+          - x-maas-username
+          - x-maas-username-oc
+          - x-maas-username-token
+          - x-maas-group
+          - x-maas-group-oc
+          - x-maas-group-token
+          - x-maas-keyname
+          - x-maas-key-id
+          - x-maas-subscription
+          - x-maas-subscription-rate-limit-id
+          - x-maas-cost-center
+          - x-maas-organization-id
+          - x-maas-identity
+          - x-maas-admin-scope
+          - x-maas-tenant
+          - x-maas-invocation-mode
+          - x-maas-policy-revision
+          - x-maas-responses-owner
+          - x-maas-return-all-models
+          - x-maas-model
       - filter: intelligent_route
         overlay_file: /etc/praxis/routing/routing-overlay.json
         model_header: X-Gateway-Model-Name
@@ -303,9 +329,20 @@ func TestSharedExtProcConfigDefaultOff(t *testing.T) {
 	}
 }
 
+// TestSharedExtProcConfigHasHeadersGuard verifies that API translation does
+// not alter the leading shared-chain security boundary.
+func TestSharedExtProcConfigHasHeadersGuard(t *testing.T) {
+	for _, apiTranslation := range []bool{false, true} {
+		t.Run(fmt.Sprintf("apiTranslation=%t", apiTranslation), func(t *testing.T) {
+			assertSharedConfigHasLeadingHeadersGuard(t, sharedExtProcConfig(apiTranslation))
+		})
+	}
+}
+
 func TestSharedExtProcConfigUsesRegisteredOrderedMessagesFilters(t *testing.T) {
 	config := sharedExtProcConfig(true)
 	ordered := []string{
+		"filter: headers",
 		"filter: request_id",
 		"filter: stream_usage_inject",
 		"filter: anthropic_messages_request",
@@ -316,11 +353,11 @@ func TestSharedExtProcConfigUsesRegisteredOrderedMessagesFilters(t *testing.T) {
 	}
 	previous := -1
 	for _, token := range ordered {
-		position := strings.Index(config, token)
-		if position <= previous {
+		position := strings.Index(config[previous+1:], token)
+		if position < 0 {
 			t.Fatalf("filter %q appears out of order (position=%d):\n%s", token, position, config)
 		}
-		previous = position
+		previous += position + 1
 	}
 	for _, want := range []string{
 		"on_invalid: reject",
@@ -336,20 +373,75 @@ func TestSharedExtProcConfigUsesRegisteredOrderedMessagesFilters(t *testing.T) {
 			t.Fatalf("translation chain missing %q:\n%s", want, config)
 		}
 	}
-	for _, filter := range []string{"filter: headers", "filter: path_rewrite"} {
-		start := strings.Index(config, filter)
-		if start < 0 {
-			t.Fatalf("translation chain missing %q:\n%s", filter, config)
-		}
-		end := strings.Index(config[start+len(filter):], "\n      - filter:")
-		if end < 0 {
-			end = len(config) - start - len(filter)
-		}
-		block := config[start : start+len(filter)+end]
+	for _, filter := range []struct {
+		name       string
+		occurrence int
+	}{
+		{name: "headers", occurrence: 1},
+		{name: "path_rewrite", occurrence: 0},
+	} {
+		block := extProcFilterBlock(t, config, filter.name, filter.occurrence)
 		if !strings.Contains(block, "path: \"/v1/messages\"") {
-			t.Fatalf("filter %q must be restricted to the exact Messages path:\n%s", filter, block)
+			t.Fatalf("translation filter %q must be restricted to the exact Messages path:\n%s", filter.name, block)
 		}
 	}
+}
+
+// assertSharedConfigHasLeadingHeadersGuard verifies that the leading shared ipp
+// filter removes every sensitive header outside the maas-api management routes.
+//
+// t reports test failures, and config is the rendered shared Praxis YAML.
+func assertSharedConfigHasLeadingHeadersGuard(t *testing.T, config string) {
+	t.Helper()
+	guard := extProcFilterBlock(t, config, "headers", 0)
+	requestID := strings.Index(config, "filter: request_id")
+	if requestID < 0 || strings.Index(config, guard) > requestID {
+		t.Fatalf("shared headers guard must precede request_id:\n%s", config)
+	}
+	for _, exemption := range []string{
+		"path_prefix: /maas-api/v1",
+		"path_prefix: /maas-api/health",
+		"path_prefix: /v1/models",
+		"path_prefix: /v1/subscriptions",
+		"path_prefix: /v1/api-keys",
+		"path: /v1/me",
+	} {
+		if !strings.Contains(guard, exemption) {
+			t.Fatalf("shared headers guard missing exemption %q:\n%s", exemption, guard)
+		}
+	}
+	for _, header := range guardedRequestHeaders {
+		if !strings.Contains(guard, "\n          - "+header) {
+			t.Fatalf("shared headers guard missing header %q:\n%s", header, guard)
+		}
+	}
+}
+
+// extProcFilterBlock returns one named filter block selected by its occurrence.
+// It bounds the block at the next filter entry so tests can distinguish
+// multiple headers filters in the translation-enabled shared chain.
+//
+// t reports malformed configurations, config is rendered Praxis YAML, filter
+// is its filter token, and occurrence selects zero-based matching instances.
+// The returned value is the complete YAML block for that filter.
+func extProcFilterBlock(t *testing.T, config, filter string, occurrence int) string {
+	t.Helper()
+	token := "filter: " + filter
+	start := -1
+	searchFrom := 0
+	for i := 0; i <= occurrence; i++ {
+		index := strings.Index(config[searchFrom:], token)
+		if index < 0 {
+			t.Fatalf("configuration missing occurrence %d of %q:\n%s", occurrence, token, config)
+		}
+		start = searchFrom + index
+		searchFrom = start + len(token)
+	}
+	end := strings.Index(config[start+len(token):], "\n      - filter:")
+	if end < 0 {
+		return config[start:]
+	}
+	return config[start : start+len(token)+end]
 }
 
 func TestConfigureSharedExtProcDoesNotRewriteExternalModelResources(t *testing.T) {
@@ -386,6 +478,7 @@ func TestConfigureSharedExtProcDoesNotRewriteExternalModelResources(t *testing.T
 	if data["pre-extproc.yaml"] != "pre" || !strings.Contains(data["extproc.yaml"], "anthropic_messages_request") {
 		t.Fatalf("unexpected shared ExtProc ConfigMap: %#v", data)
 	}
+	assertSharedConfigHasLeadingHeadersGuard(t, data["extproc.yaml"])
 	hash, found, err := unstructured.NestedString(resources[1].Object, "spec", "template", "metadata", "annotations", extprocConfigHashAnnotation)
 	if err != nil || !found || hash == "" {
 		t.Fatalf("shared config hash missing: found=%v err=%v hash=%q", found, err, hash)

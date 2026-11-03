@@ -312,6 +312,7 @@ func TestReconcileAppliesAuthProxyForDefaultTenant(t *testing.T) {
 		"Deployment/" + testInfraNamespace + "/" + AuthProxyName,
 		"DestinationRule/" + testGatewayNamespace + "/maas-consumer-portal-auth-proxy-backend-tls",
 		"DestinationRule/" + testGatewayNamespace + "/maas-consumer-portal-backend-tls",
+		"EnvoyFilter/" + testGatewayNamespace + "/maas-consumer-portal-extproc-bypass",
 		"HTTPRoute/" + testInfraNamespace + "/" + PortalRouteName,
 		"HTTPRoute/" + testInfraNamespace + "/" + OAuthRouteName,
 		"NetworkPolicy/" + testInfraNamespace + "/" + AuthProxyName,

@@ -18,9 +18,9 @@ package guardrail
 
 import (
 	"fmt"
-	"net/url"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 // nemoReadiness is what reading a NemoGuardrails provider's status answers:
@@ -72,20 +72,16 @@ type nemoReadiness struct {
 // RouteDisabled when not exposed — which a naive True check would read as
 // failure.
 //
-// An absent endpoint is reported uniformly, whatever the cause. The common one
-// is authentication being switched off: upstream writes the field only when
-// utils.RequiresAuth holds, so security.opendatahub.io/enable-auth: "false"
-// clears it. Re-reading that annotation here to word a more specific message
-// would put a second interpretation of an upstream predicate in this package,
-// and the proposal asks for authenticated internal connectivity regardless
-// (:1338) — an unauthenticated server is not one a binding should activate
-// against.
+// When status.endpoint is not published, the server is reached through its
+// plain http Service on port 80 in status.workloadNamespace, which upstream
+// publishes once the workload is ready. The Service name is the custom
+// resource namespace and name joined with a hyphen, which is how TrustyAI
+// names the Service when the workload runs in another namespace:
+// <namespace>-<name>.<workloadNamespace>.svc.cluster.local.
 //
 // The value is parsed rather than trusted. status.endpoint is owned by another
-// controller, and anything that is not a plain absolute https base URL — no
-// userinfo, query or fragment — is a target ExtProc cannot call; rejecting it
-// here fails closed instead of handing a malformed, plaintext or
-// credential-bearing address downstream.
+// controller, and ParseNemoEndpoint is the same rule the tenant compiler uses,
+// so a policy is never accepted against an endpoint it cannot call.
 func evaluateNemoReady(nemo *unstructured.Unstructured) nemoReadiness {
 	undiscovered := nemoReadiness{
 		Reason: reasonEndpointDiscoveryUnavailable,
@@ -99,33 +95,59 @@ func evaluateNemoReady(nemo *unstructured.Unstructured) nemoReadiness {
 
 	discovered, found, err := unstructured.NestedString(nemo.Object, "status", "endpoint")
 	if err != nil || !found || discovered == "" {
+		if endpoint, ok := nemoServiceEndpoint(nemo); ok {
+			return nemoReadiness{
+				Ready:    true,
+				Endpoint: endpoint,
+				Reason:   reasonProviderAvailable,
+				Message: "referenced NemoGuardrails provider is reachable through its in-cluster http Service; " +
+					"this confirms discovery, not that the server is serving",
+			}
+		}
 		return undiscovered
 	}
 
-	// Only the scheme and host are echoed back. The rejected value is an
-	// arbitrary string from another controller's status, so quoting it whole
-	// would copy a userinfo password into a condition message and the Warning
-	// Event refuse emits.
-	parsed, err := url.Parse(discovered)
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" ||
-		parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
-		shown := "unparsable"
-		if err == nil {
-			shown = (&url.URL{Scheme: parsed.Scheme, Host: parsed.Host}).String()
-		}
+	service, err := ParseNemoEndpoint(discovered, nemo.GetNamespace(), nemo.GetName())
+	if err != nil {
 		return nemoReadiness{
 			Reason: reasonEndpointDiscoveryUnavailable,
 			Message: fmt.Sprintf(
-				"the referenced NemoGuardrails provider publishes a status.endpoint that is not a plain absolute "+
-					"https base URL (%s), so no supported checks endpoint could be discovered", shown),
+				"the referenced NemoGuardrails provider publishes a status.endpoint that is not a supported "+
+					"in-cluster Service URL (%v), so no supported checks endpoint could be discovered", err),
 		}
 	}
 
+	message := "referenced NemoGuardrails provider publishes an in-cluster http checks endpoint; " +
+		"this confirms discovery, not that the server is serving"
+	if service.Authenticated {
+		message = "referenced NemoGuardrails provider publishes an authenticated in-cluster checks endpoint; " +
+			"this confirms discovery, not that the server is serving"
+	}
 	return nemoReadiness{
 		Ready:    true,
 		Endpoint: discovered,
 		Reason:   reasonProviderAvailable,
-		Message: "referenced NemoGuardrails provider publishes an authenticated in-cluster checks endpoint; " +
-			"this confirms discovery, not that the server is serving",
+		Message:  message,
 	}
+}
+
+// nemoServiceEndpoint returns the server's in-cluster http Service URL once
+// status.workloadNamespace is published.
+func nemoServiceEndpoint(nemo *unstructured.Unstructured) (string, bool) {
+	workloadNamespace, _, err := unstructured.NestedString(nemo.Object, "status", "workloadNamespace")
+	name := nemo.GetName()
+	namespace := nemo.GetNamespace()
+	if err != nil || workloadNamespace == "" || name == "" || namespace == "" {
+		return "", false
+	}
+	if errs := validation.IsDNS1123Label(workloadNamespace); len(errs) > 0 {
+		return "", false
+	}
+	// TrustyAI's Service metadata.name. A dot in the custom resource name, or
+	// a join longer than 63 characters, is not a Service name.
+	service := NemoService{Namespace: workloadNamespace, Name: namespace + "-" + name}
+	if errs := validation.IsDNS1123Label(service.Name); len(errs) > 0 {
+		return "", false
+	}
+	return service.URL(), true
 }
