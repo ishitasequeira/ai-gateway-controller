@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
@@ -21,10 +22,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -102,16 +105,19 @@ type Reconciler struct {
 // Secret and tenant changes also reconcile providers independently of any model.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	inScope := predicate.NewPredicateFuncs(func(obj client.Object) bool { return r.namespaceAllowed(obj.GetNamespace()) })
-	if err := builder.ControllerManagedBy(mgr).
+	models := builder.ControllerManagedBy(mgr).
 		For(&v1alpha1.ExternalModel{}, builder.WithPredicates(inScope)).
 		Watches(&v1alpha1.ExternalProvider{}, handler.EnqueueRequestsFromMapFunc(r.providerModels), builder.WithPredicates(inScope)).
 		WatchesMetadata(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.secretModels), builder.WithPredicates(inScope)).
-		// The tenant reconciler creates the tenant-local Praxis Service. A
-		// model may otherwise publish an HTTPRoute before that Service exists;
-		// Istio can retain ResolvedRefs=False until the route is reconciled
-		// again. Service events are namespace-scoped and therefore only fan out
-		// to models in the affected tenant.
-		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(r.serviceModels), builder.WithPredicates(inScope)).
+		// The tenant reconciler creates the tenant-local Praxis Service. Service events are namespace-scoped and therefore only affect
+		// models in the affected tenant.
+		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(r.serviceModels), builder.WithPredicates(inScope))
+	// Model routes enable the post-auth filter only while the tenant has
+	// post-auth filters, so re-check them when one of those inputs changes.
+	for _, src := range tenant.PostAuthFilterSources() {
+		models = models.Watches(src.Object, r.postAuthFilterHandler(src), builder.WithPredicates(src.Predicate))
+	}
+	if err := models.
 		WatchesRawSource(source.Kind(mgr.GetCache(), tenant.NewMaasTenantConfig(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.maasTenantConfigModels))).
 		WatchesRawSource(source.Kind(mgr.GetCache(), tenant.NewAITenant(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.tenantModels))).
 		// Gateway attachments: route acceptance is reported in HTTPRoute
@@ -267,6 +273,92 @@ func (r *Reconciler) serviceModels(ctx context.Context, obj client.Object) []rec
 		return nil
 	}
 	return r.modelsInNamespace(ctx, obj.GetNamespace())
+}
+
+// postAuthFilterRetryDelays are the waits between retries when the tenant
+// lookup fails temporarily. The event won't fire again, so without retries
+// models attached to the tenant's Gateway would be missed.
+var postAuthFilterRetryDelays = []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second}
+
+// postAuthFilterHandler queues the models of each tenant affected by a
+// change. It holds the queue so it can retry later.
+//
+//nolint:ireturn // controller-runtime watches take a handler.EventHandler.
+func (r *Reconciler) postAuthFilterHandler(src tenant.PostAuthFilterSource) handler.EventHandler {
+	enqueue := func(ctx context.Context, q workqueue.TypedRateLimitingInterface[reconcile.Request], objects ...client.Object) {
+		for _, obj := range objects {
+			for _, namespace := range src.Tenants(ctx, r.Client, obj) {
+				r.enqueuePostAuthFilterModels(ctx, q, namespace, 0)
+			}
+		}
+	}
+	return handler.Funcs{
+		CreateFunc: func(ctx context.Context, e event.CreateEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+			enqueue(ctx, q, e.Object)
+		},
+		UpdateFunc: func(ctx context.Context, e event.UpdateEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+			enqueue(ctx, q, e.ObjectOld, e.ObjectNew)
+		},
+		DeleteFunc: func(ctx context.Context, e event.DeleteEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+			enqueue(ctx, q, e.Object)
+		},
+		GenericFunc: func(ctx context.Context, e event.GenericEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+			enqueue(ctx, q, e.Object)
+		},
+	}
+}
+
+// enqueuePostAuthFilterModels queues the tenant's models and retries if the
+// tenant lookup failed temporarily. Other failures are only logged; fixing
+// the MaasTenantConfig or AITenant triggers a new pass.
+func (r *Reconciler) enqueuePostAuthFilterModels(ctx context.Context, q workqueue.TypedRateLimitingInterface[reconcile.Request], namespace string, attempt int) {
+	if ctx.Err() != nil || q.ShuttingDown() {
+		return
+	}
+	requests, err := r.postAuthFilterModels(ctx, namespace)
+	for _, request := range requests {
+		q.Add(request)
+	}
+	if err == nil {
+		return
+	}
+	if !transientReadError(err) || attempt >= len(postAuthFilterRetryDelays) {
+		r.Log.Error(err, "resolve tenant for post-auth filter event; gateway-attached models were not enqueued",
+			"namespace", namespace, "attempts", attempt+1)
+		return
+	}
+	time.AfterFunc(postAuthFilterRetryDelays[attempt], func() {
+		r.enqueuePostAuthFilterModels(ctx, q, namespace, attempt+1)
+	})
+}
+
+// postAuthFilterModels returns the tenant's models: those in its namespace
+// and those attached to its Gateway. If the tenant lookup fails, it still
+// returns the ones in its namespace, along with the error.
+func (r *Reconciler) postAuthFilterModels(ctx context.Context, tenantNamespace string) ([]reconcile.Request, error) {
+	if !r.namespaceAllowed(tenantNamespace) {
+		return nil, nil
+	}
+	requests := r.modelsInNamespace(ctx, tenantNamespace)
+	resolution, err := r.resolveTenantForNamespace(ctx, tenantNamespace)
+	if err != nil {
+		return requests, err
+	}
+	if resolution.aitenant == nil {
+		return requests, nil
+	}
+	seen := make(map[types.NamespacedName]struct{}, len(requests))
+	for _, request := range requests {
+		seen[request.NamespacedName] = struct{}{}
+	}
+	for _, request := range r.gatewayAttachedModels(ctx, resolution.aitenant) {
+		if _, ok := seen[request.NamespacedName]; ok {
+			continue
+		}
+		seen[request.NamespacedName] = struct{}{}
+		requests = append(requests, request)
+	}
+	return requests, nil
 }
 
 func (r *Reconciler) tenantModels(ctx context.Context, ait *unstructured.Unstructured) []reconcile.Request {
@@ -1990,6 +2082,10 @@ func (r *Reconciler) writeExternalModelRoutes(ctx context.Context, tenantID, mod
 			},
 		},
 	}}
+	postAuth, err := tenant.HasPostAuthFilters(ctx, r.Client, modelNamespace)
+	if err != nil {
+		return err
+	}
 	kept := append(make([]any, 0, len(preserved)+len(routes)*3+len(attached)*3+2), preserved...)
 
 	byModel := map[string][]resolver.Route{}
@@ -2033,6 +2129,62 @@ func (r *Reconciler) writeExternalModelRoutes(ctx context.Context, tenantID, mod
 			responseMode = "STREAMED"
 		}
 		for index := 0; index < route.count; index++ {
+			perFilter := map[string]any{
+				externalModelPreExtProcFilter: map[string]any{
+					"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
+					"overrides": map[string]any{
+						"processing_mode": map[string]any{
+							"request_header_mode": "SEND",
+							// The pre-auth processor extracts the model from JSON before
+							// authentication. Give its body-field-to-header filter the
+							// complete request body; only post-auth Praxis needs streamed
+							// chunks for selected-provider translation.
+							"request_body_mode":     "BUFFERED",
+							"response_header_mode":  "SKIP",
+							"response_body_mode":    "NONE",
+							"request_trailer_mode":  "SKIP",
+							"response_trailer_mode": "SKIP",
+						},
+					},
+				},
+				externalModelExtProcFilter: map[string]any{
+					"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
+					// ExtProcPerRoute is disable-only when the
+					// vhost config is disabled. An overrides
+					// object is the supported way for this
+					// more-specific ExternalModel route to
+					// re-enable the filter.
+					"overrides": map[string]any{
+						"processing_mode": map[string]any{
+							"request_header_mode": "SEND",
+							// Buffer every request so Envoy sends one complete body message,
+							// including when trailers follow: stream_usage_inject and the
+							// translation filters need the whole JSON body. The pre-auth
+							// processor already buffers it.
+							"request_body_mode":    "BUFFERED",
+							"response_header_mode": "SEND",
+							// Envoy chooses the response processing mode before the
+							// provider is selected. Stream all rules for a model that
+							// can select Messages; retain NONE for OpenAI-only models.
+							"response_body_mode":    responseMode,
+							"request_trailer_mode":  "SKIP",
+							"response_trailer_mode": "SKIP",
+						},
+					},
+				},
+				"envoy.filters.http.ext_proc.ipp-pre": map[string]any{
+					"@type":    "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
+					"disabled": true,
+				},
+			}
+			// The "ipp" filter runs the tenant's post-auth filters. Leave it
+			// on when the tenant has any; otherwise turn it off.
+			if !postAuth {
+				perFilter["envoy.filters.http.ext_proc.ipp"] = map[string]any{
+					"@type":    "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
+					"disabled": true,
+				}
+			}
 			kept = append(kept, map[string]any{
 				"applyTo": "HTTP_ROUTE",
 				"match": map[string]any{
@@ -2045,58 +2197,7 @@ func (r *Reconciler) writeExternalModelRoutes(ctx context.Context, tenantID, mod
 				},
 				"patch": map[string]any{
 					"operation": "MERGE",
-					"value": map[string]any{"typed_per_filter_config": map[string]any{
-						externalModelPreExtProcFilter: map[string]any{
-							"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
-							"overrides": map[string]any{
-								"processing_mode": map[string]any{
-									"request_header_mode": "SEND",
-									// The pre-auth processor extracts the model from JSON before
-									// authentication. Give its body-field-to-header filter the
-									// complete request body; only post-auth Praxis needs streamed
-									// chunks for selected-provider translation.
-									"request_body_mode":     "BUFFERED",
-									"response_header_mode":  "SKIP",
-									"response_body_mode":    "NONE",
-									"request_trailer_mode":  "SKIP",
-									"response_trailer_mode": "SKIP",
-								},
-							},
-						},
-						externalModelExtProcFilter: map[string]any{
-							"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
-							// ExtProcPerRoute is disable-only when the
-							// vhost config is disabled. An overrides
-							// object is the supported way for this
-							// more-specific ExternalModel route to
-							// re-enable the filter.
-							"overrides": map[string]any{
-								"processing_mode": map[string]any{
-									"request_header_mode": "SEND",
-									// Buffer every request so Envoy sends one complete body message,
-									// including when trailers follow: stream_usage_inject and the
-									// translation filters need the whole JSON body. The pre-auth
-									// processor already buffers it.
-									"request_body_mode":    "BUFFERED",
-									"response_header_mode": "SEND",
-									// Envoy chooses the response processing mode before the
-									// provider is selected. Stream all rules for a model that
-									// can select Messages; retain NONE for OpenAI-only models.
-									"response_body_mode":    responseMode,
-									"request_trailer_mode":  "SKIP",
-									"response_trailer_mode": "SKIP",
-								},
-							},
-						},
-						"envoy.filters.http.ext_proc.ipp-pre": map[string]any{
-							"@type":    "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
-							"disabled": true,
-						},
-						"envoy.filters.http.ext_proc.ipp": map[string]any{
-							"@type":    "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
-							"disabled": true,
-						},
-					}},
+					"value":     map[string]any{"typed_per_filter_config": perFilter},
 				},
 			})
 		}

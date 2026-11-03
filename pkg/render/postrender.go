@@ -41,11 +41,17 @@ type Params struct {
 	Image string
 	// MaaSAPIRouteName replaces the "PLACEHOLDER.maas-api-route" prefix used
 	// by the EnvoyFilter to disable ext_proc on maas-api's own HTTPRoute
-	// rules. Exact fidelity depends on maas-api's HTTPRoute name and the
-	// Istio version's internal route-naming scheme, which this controller
-	// does not observe in Phase 1 (see DESIGN.md, "Out of scope"); treat the
-	// default as a best-effort placeholder until that integration lands.
+	// rules. Istio names Gateway API route rules
+	// "<namespace>.<HTTPRoute-name>.<rule-index>", so PostRender combines this
+	// with MaaSAPIRouteNamespace to build the match prefix.
 	MaaSAPIRouteName string
+	// MaaSAPIRouteNamespace is the namespace of maas-api's HTTPRoute — the
+	// tenant's infrastructure namespace, distinct from Params.Namespace (the
+	// gateway namespace the vendored overlay deploys into). Required whenever
+	// MaaSAPIRouteName is set: an empty value produces match names that never
+	// match. The tenant reconciler waits for the MaasTenantConfig to publish
+	// status.infraNamespace before rendering.
+	MaaSAPIRouteNamespace string
 }
 
 // clusterScopedKinds lists the Kinds present in the vendored overlay that
@@ -87,7 +93,20 @@ func placeholderReplacements(p Params) []placeholderReplacement {
 		// networkpolicy.yaml's own comment calls out as a placeholder.
 		{old: "openshift-ingress", new: p.Namespace},
 		// EnvoyFilter HTTP_ROUTE match names, e.g. "PLACEHOLDER.maas-api-route.0".
-		{old: "PLACEHOLDER.maas-api-route", new: p.MaaSAPIRouteName},
+		// Istio names Gateway API route rules "<namespace>.<HTTPRoute-name>.<rule-index>",
+		// so the route-name prefix must be qualified with the HTTPRoute's
+		// namespace (the tenant infra namespace, not Params.Namespace) or the
+		// patches silently never match (verified against a live gateway
+		// config dump).
+		func() placeholderReplacement {
+			if p.MaaSAPIRouteNamespace == "" {
+				// No infrastructure namespace known yet: unqualified names
+				// (the pre-qualification behavior) so the patches no-op
+				// rather than matching ".maas-api-route.0".
+				return placeholderReplacement{old: "PLACEHOLDER.maas-api-route", new: p.MaaSAPIRouteName}
+			}
+			return placeholderReplacement{old: "PLACEHOLDER.maas-api-route", new: p.MaaSAPIRouteNamespace + "." + p.MaaSAPIRouteName}
+		}(),
 		// Deployment container images (payload-processing and payload-pre-processing).
 		{old: "praxis-extproc:dev", new: p.Image},
 	}

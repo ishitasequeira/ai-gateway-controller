@@ -109,7 +109,7 @@ func Render(resources []unstructured.Unstructured, p Params) []unstructured.Unst
 		switch u.GetKind() {
 		case "ReferenceGrant":
 			u.SetNamespace(p.DashboardNamespace)
-		case "DestinationRule":
+		case "DestinationRule", "EnvoyFilter":
 			u.SetNamespace(p.GatewayNamespace)
 		default:
 			u.SetNamespace(p.Namespace)

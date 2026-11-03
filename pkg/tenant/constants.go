@@ -53,6 +53,20 @@ var MaasTenantConfigGVK = schema.GroupVersionKind{
 	Kind:    "MaasTenantConfig",
 }
 
+// MaaSSubscriptionGVK is a subscription. Its guardrails lists are read in the order written.
+var MaaSSubscriptionGVK = schema.GroupVersionKind{
+	Group:   "maas.opendatahub.io",
+	Version: "v1alpha1",
+	Kind:    "MaaSSubscription",
+}
+
+// MaaSModelRefGVK is a model. Its guardrails list is read after the subscription-wide lists.
+var MaaSModelRefGVK = schema.GroupVersionKind{
+	Group:   "maas.opendatahub.io",
+	Version: "v1alpha1",
+	Kind:    "MaaSModelRef",
+}
+
 const (
 	// MaasTenantConfigInstanceName is the singleton resource name enforced by
 	// the MaasTenantConfig CRD (mirrors maasv1alpha1.MaasTenantConfigInstanceName).

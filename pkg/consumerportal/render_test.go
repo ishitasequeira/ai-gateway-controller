@@ -18,7 +18,9 @@ package consumerportal
 
 import (
 	"encoding/json"
+	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -210,6 +212,61 @@ func TestRenderBuildsBackendTLS(t *testing.T) {
 			t.Errorf("DestinationRule %s = %s/%s host=%q port=%d mode=%q sni=%q",
 				tc.name, rule.GetNamespace(), rule.GetName(), host, port, mode, sni)
 		}
+	}
+}
+
+func TestRenderBuildsExtProcBypass(t *testing.T) {
+	resources := renderTestResources(t)
+	filter := findResource(t, resources, "EnvoyFilter", "maas-consumer-portal-extproc-bypass")
+	// EnvoyFilters are gateway-namespace objects, like the DestinationRules.
+	if filter.GetNamespace() != testGatewayNamespace {
+		t.Errorf("EnvoyFilter namespace = %s, want %s", filter.GetNamespace(), testGatewayNamespace)
+	}
+	patches, _, _ := unstructured.NestedSlice(filter.Object, "spec", "configPatches")
+	// Istio names Gateway API route rules "<namespace>.<HTTPRoute-name>.<rule-index>".
+	// The expected names are DERIVED from the rendered HTTPRoutes, not
+	// hardcoded, so adding, removing, or reordering a rule in
+	// httproutes.yaml without updating envoyfilter.yaml fails here instead
+	// of silently dropping a bypass.
+	wantNames := map[string]bool{}
+	for _, resource := range resources {
+		if resource.GetKind() != "HTTPRoute" {
+			continue
+		}
+		if name := resource.GetName(); name != PortalRouteName && name != OAuthRouteName {
+			continue
+		}
+		rules, _, _ := unstructured.NestedSlice(resource.Object, "spec", "rules")
+		for i := range rules {
+			wantNames[testInfraNamespace+"."+resource.GetName()+"."+strconv.Itoa(i)] = true
+		}
+	}
+	if len(patches) != len(wantNames) {
+		t.Fatalf("EnvoyFilter has %d configPatches, want %d (one per portal route rule): %v",
+			len(patches), len(wantNames), wantNames)
+	}
+	gotNames := map[string]bool{}
+	for _, patch := range patches {
+		patchMap, ok := patch.(map[string]any)
+		if !ok {
+			t.Fatalf("configPatch is %T, want map", patch)
+		}
+		name, _, _ := unstructured.NestedString(patchMap, "match", "routeConfiguration", "vhost", "route", "name")
+		gotNames[name] = true
+		for _, filterName := range []string{"envoy.filters.http.ext_proc.ipp-pre", "envoy.filters.http.ext_proc.ipp"} {
+			disabled, _, _ := unstructured.NestedBool(patchMap, "patch", "value", "typed_per_filter_config", filterName, "disabled")
+			if !disabled {
+				t.Errorf("patch for %q does not disable %s", name, filterName)
+			}
+		}
+	}
+	if !reflect.DeepEqual(gotNames, wantNames) {
+		t.Errorf("patch route names = %v, want %v", gotNames, wantNames)
+	}
+	// The workload selector must track the tenant gateway.
+	selector, _, _ := unstructured.NestedString(filter.Object, "spec", "workloadSelector", "labels", "gateway.networking.k8s.io/gateway-name")
+	if selector != testGatewayName {
+		t.Errorf("workloadSelector gateway = %q, want %q", selector, testGatewayName)
 	}
 }
 

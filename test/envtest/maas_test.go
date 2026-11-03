@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -87,7 +88,9 @@ func (m maasFixture) existingPraxisTenant(t *testing.T, namespace string) {
 			}},
 		},
 	}}
-	require.NoError(t, m.client.Create(t.Context(), gateway))
+	if err := m.client.Create(t.Context(), gateway); err != nil && !apierrors.IsAlreadyExists(err) {
+		require.NoError(t, err)
+	}
 
 	ait := tenant.NewAITenant()
 	ait.SetName(namespace)
@@ -121,4 +124,9 @@ func (m maasFixture) existingPraxisTenant(t *testing.T, namespace string) {
 	})
 	mtc.Object["spec"] = map[string]any{}
 	require.NoError(t, m.client.Create(t.Context(), mtc))
+	// The praxis reconcile waits for the infrastructure namespace before
+	// rendering: maas-controller publishes it early in tenant bring-up, and
+	// the EnvoyFilter's maas-api route-name matches are qualified with it.
+	mtc.Object["status"] = map[string]any{"infraNamespace": namespace}
+	require.NoError(t, m.client.Status().Update(t.Context(), mtc))
 }
