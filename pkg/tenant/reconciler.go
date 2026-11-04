@@ -713,19 +713,17 @@ func (r *Reconciler) resolvePraxisRuntimeCandidates(
 	if err != nil {
 		return nil, false, false, "", err
 	}
+	homeCandidates, policyExcludedOnly, homeErr := r.runtimeCandidates(ctx, tenantNamespace, gatewayName, gatewayNamespace, apiTranslation)
+	if homeErr != nil && !errors.Is(homeErr, resolver.ErrNoRoutes) {
+		return nil, false, false, "", homeErr
+	}
 	// An unreadable overlay may still carry attachments: keep the processor
 	// and let routingOverlayReady report it, as for the tenant's own models.
-	serving := hasModels || len(attached) > 0 || unreadableOverlay
+	serving := hasModels || len(homeCandidates) > 0 || len(attached) > 0 || unreadableOverlay
 	if !serving {
 		return nil, false, true, "", nil
 	}
 
-	var homeCandidates []envelope.Candidate
-	var homeErr error
-	var policyExcludedOnly bool
-	if hasModels {
-		homeCandidates, policyExcludedOnly, homeErr = r.runtimeCandidates(ctx, tenantNamespace, gatewayName, gatewayNamespace, apiTranslation)
-	}
 	if policyExcludedOnly && len(attached) == 0 && !unreadableOverlay {
 		// The model controller has withdrawn every home route on purpose. Its
 		// overlay may already be gone, so do not wait for it before applying
@@ -856,6 +854,9 @@ func (r *Reconciler) providersForTenant(ctx context.Context, namespace, gatewayN
 	referenced := map[string]bool{}
 	required := map[string]bool{}
 	for i := range models {
+		if !models[i].DeletionTimestamp.IsZero() {
+			continue
+		}
 		for _, ref := range models[i].Spec.ExternalProviderRefs {
 			name := ref.Ref.Name
 			// A provider in another namespace is never a same-named local one.
@@ -872,7 +873,7 @@ func (r *Reconciler) providersForTenant(ctx context.Context, namespace, gatewayN
 	result := make([]v1alpha1.ExternalProvider, 0, len(providers.Items))
 	availableRequired := make(map[string]bool, len(required))
 	for i := range providers.Items {
-		if referenced[providers.Items[i].Name] {
+		if providers.Items[i].DeletionTimestamp.IsZero() && referenced[providers.Items[i].Name] {
 			result = append(result, providers.Items[i])
 			if required[providers.Items[i].Name] {
 				availableRequired[providers.Items[i].Name] = true
@@ -895,6 +896,9 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayNa
 	}
 	modelPtrs := make([]*v1alpha1.ExternalModel, 0, len(models))
 	for i := range models {
+		if !models[i].DeletionTimestamp.IsZero() {
+			continue
+		}
 		// Providers in other namespaces are loaded from the published overlay
 		// (attachedOverlayCandidates), so a model referencing only those has
 		// no local runtime candidates.
@@ -904,43 +908,30 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayNa
 			modelPtrs = append(modelPtrs, &models[i])
 		}
 	}
-	if len(modelPtrs) == 0 {
-		return nil, false, nil
-	}
+
 	providerPtrs := make([]*v1alpha1.ExternalProvider, 0, len(providers.Items))
 	for i := range providers.Items {
-		providerPtrs = append(providerPtrs, &providers.Items[i])
+		if providers.Items[i].DeletionTimestamp.IsZero() {
+			providerPtrs = append(providerPtrs, &providers.Items[i])
+		}
 	}
 	runtimeSet, err := resolver.ResolveAllWithAPITranslation(modelPtrs, providerPtrs, apiTranslationEnabled)
 	policyExcludedOnly := allRuntimeRoutesExcludedByPolicy(runtimeSet)
-	if err != nil {
+	if err != nil && !errors.Is(err, resolver.ErrNoRoutes) {
 		return nil, policyExcludedOnly, fmt.Errorf("resolve ExtProc runtime provider set: %w", err)
 	}
-	candidates := make([]envelope.Candidate, 0, len(runtimeSet.Routes()))
-	for _, route := range runtimeSet.Routes() {
-		strategy, header, err := envelope.StrategyFor(route)
-		if err != nil {
-			return nil, false, fmt.Errorf("resolve ExtProc runtime credential for model %s provider %s: %w", route.Model, route.Provider, err)
-		}
-		candidate := envelope.Candidate{
-			Cluster: route.Cluster, StableID: envelope.CandidateStableID(route.Model, route.Provider),
-			Kind: "inference_model", Name: route.ClientName, Fresh: true,
-		}
-		if apiTranslationEnabled {
-			candidate.APIFormat = route.APIFormat
-			candidate.Path = route.Path
-			candidate.TargetModel = route.TargetModel
-		}
-		if strategy != "" {
-			candidate.Credential = &envelope.Credential{
-				Strategy:  strategy,
-				Header:    header,
-				SecretRef: envelope.SecretRef{Name: route.SecretName, Namespace: route.Namespace, Key: route.SecretKey},
-			}
-		}
-		candidates = append(candidates, candidate)
+	candidates, candidateErr := ExternalModelRuntimeCandidates(runtimeSet, apiTranslationEnabled)
+	if candidateErr != nil {
+		return nil, false, candidateErr
 	}
-	return candidates, false, nil
+	candidates, candidateErr = RetainHomeRuntimeCandidates(ctx, r.Client, namespace, candidates, apiTranslationEnabled)
+	if candidateErr != nil {
+		return nil, false, candidateErr
+	}
+	if errors.Is(err, resolver.ErrNoRoutes) && len(candidates) == 0 && len(modelPtrs) > 0 {
+		return nil, policyExcludedOnly, fmt.Errorf("resolve ExtProc runtime provider set: %w", err)
+	}
+	return candidates, policyExcludedOnly, nil
 }
 
 // allRuntimeRoutesExcludedByPolicy distinguishes an intentional translation

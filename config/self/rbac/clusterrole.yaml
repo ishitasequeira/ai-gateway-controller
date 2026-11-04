@@ -43,6 +43,25 @@ rules:
 - apiGroups: ["apps"]
   resources: ["deployments"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# Provider withdrawal uses live ReplicaSet and Pod state, plus EndpointSlices,
+# to prove that no old ExtProc revision can still select a withdrawn provider.
+# These are live API reads and need no watch or write access. Pod log access
+# proves which overlay revision the ExtProc process is serving. Tenant
+# namespaces are discovered at runtime; creating narrower RoleBindings would
+# require RBAC delegation privileges, so the controller restricts log reads
+# to the tenant's selected ExtProc pods in code.
+- apiGroups: ["apps"]
+  resources: ["replicasets"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get"]
+- apiGroups: ["discovery.k8s.io"]
+  resources: ["endpointslices"]
+  verbs: ["get", "list"]
 # HPAs for Praxis IPP Deployments when MaasTenantConfig.spec.payloadProcessing
 # / payloadPreProcessing.autoscaling is set (parity with maas-controller).
 - apiGroups: ["autoscaling"]

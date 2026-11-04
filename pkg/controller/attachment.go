@@ -78,6 +78,7 @@ const (
 	annotationAttachmentRules       = "inference.opendatahub.io/attachment-destination-rules"
 	annotationAttachmentCredentials = "inference.opendatahub.io/attachment-credentials"
 	annotationAttachmentIdentity    = "inference.opendatahub.io/attachment-identity"
+	annotationWithdrawalCandidates  = "inference.opendatahub.io/provider-withdrawal-candidates"
 	annotationCredentialSource      = "inference.opendatahub.io/credential-source"
 )
 
@@ -105,12 +106,13 @@ func (t attachmentTenant) handoff() modelTenantContext {
 
 // attachmentResult is the outcome of one gateway attachment.
 type attachmentResult struct {
-	gateway   v1alpha1.NamespacedObjectReference
-	ready     bool
-	pending   bool
-	reason    string
-	message   string
-	routeName string
+	gateway      v1alpha1.NamespacedObjectReference
+	ready        bool
+	pending      bool
+	requeueAfter time.Duration
+	reason       string
+	message      string
+	routeName    string
 	// env is the overlay the home attachment distributed.
 	env *envelope.Envelope
 }
@@ -549,8 +551,14 @@ func (r *Reconciler) reconcileAttachedModel(ctx context.Context, model *v1alpha1
 	for _, res := range results {
 		if res.pending {
 			// Route acceptance and credential copies are observed through
-			// the cache; recheck instead of waiting for an unrelated event.
-			result.RequeueAfter = attachmentRequeueInterval
+			// the cache; serving-state drains supply their own bounded requeue.
+			after := res.requeueAfter
+			if after <= 0 {
+				after = attachmentRequeueInterval
+			}
+			if result.RequeueAfter == 0 || after < result.RequeueAfter {
+				result.RequeueAfter = after
+			}
 		}
 	}
 	return result, errors.Join(errs...)
@@ -723,13 +731,6 @@ func (r *Reconciler) reconcileAttachment(ctx context.Context, model *v1alpha1.Ex
 		return result, nil
 	}
 	self := candidates[idx]
-	if self.reason != "" {
-		// A model-name conflict, a resolution or credential failure (such
-		// as a deleted source Secret) and too many providers all exclude the
-		// model: no route, overlay entry or transport on this Gateway.
-		result.reason, result.message = self.reason, self.message
-		return result, r.excludeAttachment(ctx, model, t)
-	}
 	var providers v1alpha1.ExternalProviderList
 	if err := r.List(ctx, &providers, client.InNamespace(model.Namespace)); err != nil {
 		return result, fmt.Errorf("list ExternalProviders in %s: %w", model.Namespace, err)
@@ -738,7 +739,73 @@ func (r *Reconciler) reconcileAttachment(ctx context.Context, model *v1alpha1.Ex
 	for i := range providers.Items {
 		providerOwners[providers.Items[i].Name] = &providers.Items[i]
 	}
-	if err := r.applyAttachmentRoute(ctx, self, t, providerOwners); err != nil {
+	if self.reason != "" {
+		return r.reconcileExcludedAttachment(ctx, model, t, self, providerOwners)
+	}
+	return r.reconcileEligibleAttachment(ctx, model, t, self, candidates, providerOwners)
+}
+
+func (r *Reconciler) reconcileExcludedAttachment(ctx context.Context, model *v1alpha1.ExternalModel, t attachmentTenant,
+	self attachedModel, providerOwners map[string]*v1alpha1.ExternalProvider) (attachmentResult, error) {
+	result := attachmentResult{gateway: t.gateway, routeName: self.routeName}
+	// A resolution/credential failure or other exclusion can remove every
+	// current candidate. Preserve an already-accepted old route until the
+	// reduced tenant runtime is serving and its in-flight requests drain.
+	withdrawnCandidates, err := r.withdrawnAttachmentCandidates(ctx, self, t)
+	if err != nil {
+		return result, err
+	}
+	if len(withdrawnCandidates) == 0 {
+		result.reason, result.message = self.reason, self.message
+		return result, r.excludeAttachment(ctx, model, t)
+	}
+	withdrawnRoutes, err := r.routesForAttachmentWithdrawal(ctx, model, t, withdrawnCandidates)
+	if err != nil {
+		return result, err
+	}
+	if err := r.ensureAttachmentProviderFinalizers(ctx, withdrawnRoutes); err != nil {
+		return result, err
+	}
+	staged := self
+	staged.routes = withdrawnRoutes
+	staged.ready, staged.reason = true, ""
+	if err := r.applyAttachmentRoute(ctx, staged, t, providerOwners, withdrawnCandidates); err != nil {
+		return result, err
+	}
+	retainedRoutes := map[types.UID][]resolver.Route{model.UID: withdrawnRoutes}
+	if _, err := r.publishAttachmentTenantWithRetainedRoutes(ctx, t, model, retainedRoutes); err != nil {
+		return result, err
+	}
+	remaining, err := r.attachmentWithdrawalRemaining(ctx, t)
+	if err != nil {
+		return result, err
+	}
+	if remaining > 0 {
+		result.pending, result.reason = true, reasonAttachmentPending
+		result.message = "provider withdrawal is waiting for the reduced ExternalModel ExtProc revision and in-flight requests to drain"
+		result.requeueAfter = remaining
+		return result, nil
+	}
+	result.reason, result.message = self.reason, self.message
+	return result, r.excludeAttachment(ctx, model, t)
+}
+
+func (r *Reconciler) reconcileEligibleAttachment(ctx context.Context, model *v1alpha1.ExternalModel, t attachmentTenant,
+	self attachedModel, candidates []attachedModel, providerOwners map[string]*v1alpha1.ExternalProvider) (attachmentResult, error) {
+	result := attachmentResult{gateway: t.gateway, routeName: self.routeName}
+	withdrawnCandidates, err := r.withdrawnAttachmentCandidates(ctx, self, t)
+	if err != nil {
+		return result, err
+	}
+	withdrawnRoutes, err := r.routesForAttachmentWithdrawal(ctx, model, t, withdrawnCandidates)
+	if err != nil {
+		return result, err
+	}
+	routesToProtect := append(slices.Clone(self.routes), withdrawnRoutes...)
+	if err := r.ensureAttachmentProviderFinalizers(ctx, routesToProtect); err != nil {
+		return result, err
+	}
+	if err := r.applyAttachmentRoute(ctx, self, t, providerOwners, withdrawnCandidates); err != nil {
 		return result, err
 	}
 
@@ -780,14 +847,40 @@ func (r *Reconciler) reconcileAttachment(ctx context.Context, model *v1alpha1.Ex
 	if err := r.applyCredentialCopies(ctx, self, t); err != nil {
 		return result, err
 	}
-	admitted, err := r.publishAttachmentTenant(ctx, t, model)
+	retainedRoutes := map[types.UID][]resolver.Route{}
+	if len(withdrawnRoutes) > 0 {
+		retainedRoutes[model.UID] = withdrawnRoutes
+	}
+	admitted, err := r.publishAttachmentTenantWithRetainedRoutes(ctx, t, model, retainedRoutes)
 	if err != nil {
 		return result, err
+	}
+	if len(withdrawnCandidates) > 0 {
+		remaining, err := r.attachmentWithdrawalRemaining(ctx, t)
+		if err != nil {
+			return result, err
+		}
+		if remaining > 0 {
+			result.pending, result.reason = true, reasonAttachmentPending
+			result.message = "provider withdrawal is waiting for the reduced ExternalModel ExtProc revision and in-flight requests to drain"
+			result.requeueAfter = remaining
+			return result, nil
+		}
+		// The reduced revision is serving and the drain interval elapsed. Now
+		// remove the retained provider rules, then their Gateway configuration
+		// and credential copies.
+		if err := r.applyAttachmentRoute(ctx, self, t, providerOwners, nil); err != nil {
+			return result, err
+		}
+		admitted, err = r.publishAttachmentTenant(ctx, t, model)
+		if err != nil {
+			return result, err
+		}
 	}
 	if err := r.gcAttachmentState(ctx, t.namespace, excludedRoutes(admitted)); err != nil {
 		return result, err
 	}
-	idx = slices.IndexFunc(admitted, func(c attachedModel) bool { return c.model.UID == model.UID })
+	idx := slices.IndexFunc(admitted, func(c attachedModel) bool { return c.model.UID == model.UID })
 	switch {
 	case idx >= 0 && admitted[idx].reason != "":
 		result.reason, result.message = admitted[idx].reason, admitted[idx].message
@@ -825,6 +918,159 @@ func (r *Reconciler) withdrawAttachment(ctx context.Context, model *v1alpha1.Ext
 	return r.gcAttachmentState(ctx, t.namespace, excludedRoutes(admitted))
 }
 
+// withdrawnAttachmentCandidates identifies provider rules that were in the
+// previously accepted attachment route but are absent from the current model
+// configuration. Their complete overlay candidates are copied onto the route
+// before publishing the reduced tenant overlay, so subsequent reconciles can
+// keep the prior route/filter contract while the new ExtProc revision rolls.
+func (r *Reconciler) withdrawnAttachmentCandidates(ctx context.Context, a attachedModel, t attachmentTenant) ([]envelope.Candidate, error) {
+	existing, err := r.getAttachmentRoute(ctx, a.model.Namespace, a.routeName)
+	if err != nil || existing == nil {
+		return nil, err
+	}
+	if !isAttachmentRoute(existing, a.model, t.gateway) {
+		return nil, fmt.Errorf("HTTPRoute %s/%s exists with a different identity; refusing to stage withdrawal", existing.GetNamespace(), existing.GetName())
+	}
+	if accepted, _, _ := routeAccepted(existing, t.gateway); !accepted {
+		return nil, nil
+	}
+	rules, found, err := unstructured.NestedSlice(existing.Object, "spec", "rules")
+	if err != nil {
+		return nil, fmt.Errorf("read accepted attachment HTTPRoute %s/%s rules: %w", existing.GetNamespace(), existing.GetName(), err)
+	}
+	if !found {
+		return nil, fmt.Errorf("accepted attachment HTTPRoute %s/%s has no rules", existing.GetNamespace(), existing.GetName())
+	}
+	current := map[string]bool{}
+	for _, route := range a.routes {
+		current[envelope.RouteStableID(route)] = true
+	}
+	byID := map[string]envelope.Candidate{}
+	if raw := existing.GetAnnotations()[annotationWithdrawalCandidates]; raw != "" {
+		var retained []envelope.Candidate
+		if err := json.Unmarshal([]byte(raw), &retained); err != nil {
+			return nil, fmt.Errorf("decode retained withdrawal candidates on HTTPRoute %s/%s: %w", existing.GetNamespace(), existing.GetName(), err)
+		}
+		for _, candidate := range retained {
+			byID[candidate.StableID] = candidate
+		}
+	}
+	if published, err := r.readPublishedEnvelope(ctx, t.namespace); err != nil {
+		return nil, err
+	} else if published != nil {
+		for _, candidate := range published.Overlay.Candidates {
+			if candidate.Kind == "inference_model" {
+				byID[candidate.StableID] = candidate
+			}
+		}
+	}
+	seen := map[string]bool{}
+	var withdrawn []envelope.Candidate
+	for _, rawRule := range rules {
+		rule, ok := rawRule.(map[string]any)
+		if !ok {
+			continue
+		}
+		stableID := providerStableIDFromRule(rule)
+		if stableID == "" || current[stableID] || seen[stableID] {
+			continue
+		}
+		refs, _, _ := unstructured.NestedSlice(rule, "backendRefs")
+		if len(refs) == 0 {
+			continue
+		}
+		backend, ok := refs[0].(map[string]any)
+		if !ok {
+			continue
+		}
+		service, _ := backend["name"].(string)
+		if !strings.HasPrefix(service, providerServicePrefix) || strings.HasPrefix(service, providerSelectionSinkPrefix) {
+			continue
+		}
+		candidate, ok := byID[stableID]
+		if !ok || candidate.Cluster != service || candidate.Name != clientModelName(a.model) {
+			return nil, fmt.Errorf("cannot prove prior candidate %q belongs to attachment %s/%s and route Service %q", stableID, a.model.Namespace, a.model.Name, service)
+		}
+		withdrawn = append(withdrawn, cloneCandidate(candidate))
+		seen[stableID] = true
+	}
+	sort.Slice(withdrawn, func(i, j int) bool { return withdrawn[i].StableID < withdrawn[j].StableID })
+	return withdrawn, nil
+}
+
+func (r *Reconciler) routesForAttachmentWithdrawal(ctx context.Context, model *v1alpha1.ExternalModel, t attachmentTenant, candidates []envelope.Candidate) ([]resolver.Route, error) {
+	routes := make([]resolver.Route, 0, len(candidates))
+	for _, candidate := range candidates {
+		providerNamespace, providerName, found, err := r.providerIdentityForService(ctx, model.Namespace, model.Name, candidate.Cluster)
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			// No provider remains to own this stale attachment candidate.
+			continue
+		}
+		route, err := r.routeForWithdrawnCandidate(ctx, model.Namespace, candidate, model.Name, providerNamespace, providerName, nil, t.apiTranslationEnabled)
+		if errors.Is(err, errWithdrawnProviderGone) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		routes = append(routes, route)
+	}
+	return routes, nil
+}
+
+func (r *Reconciler) providerIdentityForService(ctx context.Context, modelNamespace, modelName, serviceName string) (string, string, bool, error) {
+	var providers v1alpha1.ExternalProviderList
+	if err := r.List(ctx, &providers); err != nil {
+		return "", "", false, fmt.Errorf("list ExternalProviders to identify attachment transport %s: %w", serviceName, err)
+	}
+	for i := range providers.Items {
+		provider := &providers.Items[i]
+		route := resolver.Route{Model: modelName, Namespace: modelNamespace, Provider: provider.Name, ProviderNamespace: provider.Namespace}
+		if route.ServiceName() == serviceName {
+			return provider.Namespace, provider.Name, true, nil
+		}
+	}
+	return "", "", false, nil
+}
+
+// ensureAttachmentProviderFinalizers protects provider-owned transport while
+// any attached route can reach it. Some provider namespaces have no tenant
+// reconciliation, so ReconcileProvider otherwise reports validation without
+// claiming a finalizer. Install it before the first attachment route; on a
+// deletion event, an already-terminating provider must already have it or the
+// attachment cannot safely proceed.
+func (r *Reconciler) ensureAttachmentProviderFinalizers(ctx context.Context, routes []resolver.Route) error {
+	seen := map[types.NamespacedName]bool{}
+	for _, route := range routes {
+		namespace := route.ProviderNamespace
+		if namespace == "" {
+			namespace = route.Namespace
+		}
+		key := types.NamespacedName{Namespace: namespace, Name: route.Provider}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		provider := &v1alpha1.ExternalProvider{}
+		if err := r.Get(ctx, key, provider); err != nil {
+			return fmt.Errorf("get attached ExternalProvider %s for cleanup protection: %w", key, err)
+		}
+		if !provider.DeletionTimestamp.IsZero() {
+			if !controllerutil.ContainsFinalizer(provider, externalProviderFinalizer) {
+				return fmt.Errorf("attached ExternalProvider %s is already deleting without the controller cleanup finalizer; refusing to publish or alter its route", key)
+			}
+			continue
+		}
+		if err := r.ensureExternalProviderFinalizer(ctx, provider); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ownServedModels lists the models the tenant serves from its own namespace.
 func (r *Reconciler) ownServedModels(ctx context.Context, t attachmentTenant) ([]*v1alpha1.ExternalModel, error) {
 	var models v1alpha1.ExternalModelList
@@ -833,7 +1079,7 @@ func (r *Reconciler) ownServedModels(ctx context.Context, t attachmentTenant) ([
 	}
 	own := make([]*v1alpha1.ExternalModel, 0, len(models.Items))
 	for i := range models.Items {
-		if tenant.ServedByTenantGateway(&models.Items[i], t.gateway.Name, t.gateway.Namespace) {
+		if models.Items[i].DeletionTimestamp.IsZero() && tenant.ServedByTenantGateway(&models.Items[i], t.gateway.Name, t.gateway.Namespace) {
 			own = append(own, &models.Items[i])
 		}
 	}
@@ -1214,11 +1460,15 @@ func (r *Reconciler) publishTenantOverlay(ctx context.Context, namespace, gatewa
 // is served; without one the caller keeps its existing cleanup.
 func (r *Reconciler) keepTenantAttachments(ctx context.Context, t attachmentTenant, sourceUID string) (bool, error) {
 	attached, err := r.admittedAttachments(ctx, t, 0)
-	if err != nil || len(servedAttachments(attached)) == 0 {
+	if err != nil {
 		return false, err
 	}
-	if err := r.writeExternalModelRoutes(ctx, t.tenantID, t.namespace, t.gateway.Name, t.gateway.Namespace, nil, nil, attached); err != nil {
+	retainingWithdrawal, err := r.writeTenantExternalModelRoutes(ctx, t, nil, nil, attached, nil, nil)
+	if err != nil {
 		return true, err
+	}
+	if len(servedAttachments(attached)) == 0 && !retainingWithdrawal {
+		return false, nil
 	}
 	if err := r.cleanupExternalModelRouteFilters(ctx, t.namespace, t.tenantID, t.gateway.Name, t.gateway.Namespace); err != nil {
 		return true, err
@@ -1240,6 +1490,15 @@ func (r *Reconciler) keepTenantAttachments(ctx context.Context, t attachmentTena
 // a time (the default single worker): the tenant-local path and attachments
 // from every namespace write the same overlay and route filter.
 func (r *Reconciler) publishAttachmentTenant(ctx context.Context, t attachmentTenant, subject *v1alpha1.ExternalModel) ([]attachedModel, error) {
+	return r.publishAttachmentTenantWithRetainedRoutes(ctx, t, subject, nil)
+}
+
+func (r *Reconciler) publishAttachmentTenantWithRetainedRoutes(
+	ctx context.Context,
+	t attachmentTenant,
+	subject *v1alpha1.ExternalModel,
+	retainedRoutes map[types.UID][]resolver.Route,
+) ([]attachedModel, error) {
 	if valid, err := r.livePraxisBeforeWrite(ctx, t.namespace, t.handoff()); err != nil || !valid {
 		return nil, err
 	}
@@ -1251,20 +1510,154 @@ func (r *Reconciler) publishAttachmentTenant(ctx context.Context, t attachmentTe
 	if err != nil {
 		return nil, err
 	}
-	admitted, err := r.admittedAttachments(ctx, t, len(preserved))
+	candidates, err := r.attachmentCandidates(ctx, t)
 	if err != nil {
 		return nil, err
 	}
-	if err := r.writeExternalModelRoutes(ctx, t.tenantID, t.namespace, t.gateway.Name, t.gateway.Namespace, nil, ownPatches, admitted); err != nil {
+	admitted, err := r.admitAttachments(ctx, t, candidates, len(preserved))
+	if err != nil {
 		return nil, err
 	}
-	if len(preserved) == 0 && len(servedAttachments(admitted)) == 0 {
+	retainingWithdrawal, err := r.writeTenantExternalModelRoutes(ctx, t, nil, ownPatches, admitted, retainedRoutes, subject)
+	if err != nil {
+		return nil, err
+	}
+	if len(preserved) == 0 && len(servedAttachments(admitted)) == 0 && !retainingWithdrawal {
 		return admitted, r.cleanupOverlay(ctx, t.namespace)
 	}
 	if _, err := r.publishTenantOverlay(ctx, t.namespace, t.gateway.Name, nil, admitted, preserved, string(subject.UID), t.apiTranslationEnabled); err != nil {
 		return nil, err
 	}
 	return admitted, nil
+}
+
+// writeTenantExternalModelRoutes centralizes writes to the tenant-shared
+// ExternalModel route EnvoyFilter. Every writer must preserve accepted
+// attachment routes whose removed providers are still in their drain window.
+// Those routes are added only to the filter input; the caller's `attached`
+// slice remains the source for overlay publication and never regains withdrawn
+// candidates.
+func (r *Reconciler) writeTenantExternalModelRoutes(
+	ctx context.Context,
+	t attachmentTenant,
+	routes []resolver.Route,
+	preserved []any,
+	attached []attachedModel,
+	retainedRoutes map[types.UID][]resolver.Route,
+	subject *v1alpha1.ExternalModel,
+) (bool, error) {
+	candidates, err := r.attachmentCandidates(ctx, t)
+	if err != nil {
+		return false, err
+	}
+	patchAttachments := slices.Clone(attached)
+	patchIndex := make(map[types.UID]int, len(patchAttachments))
+	for i := range patchAttachments {
+		patchIndex[patchAttachments[i].model.UID] = i
+	}
+	retainingWithdrawal := false
+	for _, retained := range retainedRoutes {
+		retainingWithdrawal = retainingWithdrawal || len(retained) > 0
+	}
+	for _, candidate := range candidates {
+		withdrawnCandidates, err := r.withdrawnAttachmentCandidates(ctx, candidate, t)
+		if err != nil {
+			return false, err
+		}
+		if len(withdrawnCandidates) == 0 {
+			continue
+		}
+		if err := r.persistAttachmentWithdrawal(ctx, candidate, t, withdrawnCandidates); err != nil {
+			return false, err
+		}
+		retainingWithdrawal = true
+		withdrawn, err := r.routesForAttachmentWithdrawal(ctx, candidate.model, t, withdrawnCandidates)
+		if err != nil {
+			return false, err
+		}
+		if i, found := patchIndex[candidate.model.UID]; found {
+			patchAttachments[i].routes = mergeAttachmentRoutes(patchAttachments[i].routes, withdrawn)
+			// Route-patch retention is independent of current overlay admission:
+			// an old serving revision may still select a withdrawn candidate.
+			patchAttachments[i].ready = true
+			patchAttachments[i].reason = ""
+			continue
+		}
+		// A currently excluded attachment can still have an accepted route
+		// selected by the prior runtime. Keep its complete old route contract
+		// in the filter until the same serving-revision drain completes.
+		candidate.routes = mergeAttachmentRoutes(candidate.routes, withdrawn)
+		candidate.ready, candidate.reason = true, ""
+		patchIndex[candidate.model.UID] = len(patchAttachments)
+		patchAttachments = append(patchAttachments, candidate)
+	}
+	for uid, retained := range retainedRoutes {
+		if len(retained) == 0 {
+			continue
+		}
+		if i, found := patchIndex[uid]; found {
+			patchAttachments[i].routes = mergeAttachmentRoutes(patchAttachments[i].routes, retained)
+			continue
+		}
+		if subject == nil || subject.UID != uid {
+			return false, fmt.Errorf("cannot identify ExternalModel UID %q for retained attachment routes", uid)
+		}
+		patchIndex[uid] = len(patchAttachments)
+		patchAttachments = append(patchAttachments, attachedModel{
+			model: subject, routeName: attachmentRouteName(subject, t.gateway), routes: mergeAttachmentRoutes(retained), ready: true,
+		})
+	}
+	err = r.writeExternalModelRoutes(ctx, t.tenantID, t.namespace, t.gateway.Name, t.gateway.Namespace, routes, preserved, patchAttachments)
+	return retainingWithdrawal, err
+}
+
+func mergeAttachmentRoutes(groups ...[]resolver.Route) []resolver.Route {
+	var merged []resolver.Route
+	seen := map[string]bool{}
+	for _, routes := range groups {
+		for _, route := range routes {
+			stableID := envelope.RouteStableID(route)
+			if seen[stableID] {
+				continue
+			}
+			seen[stableID] = true
+			merged = append(merged, route)
+		}
+	}
+	return merged
+}
+
+func (r *Reconciler) attachmentWithdrawalRemaining(ctx context.Context, t attachmentTenant) (time.Duration, error) {
+	var models v1alpha1.ExternalModelList
+	if err := r.List(ctx, &models, client.InNamespace(t.namespace)); err != nil {
+		return 0, fmt.Errorf("list home ExternalModels while draining attachment withdrawal: %w", err)
+	}
+	home := make([]*v1alpha1.ExternalModel, 0, len(models.Items))
+	for i := range models.Items {
+		model := &models.Items[i]
+		if model.DeletionTimestamp.IsZero() && tenant.ServedByTenantGateway(model, t.gateway.Name, t.gateway.Namespace) {
+			home = append(home, model)
+		}
+	}
+	env, err := r.readPublishedEnvelope(ctx, t.namespace)
+	if err != nil {
+		return 0, err
+	}
+	if env == nil || env.Revision.Value == "" {
+		return withdrawalRequeueInterval, nil
+	}
+	configHash, err := runtimeConfigHash(ctx, r, home, t.namespace, t.apiTranslationEnabled)
+	if err != nil {
+		return 0, err
+	}
+	safe, err := r.externalModelRolloutSafe(ctx, t.namespace, t.tenantID, configHash)
+	if errors.Is(err, errServingRevisionUnknown) {
+		return withdrawalRequeueInterval, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return r.withdrawalDrainRemaining(ctx, t.namespace, env.Revision.Value, safe, time.Now())
 }
 
 // ownOverlayCandidates returns the tenant's own published candidates: those
@@ -1278,6 +1671,9 @@ func (r *Reconciler) ownOverlayCandidates(ctx context.Context, namespace string)
 	}
 	ownScoped := map[string]bool{}
 	for i := range models.Items {
+		if !models.Items[i].DeletionTimestamp.IsZero() {
+			continue
+		}
 		for _, ref := range models.Items[i].Spec.ExternalProviderRefs {
 			if ref.Ref.Namespace != "" && ref.Ref.Namespace != namespace {
 				ownScoped[envelope.ScopedStableID(namespace, models.Items[i].Name, ref.Ref.Namespace, ref.Ref.Name)] = true
@@ -1343,7 +1739,7 @@ func (r *Reconciler) ownRoutePatches(ctx context.Context, t attachmentTenant) ([
 // selection sink are shared with the model's other attachments. The route
 // goes first, so the provider reconciler's IPP cleanup, which keeps the
 // transport of the routes it reads live, never sees a Service without it.
-func (r *Reconciler) applyAttachmentRoute(ctx context.Context, a attachedModel, t attachmentTenant, providerOwners map[string]*v1alpha1.ExternalProvider) error {
+func (r *Reconciler) applyAttachmentRoute(ctx context.Context, a attachedModel, t attachmentTenant, providerOwners map[string]*v1alpha1.ExternalProvider, retained []envelope.Candidate) error {
 	m := a.model
 	route := modelHTTPRouteSet(a.routes, m.Namespace, t.gateway.Name, t.gateway.Namespace)
 	providers := make([]string, 0, len(a.routes))
@@ -1371,14 +1767,148 @@ func (r *Reconciler) applyAttachmentRoute(ctx context.Context, a attachedModel, 
 	// keeps those an accepted route still names.
 	annotations := routeStateAnnotations(t.gateway, a)
 	annotations[annotationAttachmentModel], annotations[annotationAttachmentGateway] = m.Name, gatewayKey(t.gateway)
-	route.SetAnnotations(annotations)
-	setOwnerReference(&route, m)
-	if existing, err := r.getAttachmentRoute(ctx, m.Namespace, a.routeName); err != nil {
+	existing, err := r.getAttachmentRoute(ctx, m.Namespace, a.routeName)
+	if err != nil {
 		return err
-	} else if existing != nil && !isAttachmentRoute(existing, m, t.gateway) {
+	}
+	if existing != nil && !isAttachmentRoute(existing, m, t.gateway) {
 		return fmt.Errorf("HTTPRoute %s/%s exists with a different identity; refusing to adopt it", m.Namespace, a.routeName)
 	}
+	if len(retained) > 0 {
+		if existing == nil {
+			return errors.New("cannot stage attached provider withdrawal without the previously accepted HTTPRoute")
+		}
+		if accepted, _, _ := routeAccepted(existing, t.gateway); !accepted {
+			return errors.New("cannot stage attached provider withdrawal from an HTTPRoute that is not accepted")
+		}
+		if err := retainAttachmentRules(&route, existing, retained); err != nil {
+			return err
+		}
+		var prior []envelope.Candidate
+		if raw := existing.GetAnnotations()[annotationWithdrawalCandidates]; raw != "" {
+			if err := json.Unmarshal([]byte(raw), &prior); err != nil {
+				return fmt.Errorf("decode retained withdrawal candidates on HTTPRoute %s/%s: %w", m.Namespace, a.routeName, err)
+			}
+		}
+		byID := make(map[string]envelope.Candidate, len(prior)+len(retained))
+		for _, candidate := range prior {
+			byID[candidate.StableID] = candidate
+		}
+		for _, candidate := range retained {
+			byID[candidate.StableID] = cloneCandidate(candidate)
+		}
+		all := make([]envelope.Candidate, 0, len(byID))
+		for _, candidate := range byID {
+			all = append(all, candidate)
+		}
+		sort.Slice(all, func(i, j int) bool { return all[i].StableID < all[j].StableID })
+		encoded, err := json.Marshal(all)
+		if err != nil {
+			return fmt.Errorf("encode retained attachment withdrawal candidates: %w", err)
+		}
+		annotations[annotationWithdrawalCandidates] = string(encoded)
+		for _, key := range []string{annotationAttachmentRules, annotationAttachmentCredentials} {
+			annotations[key] = joinUniqueCSV(existing.GetAnnotations()[key], annotations[key])
+		}
+	}
+	route.SetAnnotations(annotations)
+	setOwnerReference(&route, m)
 	return r.applyResources(ctx, append([]unstructured.Unstructured{route}, append(resources, sink)...))
+}
+
+// retainAttachmentRules preserves the old provider rules for withdrawn
+// candidates ahead of the fail-closed sink rules. Copying the original rule
+// maps also retains exact path matching, URL rewriting, and header cleanup.
+func retainAttachmentRules(desired, existing *unstructured.Unstructured, candidates []envelope.Candidate) error {
+	ids := make(map[string]bool, len(candidates))
+	for _, candidate := range candidates {
+		ids[candidate.StableID] = true
+	}
+	oldRules, found, err := unstructured.NestedSlice(existing.Object, "spec", "rules")
+	if err != nil {
+		return fmt.Errorf("read prior attachment rules: %w", err)
+	}
+	if !found {
+		return errors.New("prior accepted attachment HTTPRoute has no rules")
+	}
+	desiredRules, desiredFound, err := unstructured.NestedSlice(desired.Object, "spec", "rules")
+	if err != nil {
+		return fmt.Errorf("read desired attachment rules: %w", err)
+	}
+	if !desiredFound {
+		return errors.New("desired attachment HTTPRoute has no rules")
+	}
+	desiredIDs := map[string]bool{}
+	for _, raw := range desiredRules {
+		if rule, ok := raw.(map[string]any); ok {
+			if id := providerStableIDFromRule(rule); id != "" {
+				desiredIDs[id] = true
+			}
+		}
+	}
+	var keep []any
+	seen := map[string]bool{}
+	for _, raw := range oldRules {
+		rule, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		id := providerStableIDFromRule(rule)
+		if ids[id] && !desiredIDs[id] {
+			keep = append(keep, rule)
+			seen[id] = true
+		}
+	}
+	for id := range ids {
+		if !seen[id] && !desiredIDs[id] {
+			return fmt.Errorf("prior accepted attachment HTTPRoute has no provider rule for retained candidate %q", id)
+		}
+	}
+	current := desiredRules
+	insert := len(current)
+	for i, raw := range current {
+		rule, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		refs, _, _ := unstructured.NestedSlice(rule, "backendRefs")
+		if len(refs) == 0 {
+			continue
+		}
+		backend, ok := refs[0].(map[string]any)
+		if !ok {
+			continue
+		}
+		service, _ := backend["name"].(string)
+		if strings.HasPrefix(service, providerSelectionSinkPrefix) {
+			insert = i
+			break
+		}
+	}
+	merged := make([]any, 0, len(current)+len(keep))
+	merged = append(merged, current[:insert]...)
+	merged = append(merged, keep...)
+	merged = append(merged, current[insert:]...)
+	if err := unstructured.SetNestedSlice(desired.Object, merged, "spec", "rules"); err != nil {
+		return fmt.Errorf("write staged attachment rules: %w", err)
+	}
+	return nil
+}
+
+func joinUniqueCSV(values ...string) string {
+	seen := map[string]bool{}
+	var joined []string
+	for _, value := range values {
+		for _, item := range strings.Split(value, ",") {
+			item = strings.TrimSpace(item)
+			if item != "" && !seen[item] {
+				seen[item] = true
+				joined = append(joined, item)
+			}
+		}
+	}
+	sort.Strings(joined)
+	return strings.Join(joined, ",")
 }
 
 func (r *Reconciler) applyResources(ctx context.Context, resources []unstructured.Unstructured) error {
@@ -1868,4 +2398,32 @@ func (r *Reconciler) attachedModelSinks(ctx context.Context, namespace string) (
 		models[routes[i].GetAnnotations()[annotationAttachmentModel]] = true
 	}
 	return models, nil
+}
+
+// persistAttachmentWithdrawal makes the prior serving contract durable before
+// any tenant writer can remove its candidates from the published overlay.
+func (r *Reconciler) persistAttachmentWithdrawal(ctx context.Context, a attachedModel, t attachmentTenant, candidates []envelope.Candidate) error {
+	route := &unstructured.Unstructured{}
+	route.SetGroupVersionKind(httpRouteGVK)
+	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: a.model.Namespace, Name: a.routeName}, route); err != nil {
+		return err
+	}
+	if !isAttachmentRoute(route, a.model, t.gateway) {
+		return fmt.Errorf("refusing to persist withdrawal on foreign attachment route %s/%s", route.GetNamespace(), route.GetName())
+	}
+	encoded, err := json.Marshal(candidates)
+	if err != nil {
+		return err
+	}
+	if route.GetAnnotations()[annotationWithdrawalCandidates] == string(encoded) {
+		return nil
+	}
+	base := route.DeepCopy()
+	annotations := route.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	annotations[annotationWithdrawalCandidates] = string(encoded)
+	route.SetAnnotations(annotations)
+	return r.Patch(ctx, route, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
 }

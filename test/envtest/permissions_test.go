@@ -28,6 +28,23 @@ const (
 // reconciler exercises them.
 func testShippedPermissions(t *testing.T, c client.Client) {
 	t.Helper()
+	for _, resource := range []struct{ group, name string }{
+		{group: "apps", name: "replicasets"},
+		{group: "", name: "pods"},
+		{group: "discovery.k8s.io", name: "endpointslices"},
+	} {
+		for _, verb := range []string{"get", "list"} {
+			assertAccess(t, c, true, authv1.ResourceAttributes{
+				Namespace: tenantNamespace, Group: resource.group, Resource: resource.name, Verb: verb,
+			})
+		}
+		assertAccess(t, c, false, authv1.ResourceAttributes{
+			Namespace: tenantNamespace, Group: resource.group, Resource: resource.name, Verb: "watch",
+		})
+	}
+	assertAccess(t, c, true, authv1.ResourceAttributes{
+		Namespace: tenantNamespace, Resource: "pods/log", Verb: "get",
+	})
 	// Controller-owned credential copies are applied and deleted in tenant namespaces.
 	for _, verb := range []string{"create", "patch", "delete"} {
 		assertAccess(t, c, true, authv1.ResourceAttributes{
