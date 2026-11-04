@@ -58,9 +58,11 @@ func TestConfigureExternalModelExtProcProjectsReferencesAndTrustedHandoff(t *tes
 		"filter: intelligent_route",
 		"filter: credential_inject",
 		"provider_hop_clusters: [\"provider-provider-a\", \"provider-provider-b\"]",
-		"  max_body_bytes: 10485760\n",
+		"  max_body_bytes: 10551296\n",
 		"filter: stream_usage_inject\n        max_body_bytes: 10485760\n",
-		"api_translation_enabled: true\n        max_body_bytes: 10485760\n",
+		"api_translation_enabled: true",
+		"max_request_body_bytes: 10485760",
+		"max_response_body_bytes: 1048576",
 		"strategy: bearer_token",
 		"a-secret",
 		"b-secret",
@@ -579,12 +581,16 @@ func TestTranslationSettingsToggleWithoutStaleRenderedState(t *testing.T) {
 			t.Fatalf("ExternalModel translation filters stale for enabled=%t:\n%s", enabled, externalConfig)
 		}
 		if !strings.Contains(externalConfig, "filter: stream_usage_inject") {
-			t.Fatalf("ExternalModel chain lost stream_usage_inject for enabled=%t:\n%s", enabled, externalConfig)
+			t.Fatalf("ExternalModel chain lost stream_usage_inject")
 		}
-		if enabled && (!strings.Contains(externalConfig, "\n  max_body_bytes: 10485760\n") || strings.Contains(externalConfig, "allow_unbounded_body: true")) {
+		if enabled && (!strings.Contains(externalConfig, "max_request_body_bytes: 10485760") ||
+			!strings.Contains(externalConfig, "max_response_body_bytes: 1048576") ||
+			strings.Contains(externalConfig, "allow_unbounded_body: true")) {
 			t.Fatalf("translation-on body limits are not rendered for enabled=true:\n%s", externalConfig)
 		}
-		if !enabled && (strings.Contains(externalConfig, "\n  max_body_bytes:") || !strings.Contains(externalConfig, "allow_unbounded_body: true")) {
+		if !enabled && (strings.Contains(externalConfig, "\n  max_body_bytes:") || strings.Contains(externalConfig, "max_request_body_bytes") ||
+			strings.Contains(externalConfig, "max_response_body_bytes") ||
+			!strings.Contains(externalConfig, "allow_unbounded_body: true")) {
 			t.Fatalf("translation-off body limits are stale for enabled=false:\n%s", externalConfig)
 		}
 	}

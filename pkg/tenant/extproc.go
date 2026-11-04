@@ -24,6 +24,11 @@ import (
 )
 
 const extprocCredentialDir = "/etc/praxis/credentials" //nolint:gosec // fixed non-secret mount path
+const anthropicTranslationRequestMaxBytes = extprocMaxBodyBytes
+
+// Preserve the existing input allowance while bounding model-rewrite overhead separately.
+const anthropicTranslationAccumulationMaxBytes = extprocMaxBodyBytes + (64 << 10)
+const anthropicTranslationResponseMaxBytes = 1 << 20
 
 type extprocCredential struct {
 	name      string
@@ -468,7 +473,7 @@ func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extpro
 	// translation disabled, omit the translation and provider-profile filters
 	// and retain main's unbounded-body setting.
 	if apiTranslationEnabled {
-		fmt.Fprintf(&b, "  max_body_bytes: %d\n", extprocMaxBodyBytes)
+		fmt.Fprintf(&b, "  max_body_bytes: %d\n", anthropicTranslationAccumulationMaxBytes)
 	}
 	b.WriteString("  tls:\n    mode: self_signed\n\n")
 	// headers must stay first: it strips caller credentials and internal MaaS
@@ -497,7 +502,8 @@ func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extpro
 		b.WriteString("        max_partial_event_bytes: 1048576\n        max_tool_blocks: 256\n")
 		b.WriteString("      - filter: openai_chat_completions_to_anthropic\n")
 		b.WriteString("        api_translation_enabled: true\n")
-		fmt.Fprintf(&b, "        max_body_bytes: %d\n", extprocMaxBodyBytes)
+		fmt.Fprintf(&b, "        max_request_body_bytes: %d\n", anthropicTranslationRequestMaxBytes)
+		fmt.Fprintf(&b, "        max_response_body_bytes: %d\n", anthropicTranslationResponseMaxBytes)
 	}
 	if len(credentials) > 0 {
 		b.WriteString("      - filter: credential_inject\n        credentials:\n")

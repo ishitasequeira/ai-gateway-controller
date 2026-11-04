@@ -1439,12 +1439,10 @@ def main():
     source_head = run(["git", "-C", PRAXIS_EXTPROC_REPO, "rev-parse", "HEAD"]).stdout.strip()
     source_branch = run(["git", "-C", PRAXIS_EXTPROC_REPO, "branch", "--show-current"]).stdout.strip()
     source_status = run(["git", "-C", PRAXIS_EXTPROC_REPO, "status", "--porcelain"]).stdout.strip()
-    if source_branch != "main":
-        raise RuntimeError(f"ExtProc source checkout must be on main, got {source_branch!r}")
     if source_status:
-        raise RuntimeError("ExtProc main checkout must be clean")
+        raise RuntimeError(f"ExtProc source checkout must be clean, got dirty worktree on {source_branch!r}")
     if EXPECTED_EXTPROC_MAIN_SHA and source_head != EXPECTED_EXTPROC_MAIN_SHA:
-        raise RuntimeError(f"ExtProc main SHA mismatch: expected={EXPECTED_EXTPROC_MAIN_SHA}, got={source_head}")
+        raise RuntimeError(f"ExtProc source SHA mismatch: expected={EXPECTED_EXTPROC_MAIN_SHA}, got={source_head}")
     node = f"{CLUSTER}-control-plane"
     node_images = run(["docker", "exec", node, "crictl", "images", "-o", "json"])
     expected_node_tag = f"docker.io/library/{EXTPROC_IMAGE}"

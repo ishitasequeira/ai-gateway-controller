@@ -9,7 +9,7 @@ spec:
     odh-ai-gateway-controller-ci image.
 
     Uses odh-praxis-extproc-ci from the group snapshot when present; otherwise
-    quay.io/opendatahub/odh-praxis-extproc:odh-stable (includes llmisvc_model_provider_resolver
+    the pinned released ExtProc image (includes llmisvc_model_provider_resolver
     since opendatahub-io/praxis-extproc#79 / commit 9872fc9).
   params:
     - description: List of components in the group
@@ -293,12 +293,12 @@ spec:
               echo "AI_GATEWAY_CONTROLLER_IMAGE (snapshot digest, unused): ${AIGC_DIGEST_REF}"
               echo "AI_GATEWAY_CONTROLLER_IMAGE (snapshot tag): ${AIGC_REPO}:${AIGC_TAG}"
 
-              PRAXIS_EXTPROC_STABLE_IMAGE="quay.io/opendatahub/odh-praxis-extproc:odh-stable"
+              PRAXIS_EXTPROC_DEFAULT_IMAGE="quay.io/opendatahub/odh-praxis-extproc@sha256:a67be44e530961ca7e6dc453220ebe11a6641a2003577f3c4ddb1f426555b874"
               PRAXIS_FROM_SNAPSHOT=$(jq -r '."odh-praxis-extproc-ci".image // empty' <<< "${SNAPSHOT}")
               if [ -n "${PRAXIS_FROM_SNAPSHOT}" ] && [ "${PRAXIS_FROM_SNAPSHOT}" != "null" ]; then
                 export PRAXIS_EXTPROC_IMAGE="${PRAXIS_FROM_SNAPSHOT}"
               else
-                export PRAXIS_EXTPROC_IMAGE="${PRAXIS_EXTPROC_IMAGE:-${PRAXIS_EXTPROC_STABLE_IMAGE}}"
+                export PRAXIS_EXTPROC_IMAGE="${PRAXIS_EXTPROC_IMAGE:-${PRAXIS_EXTPROC_DEFAULT_IMAGE}}"
                 echo "NOTE: odh-praxis-extproc-ci not in SNAPSHOT; using PRAXIS_EXTPROC_IMAGE=${PRAXIS_EXTPROC_IMAGE}"
               fi
 

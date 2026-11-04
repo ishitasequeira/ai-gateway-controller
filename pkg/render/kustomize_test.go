@@ -17,6 +17,7 @@ limitations under the License.
 package render
 
 import (
+	"os"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -96,6 +97,44 @@ func TestRenderKustomizeBuildsVendoredOverlay(t *testing.T) {
 	}
 }
 
+func TestRenderedExternalModelGatewayHasTenMiBRequestHeadroom(t *testing.T) {
+	const manifestPath = "../../config/manifests/external-model/overlays/odh"
+	requireVendoredManifests(t, manifestPath)
+	resources, err := Build(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := 0
+	for _, resource := range resources {
+		if resource.GetKind() != "EnvoyFilter" || resource.GetName() != "payload-processing-external-model-filters" {
+			continue
+		}
+		patches, _, err := unstructured.NestedSlice(resource.Object, "spec", "configPatches")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, raw := range patches {
+			patch, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if patch["applyTo"] != "LISTENER" {
+				continue
+			}
+			found++
+			context, _, _ := unstructured.NestedString(patch, "match", "context")
+			operation, _, _ := unstructured.NestedString(patch, "patch", "operation")
+			limit, _, _ := unstructured.NestedInt64(patch, "patch", "value", "per_connection_buffer_limit_bytes")
+			if context != "GATEWAY" || operation != "MERGE" || limit != 10*1024*1024+64*1024 {
+				t.Fatalf("listener patch = %s/%s/%d, want GATEWAY/MERGE/10551296", context, operation, limit)
+			}
+		}
+	}
+	if found != 1 {
+		t.Fatalf("listener buffer patches = %d, want exactly one", found)
+	}
+}
+
 func assertRenderedExtProcResource(t *testing.T, resource map[string]any) string {
 	t.Helper()
 	name, ok := resource["name"].(string)
@@ -145,9 +184,10 @@ func assertRenderedExtProcResource(t *testing.T, resource map[string]any) string
 func TestRenderedExtProcPreservesBufferedMaaSAndAddsHeaderPhaseExternalModel(t *testing.T) {
 	const manifestPath = "../../config/manifests/external-model/overlays/odh"
 
+	requireVendoredManifests(t, manifestPath)
 	resources, err := Build(manifestPath)
 	if err != nil {
-		t.Skipf("vendored manifests not present at %s: %v", manifestPath, err)
+		t.Fatalf("build vendored manifests at %s: %v", manifestPath, err)
 	}
 
 	var patches []any
@@ -270,4 +310,13 @@ func assertRenderedIPPPreResponseNone(t *testing.T, patches []any) int {
 		count++
 	}
 	return count
+}
+
+func requireVendoredManifests(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		t.Skipf("vendored manifests not present at %s", path)
+	} else if err != nil {
+		t.Fatalf("inspect vendored manifests: %v", err)
+	}
 }

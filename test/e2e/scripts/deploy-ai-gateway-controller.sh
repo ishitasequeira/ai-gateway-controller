@@ -59,10 +59,10 @@ _derive_praxis_image_from_controller() {
   fi
 }
 # Prow/Tekton may set PRAXIS_EXTPROC_IMAGE via maas-image-defaults.sh or Konflux snapshot.
-# When unset, fall back to params.env, controller tag alignment, then odh-stable.
+# When unset, fall back to params.env, controller tag alignment, then the pinned release image.
 PRAXIS_EXTPROC_IMAGE="${PRAXIS_EXTPROC_IMAGE:-$(_default_praxis_image)}"
 PRAXIS_EXTPROC_IMAGE="${PRAXIS_EXTPROC_IMAGE:-$(_derive_praxis_image_from_controller)}"
-PRAXIS_EXTPROC_IMAGE="${PRAXIS_EXTPROC_IMAGE:-quay.io/opendatahub/odh-praxis-extproc:odh-stable}"
+PRAXIS_EXTPROC_IMAGE="${PRAXIS_EXTPROC_IMAGE:-quay.io/opendatahub/odh-praxis-extproc@sha256:a67be44e530961ca7e6dc453220ebe11a6641a2003577f3c4ddb1f426555b874}"
 
 if [[ -z "${AI_GATEWAY_CONTROLLER_IMAGE}" ]]; then
   echo "ERROR: AI_GATEWAY_CONTROLLER_IMAGE is required" >&2
