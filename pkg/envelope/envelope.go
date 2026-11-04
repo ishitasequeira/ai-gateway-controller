@@ -95,11 +95,17 @@ type Candidate struct {
 	Fresh    bool   `json:"fresh"`
 	// SelectionGroup is scoped by (kind, name). A pointer is required so
 	// group zero is emitted instead of being omitted by encoding/json.
-	SelectionGroup *uint32     `json:"selection_group,omitempty"`
-	Credential     *Credential `json:"credential,omitempty"`
-	APIFormat      string      `json:"api_format,omitempty"`
-	Path           string      `json:"path,omitempty"`
-	TargetModel    string      `json:"target_model,omitempty"`
+	SelectionGroup *uint32 `json:"selection_group,omitempty"`
+	// TrafficWeight is the Praxis weightedRandom candidate weight (1–1000).
+	// CRD ExternalProviderRef.weight is 0–100; AGC pass-throughs positive
+	// values. Omitted unless selection_policy.mode is weightedRandom — Praxis
+	// rejects traffic_weight with any other mode, and requires it on every
+	// candidate when mode is weightedRandom.
+	TrafficWeight *uint32     `json:"traffic_weight,omitempty"`
+	Credential    *Credential `json:"credential,omitempty"`
+	APIFormat     string      `json:"api_format,omitempty"`
+	Path          string      `json:"path,omitempty"`
+	TargetModel   string      `json:"target_model,omitempty"`
 }
 
 // Provenance records who rendered this envelope and from what source state.
@@ -143,7 +149,6 @@ type Overlay struct {
 // Frozen error surface (port plan §6): each maps to a Ready=False condition
 // with a stable reason, and is what E2E failure-injection asserts against.
 var (
-	ErrWeightUnsupported     = errors.New("envelope: non-uniform (proportional) weights are not supported in 3.6; use uniform weights or a single provider (proportional canaries: known 3.6 limitation, see ADR 0001 D5)")
 	ErrDuplicateProvider     = errors.New("envelope: a client model cannot bind the same provider more than once")
 	ErrUnknownCluster        = errors.New("envelope: candidate references cluster absent from load_balancer config")
 	ErrScopeMismatch         = errors.New("envelope: scope fields must be non-empty")
@@ -176,10 +181,12 @@ type Options struct {
 // Render validates the resolved route set and emits the envelope with its
 // revision. Distinct providers with equal positive weights sharing a
 // client-visible model name are assigned selection group zero and use
-// Praxis' global random policy. Singleton model capabilities remain ungrouped
-// and deterministic.
-// Unequal weights and repeated providers are rejected because this controller
-// does not implement proportional routing or deduplication of bindings.
+// Praxis' global random policy. Unequal positive weights use weightedRandom
+// with per-candidate traffic_weight (CRD weight pass-through). Singleton
+// model capabilities remain ungrouped and deterministic unless the overlay
+// must use weightedRandom (Praxis requires traffic_weight and selection_group
+// on every candidate in that mode). Repeated providers for one client model
+// are rejected.
 //
 // Revision rule: digest equal to prev → prev returned unchanged (no bump);
 // digest changed → Generation = prev.Generation + 1.
@@ -197,9 +204,12 @@ func Render(routes *resolver.ResolvedRouteSet, scope Scope, prev Revision, opts 
 	if err != nil {
 		return Envelope{}, err
 	}
-	// Preserved candidates keep their selection groups, and so the policy
-	// those groups need.
-	if selection.policy == nil && slices.ContainsFunc(opts.PreservedCandidates, func(c Candidate) bool { return c.SelectionGroup != nil }) {
+	preservedNeedsWeighted := slices.ContainsFunc(opts.PreservedCandidates, func(c Candidate) bool { return c.TrafficWeight != nil })
+	preservedNeedsRandom := slices.ContainsFunc(opts.PreservedCandidates, func(c Candidate) bool { return c.SelectionGroup != nil })
+	if selection.weighted || preservedNeedsWeighted {
+		selection.policy = weightedRandomSelectionPolicy
+		selection.weighted = true
+	} else if selection.policy == nil && preservedNeedsRandom {
 		selection.policy = randomSelectionPolicy
 	}
 
@@ -231,9 +241,14 @@ func Render(routes *resolver.ResolvedRouteSet, scope Scope, prev Revision, opts 
 				cand.Path = r.Path
 				cand.TargetModel = r.TargetModel
 			}
-			if group, ok := selection.groups[selectionRouteKey{modelRef: m.ModelRef, model: r.Model, provider: r.Provider, cluster: r.Cluster}]; ok {
+			key := selectionRouteKey{modelRef: m.ModelRef, model: r.Model, provider: r.Provider, cluster: r.Cluster}
+			if group, ok := selection.groups[key]; ok {
 				group := group
 				cand.SelectionGroup = &group
+			}
+			if weight, ok := selection.weights[key]; ok {
+				weight := weight
+				cand.TrafficWeight = &weight
 			}
 			// ValidateModel has already qualified the strategy.
 			if strategy, header, _ := StrategyFor(r); strategy != "" {
@@ -249,6 +264,11 @@ func Render(routes *resolver.ResolvedRouteSet, scope Scope, prev Revision, opts 
 			}
 			candidates = append(candidates, cand)
 		}
+	}
+	if selection.weighted {
+		// Praxis weightedRandom requires selection_group and traffic_weight on
+		// every candidate, including preserved foreign entries and singletons.
+		normalizeWeightedCandidates(candidates)
 	}
 	if !opts.IncludeProviderProfiles {
 		// Preserved candidates may have been published while translation was
@@ -311,26 +331,31 @@ type selectionRouteKey struct {
 }
 
 type selectionCapability struct {
-	count      int
-	firstRoute resolver.Route
+	count       int
+	firstWeight int
+	unequal     bool
 }
 
 type selectionMetadata struct {
-	policy json.RawMessage
-	groups map[selectionRouteKey]uint32
+	policy   json.RawMessage
+	weighted bool
+	groups   map[selectionRouteKey]uint32
+	weights  map[selectionRouteKey]uint32
 }
 
 // deriveSelectionMetadata is the single policy derivation used by both
 // normal publication and deletion-time republishing (both pass through
 // Render). Praxis scopes groups by (kind, name), so provider candidates for
 // distinct client-visible names never share a group.
+//
+// Equal multi-provider capabilities keep mode random (no traffic_weight).
+// Any unequal positive weights force weightedRandom for the whole overlay:
+// Praxis allows only one selection_policy.mode and requires traffic_weight
+// plus selection_group on every candidate in that mode.
 func deriveSelectionMetadata(routes *resolver.ResolvedRouteSet) (selectionMetadata, error) {
 	capabilities := map[string]*selectionCapability{}
 	providerBindings := map[string]bool{}
 	for _, model := range routes.Models {
-		if err := checkUniformWeights(model); err != nil {
-			return selectionMetadata{}, err
-		}
 		for _, route := range model.Routes {
 			key := "inference_model\x00" + route.ClientName
 			binding := key + "\x00" + route.ProviderNamespace + "/" + route.Provider
@@ -340,37 +365,88 @@ func deriveSelectionMetadata(routes *resolver.ResolvedRouteSet) (selectionMetada
 			providerBindings[binding] = true
 			capability := capabilities[key]
 			if capability == nil {
-				capability = &selectionCapability{firstRoute: route}
+				capability = &selectionCapability{firstWeight: route.Weight}
 				capabilities[key] = capability
-			} else if route.Weight != capability.firstRoute.Weight {
-				return selectionMetadata{}, fmt.Errorf("%w: client model %s has weights %d and %d across providers",
-					ErrWeightUnsupported, route.ClientName, capability.firstRoute.Weight, route.Weight)
+			} else if route.Weight != capability.firstWeight {
+				capability.unequal = true
 			}
 			capability.count++
 		}
 	}
-	metadata := selectionMetadata{groups: make(map[selectionRouteKey]uint32)}
-	for _, model := range routes.Models {
-		for _, route := range model.Routes {
-			capability := capabilities["inference_model\x00"+route.ClientName]
-			if capability.count > 1 {
-				metadata.groups[selectionRouteKey{modelRef: model.ModelRef, model: route.Model, provider: route.Provider, cluster: route.Cluster}] = 0
-			}
+	needsWeighted := false
+	needsRandom := false
+	for _, capability := range capabilities {
+		if capability.count <= 1 {
+			continue
+		}
+		if capability.unequal {
+			needsWeighted = true
+		} else {
+			needsRandom = true
 		}
 	}
-	for _, capability := range capabilities {
-		if capability.count > 1 {
-			metadata.policy = randomSelectionPolicy
-			break
+	metadata := selectionMetadata{
+		groups:  make(map[selectionRouteKey]uint32),
+		weights: make(map[selectionRouteKey]uint32),
+	}
+	if needsWeighted {
+		metadata.policy = weightedRandomSelectionPolicy
+		metadata.weighted = true
+		for _, model := range routes.Models {
+			for _, route := range model.Routes {
+				key := selectionRouteKey{modelRef: model.ModelRef, model: route.Model, provider: route.Provider, cluster: route.Cluster}
+				metadata.groups[key] = 0
+				metadata.weights[key] = trafficWeightFor(route.Weight)
+			}
+		}
+		return metadata, nil
+	}
+	if needsRandom {
+		metadata.policy = randomSelectionPolicy
+		for _, model := range routes.Models {
+			for _, route := range model.Routes {
+				if capabilities["inference_model\x00"+route.ClientName].count > 1 {
+					metadata.groups[selectionRouteKey{modelRef: model.ModelRef, model: route.Model, provider: route.Provider, cluster: route.Cluster}] = 0
+				}
+			}
 		}
 	}
 	return metadata, nil
 }
 
-// ValidateSelectionMetadata rejects unequal positive weights for routes that
-// resolve to the same client-visible model. Render uses the same derivation to
-// generate the wire metadata; the controller calls this before applying
-// transport resources so invalid weights do not change serving state.
+// trafficWeightFor maps a positive CRD/resolver weight onto Praxis
+// traffic_weight. CRD max is 100; Praxis accepts 1–1000. Non-positive values
+// should already be filtered by the resolver; clamp defensively.
+func trafficWeightFor(weight int) uint32 {
+	if weight < 1 {
+		return 1
+	}
+	if weight > 1000 {
+		return 1000
+	}
+	return uint32(weight)
+}
+
+// normalizeWeightedCandidates stamps the Praxis weightedRandom contract onto
+// every candidate: selection_group and traffic_weight are required on all of
+// them, including preserved foreign entries that previously used mode random.
+func normalizeWeightedCandidates(candidates []Candidate) {
+	for i := range candidates {
+		if candidates[i].SelectionGroup == nil {
+			group := uint32(0)
+			candidates[i].SelectionGroup = &group
+		}
+		if candidates[i].TrafficWeight == nil {
+			weight := uint32(1)
+			candidates[i].TrafficWeight = &weight
+		}
+	}
+}
+
+// ValidateSelectionMetadata rejects invalid selection bindings (today:
+// duplicate providers for one client-visible model). Render uses the same
+// derivation for wire metadata; the controller calls this before applying
+// transport resources so invalid configs do not change serving state.
 func ValidateSelectionMetadata(routes *resolver.ResolvedRouteSet) error {
 	if routes == nil {
 		return fmt.Errorf("%w: nil route set", ErrScopeMismatch)
@@ -457,8 +533,11 @@ func CandidateStableID(model, provider string) string {
 	return model + "/provider-" + provider
 }
 
-// randomSelectionPolicy is the Praxis picker policy for selection groups.
+// randomSelectionPolicy is the Praxis picker policy for equal-weight groups.
 var randomSelectionPolicy = json.RawMessage(`{"mode":"random"}`)
+
+// weightedRandomSelectionPolicy is the Praxis picker for proportional weights.
+var weightedRandomSelectionPolicy = json.RawMessage(`{"mode":"weightedRandom"}`)
 
 // maxStableIDBytes is the Praxis stable_id length limit.
 const maxStableIDBytes = 256
@@ -498,11 +577,11 @@ func IsScopedStableID(id string) bool {
 	return strings.Count(id, "/") != 1
 }
 
-// ValidateModel applies Render's per-model checks: provider selection (equal
-// weights, no repeated provider), known clusters and qualified credential
-// strategies. The controller also runs it on a contribution from another
-// namespace in isolation, so a model Render would reject is excluded before it
-// can fail the whole tenant overlay.
+// ValidateModel applies Render's per-model checks: provider selection (no
+// repeated provider), known clusters and qualified credential strategies. The
+// controller also runs it on a contribution from another namespace in
+// isolation, so a model Render would reject is excluded before it can fail
+// the whole tenant overlay.
 func ValidateModel(m resolver.ModelRoutes, opts Options) error {
 	if _, err := deriveSelectionMetadata(&resolver.ResolvedRouteSet{Models: []resolver.ModelRoutes{m}}); err != nil {
 		return err
@@ -517,21 +596,6 @@ func ValidateModel(m resolver.ModelRoutes, opts Options) error {
 		}
 		if _, _, err := StrategyFor(r); err != nil {
 			return fmt.Errorf("model %s provider %s: %w", r.Model, r.Provider, err)
-		}
-	}
-	return nil
-}
-
-// checkUniformWeights enforces the R1 guard for one model group.
-func checkUniformWeights(m resolver.ModelRoutes) error {
-	if len(m.Routes) == 0 {
-		return nil // model renders no candidates; skips are the record
-	}
-	first := m.Routes[0].Weight
-	for _, r := range m.Routes[1:] {
-		if r.Weight != first {
-			return fmt.Errorf("%w: model %s has weights %d and %d across providers",
-				ErrWeightUnsupported, m.ModelRef, first, r.Weight)
 		}
 	}
 	return nil

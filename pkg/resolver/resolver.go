@@ -343,6 +343,20 @@ func resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalPro
 		}
 		for _, ref := range m.Spec.ExternalProviderRefs {
 			base := Skip{ModelRef: mref, ProviderRef: ref.Ref.Name}
+			weight := 1
+			if ref.Weight != nil {
+				weight = *ref.Weight
+			}
+			// An explicit zero (or negative) weight is an administrative
+			// exclusion from routing. Classify it before provider lookup,
+			// ReferenceGrant checks, and readiness so an unavailable disabled
+			// provider cannot make reconciliation retain its old route. ResolveAll
+			// still resolves disabled bindings for credential/transport preload.
+			if weight <= 0 && !includeDisabled {
+				mr.Skips = append(mr.Skips, newSkip(base,
+					SkipWeightDisabled, fmt.Sprintf("weight %d disables this ref", weight)))
+				continue
+			}
 			key := provKey{m.Namespace, ref.Ref.Name}
 			if ref.Ref.Namespace != "" {
 				key.ns = ref.Ref.Namespace
@@ -378,15 +392,6 @@ func resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalPro
 				continue
 			}
 
-			weight := 1
-			if ref.Weight != nil {
-				weight = *ref.Weight
-			}
-			if weight <= 0 && !includeDisabled {
-				mr.Skips = append(mr.Skips, newSkip(base,
-					SkipWeightDisabled, fmt.Sprintf("weight %d disables this ref", weight)))
-				continue
-			}
 			if !supportedProviderFormat(prov.Spec.Provider, ref.APIFormat) {
 				message := fmt.Sprintf("provider %q with APIFormat %q has no qualified route and credential profile", prov.Spec.Provider, ref.APIFormat)
 				if weight <= 0 {

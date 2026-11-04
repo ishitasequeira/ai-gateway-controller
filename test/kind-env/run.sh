@@ -848,6 +848,7 @@ PY
       "--known-cluster=provider-provider-b",
       "--known-cluster=provider-provider-proof-a",
       "--known-cluster=provider-provider-proof-b",
+      "--known-cluster=provider-provider-proof-c",
       "--known-cluster=provider-api-translation-openai",
       "--known-cluster=provider-api-translation-anthropic",
       "--known-cluster=provider-transition-provider",
@@ -983,6 +984,7 @@ EOF
   make_katan_tls provider-b-tls provider-b provider-b-ext
   make_katan_tls provider-proof-a-tls provider-proof-a-ext
   make_katan_tls provider-proof-b-tls provider-proof-b-ext
+  make_katan_tls provider-proof-c-tls provider-proof-c-ext
   make_katan_tls provider-translation-tls provider-translation-ext provider-translation-openai-ext
   make_katan_tls provider-a-tenant-b-tls provider-a-tenant-b
   make_katan_tls provider-b-tenant-b-tls provider-b-tenant-b

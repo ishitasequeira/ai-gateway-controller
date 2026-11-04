@@ -489,11 +489,11 @@ def set_refs(refs, wait=True):
     return wait_model() if wait else None
 
 
-def make_ref(name):
+def make_ref(name, weight=1):
     return {
         "ref": {"name": name}, "targetModel": "demo", "apiFormat": "openai-chat",
         "path": "/v1/chat/completions",
-        "weight": 1,
+        "weight": weight,
     }
 
 
@@ -564,7 +564,7 @@ def overlay_snapshot(label):
         "deployment_unavailable_replicas": dep.get("status", {}).get("unavailableReplicas", 0),
         "deployment_terminating_replicas": dep.get("status", {}).get("terminatingReplicas", 0),
         "candidates": [
-            {k: c.get(k) for k in ("cluster", "kind", "name", "selection_group")}
+            {k: c.get(k) for k in ("cluster", "kind", "name", "selection_group", "traffic_weight")}
             for c in wire.get("overlay", {}).get("candidates", [])
         ],
     }
@@ -1063,7 +1063,7 @@ def current_provider_path_snapshot():
         "inference.opendatahub.io/routing-overlay-content-digest", "")
     KNOWN_OVERLAYS[published] = {
         "candidates": [
-            {key: candidate.get(key) for key in ("cluster", "kind", "name", "selection_group")}
+            {key: candidate.get(key) for key in ("cluster", "kind", "name", "selection_group", "traffic_weight")}
             for candidate in wire.get("overlay", {}).get("candidates", [])
         ],
         "selection_policy": wire.get("overlay", {}).get("selection_policy"),
@@ -1383,7 +1383,7 @@ def gateway_request(session=None):
     }
 
 
-def sample(name):
+def sample(name, a_min=35, a_max=65, b_min=35, b_max=65, label="roughly_even_split", require_a_gt_b=False):
     a = b = failures = 0
     status_counts = {}
     for _ in range(100):
@@ -1395,16 +1395,19 @@ def sample(name):
             a += 1
         else:
             b += 1
-    # For 100 independent draws from an equal-weight pair, allow a broad
-    # 35–65 band so ordinary random variation passes while skew is visible.
-    roughly_even = 35 <= a <= 65 and 35 <= b <= 65
+    # Broad bands absorb ordinary random variation while still catching
+    # uniform-vs-proportional skew (equal: 35–65; 80/20: prefer A and a > b).
+    biased = a_min <= a <= a_max and b_min <= b <= b_max
+    if require_a_gt_b:
+        biased = biased and a > b
     result = {"name": name, "requests": 100, "proof_a": a, "proof_b": b, "failures": failures,
               "status_counts": status_counts,
               "strict_https_sni_authority_credential": True,
-              "roughly_even_split": roughly_even, "accepted_per_provider": "35-65"}
+              label: biased, "a_gt_b": a > b,
+              "accepted_proof_a": f"{a_min}-{a_max}", "accepted_proof_b": f"{b_min}-{b_max}"}
     RESULT["samples"].append(result)
     write_json(EVIDENCE / "results.json", RESULT)
-    record(name, failures == 0 and roughly_even, str(result))
+    record(name, failures == 0 and biased, str(result))
 
 
 def sample_single_provider(name, expected_provider):
@@ -1727,6 +1730,40 @@ def main():
 
     resume_controller()
     converged({"provider-provider-proof-a", "provider-provider-proof-b"}, "two-provider-after-affinity")
+
+    # Proportional 80/20 selection (#122). Band is intentionally wide: prove
+    # bias toward A without requiring an exact ratio over 100 draws.
+    ref_a80, ref_b20 = make_ref("provider-proof-a", 80), make_ref("provider-proof-b", 20)
+    set_refs([ref_a80, ref_b20])
+    weighted = converged({"provider-provider-proof-a", "provider-provider-proof-b"}, "unequal-weight-80-20")
+    weights = {c.get("cluster"): c.get("traffic_weight") for c in weighted["candidates"]}
+    record("unequal_weight_wire_metadata",
+           weighted["selection_policy"] == {"mode": "weightedRandom"}
+           and weights.get("provider-provider-proof-a") == 80
+           and weights.get("provider-provider-proof-b") == 20
+           and {c.get("selection_group") for c in weighted["candidates"]} == {0},
+           json.dumps({"selection_policy": weighted["selection_policy"], "traffic_weights": weights},
+                      sort_keys=True))
+    sample("sample_unequal_80_20", a_min=55, a_max=95, b_min=5, b_max=45,
+           label="roughly_proportional_80_20", require_a_gt_b=True)
+
+    # weight 0 disables the second provider while keeping the ref.
+    set_refs([ref_a, make_ref("provider-proof-b", 0)])
+    disabled = converged({"provider-provider-proof-a"}, "weight-zero-disabled")
+    record("weight_zero_wire_metadata",
+           len(disabled["candidates"]) == 1
+           and disabled["candidates"][0].get("cluster") == "provider-provider-proof-a"
+           and not disabled.get("selection_policy"),
+           json.dumps(disabled, sort_keys=True))
+    disabled_sample = sample_single_provider("sample_weight_zero_disabled", "proof-a")
+    RESULT["samples"].append(disabled_sample)
+    write_json(EVIDENCE / "results.json", RESULT)
+    record("sample_weight_zero_disabled",
+           disabled_sample["failures"] == 0 and disabled_sample["proof_a"] == 100,
+           str(disabled_sample))
+
+    set_refs([ref_a, ref_b])
+    converged({"provider-provider-proof-a", "provider-provider-proof-b"}, "two-provider-before-withdrawal")
     set_refs([ref_a], wait=False)
     first_one = wait_for_published_candidates({"provider-provider-proof-a"}, "two-to-one")
     transition_probe("two_to_one_first_publication", {"proof-a", "proof-b"}, first_one)

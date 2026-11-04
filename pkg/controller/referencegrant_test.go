@@ -340,6 +340,51 @@ func TestUnpermittedSiblingKeepsLastServingState(t *testing.T) {
 	}
 }
 
+func TestAllZeroCrossNamespaceReferenceWithdrawsAfterGrantRevocation(t *testing.T) {
+	ctx := context.Background()
+	sharedProvider, sharedSecret := attachmentProvider("shared")
+	model := referenceProvider(attachmentModel("chat", "tenant-b", "chat-model", time.Unix(100, 0)), "shared")
+	grant := referenceGrant("shared", "tenant-b", "openai")
+	objects := append([]client.Object{sharedProvider, sharedSecret, model, grant},
+		attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	request := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}
+	if _, err := r.Reconcile(ctx, request); err != nil {
+		t.Fatalf("initial granted serving reconcile: %v", err)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, model.Namespace, modelRouteName(model.Name)); err != nil {
+		t.Fatalf("initial granted route: %v", err)
+	}
+	if len(overlayEnvelope(t, r, model.Namespace).Overlay.Candidates) != 1 {
+		t.Fatal("expected the granted provider to be published before withdrawal")
+	}
+	var current v1alpha1.ExternalModel
+	if err := r.Get(ctx, client.ObjectKeyFromObject(model), &current); err != nil {
+		t.Fatal(err)
+	}
+	zero := 0
+	current.Spec.ExternalProviderRefs[0].Weight = &zero
+	if err := r.Update(ctx, &current); err != nil {
+		t.Fatalf("set cross-namespace provider weight to zero: %v", err)
+	}
+	if err := r.Delete(ctx, grant); err != nil {
+		t.Fatalf("revoke ReferenceGrant: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, request); !errors.Is(err, resolver.ErrNoRoutes) {
+		t.Fatalf("all-zero revoked-reference reconcile = %v, want ErrNoRoutes", err)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, model.Namespace, modelRouteName(model.Name)); !apierrors.IsNotFound(err) {
+		t.Fatalf("revoked zero-weight route = %v, want NotFound", err)
+	}
+	assertNoTenantOverlay(t, r)
+	got := getModel(t, r, model)
+	if got.Status.Phase != modelPhaseFailed || got.Status.ObservedGeneration != got.Generation ||
+		readyReason(got) != reasonNoRoutes {
+		t.Fatalf("revoked zero-weight model status = %q/%q at %d/%d, want current-generation Failed/NoRoutes",
+			got.Status.Phase, readyReason(got), got.Status.ObservedGeneration, got.Generation)
+	}
+}
+
 func TestLocalProviderCannotTakeOverHashedTransport(t *testing.T) {
 	sharedProvider, sharedSecret := attachmentProvider("shared")
 	_, localSecret := attachmentProvider("tenant-b")

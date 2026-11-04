@@ -164,11 +164,12 @@ func loadRecorderConfig() recorderConfig {
 	providerLabel, ok := map[string]string{
 		"proof-a":        "proof-a",
 		"proof-b":        "proof-b",
+		"proof-c":        "proof-c",
 		"translation":    "translation",
 		"provider-aware": "provider-aware",
 	}[provider]
 	if !ok {
-		log.Fatal("PROVIDER_NAME must be proof-a, proof-b, translation, or provider-aware")
+		log.Fatal("PROVIDER_NAME must be proof-a, proof-b, proof-c, translation, or provider-aware")
 	}
 	responseMode := os.Getenv("RESPONSE_MODE")
 	if responseMode == "" {
