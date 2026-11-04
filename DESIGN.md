@@ -622,7 +622,21 @@ Service, and NetworkPolicy named `maas-consumer-portal-auth-proxy`. The proxy se
 TLS on port 4180 with a service-ca certificate, trusts
 `odh-trusted-ca-bundle` for the OIDC issuer, and accepts traffic only from the
 tenant Gateway and Authorino. Its OIDC callback is
-`https://<Gateway HTTPS listener hostname>/oauth2/callback`.
+`https://<external gateway hostname>/oauth2/callback`. The hostname is
+resolved in order: the Gateway's first HTTPS listener with a concrete
+(non-wildcard) hostname; an external Hostname-type Gateway status address
+(internal `.svc`/`.cluster.local` names are skipped — they are unreachable
+from user browsers and would break the broker-registered redirect URI); and
+the OpenShift Route that fronts the Gateway in the ClusterIP + Route gateway
+pattern, where the listener carries no hostname. An HTTPS listener is
+required regardless of source — the portal routes attach to the Gateway's
+https section and the callback is served over TLS, so a Gateway without one
+fails closed. Routes are discovered by listing the Gateway namespace and
+matching the backend Service's `gateway.networking.k8s.io/gateway-name`
+label rather than by name, and only Routes that can serve the portal count:
+TLS configured, no subpath restriction, and a concrete host. The
+conventional `maas-gateway-route` name only breaks ties when several Routes
+front the same Gateway.
 
 The same reconciliation creates the `maas-consumer-portal` and
 `maas-consumer-portal-oauth2` HTTPRoutes on the default Gateway, a
