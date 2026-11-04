@@ -1539,15 +1539,27 @@ func (r *Reconciler) applyCredentialCopies(ctx context.Context, a attachedModel,
 
 // credentialCopyOwned reports whether a Secret exists at the copy name and
 // whether it is the controller-owned copy of the same source. Secret metadata
-// is read from the metadata-only cache.
+// is read from the metadata-only cache; on a cache miss the API server is read
+// directly before concluding the copy is absent, because the cache can lag a
+// copy applied earlier in the same reconcile (admitAttachments checks
+// readiness right after applyCredentialCopies wrote the copy) and the
+// adoption guard below must not be skipped because of that lag.
 func (r *Reconciler) credentialCopyOwned(ctx context.Context, namespace string, copied credentialCopy) (bool, bool, error) {
 	existing := &metav1.PartialObjectMetadata{}
 	existing.SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("Secret"))
 	if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: copied.name}, existing); err != nil {
-		if apierrors.IsNotFound(err) {
+		if !apierrors.IsNotFound(err) {
+			return false, false, fmt.Errorf("get credential copy %s/%s: %w", namespace, copied.name, err)
+		}
+		if r.APIReader == nil {
 			return false, false, nil
 		}
-		return false, false, fmt.Errorf("get credential copy %s/%s: %w", namespace, copied.name, err)
+		if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: copied.name}, existing); err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, false, nil
+			}
+			return false, false, fmt.Errorf("live get credential copy %s/%s: %w", namespace, copied.name, err)
+		}
 	}
 	return true, existing.GetLabels()[tenant.LabelCredentialCopy] == "true" &&
 		existing.GetAnnotations()[annotationCredentialSource] == copied.source(), nil

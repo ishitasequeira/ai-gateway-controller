@@ -2305,3 +2305,54 @@ func TestAttachedModelReportsWhyNoProviderResolved(t *testing.T) {
 		t.Fatalf("failed model keeps httpRouteName %q", got.Status.HTTPRouteName)
 	}
 }
+
+func TestCredentialCopyOwnedFallsBackToLiveRead(t *testing.T) {
+	copyName := "agc-cred-lagged"
+	copied := credentialCopy{name: copyName, sourceNamespace: "llm", sourceName: "api-key", key: "token"}
+	owned := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Namespace:   "tenant-a",
+		Name:        copyName,
+		Labels:      map[string]string{tenant.LabelCredentialCopy: "true"},
+		Annotations: map[string]string{annotationCredentialSource: copied.source()},
+	}}
+	r := controllerTestClient(t, owned)
+	cached, ok := r.Client.(client.WithWatch)
+	if !ok {
+		t.Fatal("the test client must support watches")
+	}
+	// Simulate metadata-cache lag: the cached client has not seen the Secret
+	// yet, while the API server (APIReader) already serves it.
+	r.Client = interceptor.NewClient(cached, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, meta := obj.(*metav1.PartialObjectMetadata); meta && key.Name == copyName {
+				return apierrors.NewNotFound(corev1.Resource("secrets"), copyName)
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+
+	if exists, isOwned, err := r.credentialCopyOwned(context.Background(), "tenant-a", copied); err != nil || !exists || !isOwned {
+		t.Fatalf("cache-miss read: exists=%v owned=%v err=%v, want the live read to find the controller-owned copy", exists, isOwned, err)
+	}
+
+	// When the Secret is truly absent, the live read confirms the miss
+	// instead of speculatively marking the copy ready.
+	if exists, _, err := r.credentialCopyOwned(context.Background(), "tenant-a", credentialCopy{name: "agc-cred-absent", sourceNamespace: "llm", sourceName: "api-key", key: "token"}); err != nil || exists {
+		t.Fatalf("absent copy: exists=%v err=%v, want exists=false", exists, err)
+	}
+
+	// A foreign Secret at the copy name must not be adopted through the
+	// live-read fallback either.
+	foreign := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "tenant-a", Name: "agc-cred-foreign"}}
+	writer, canWrite := r.APIReader.(client.Client)
+	if !canWrite {
+		t.Fatal("the test APIReader must be a writable client")
+	}
+	if err := writer.Create(context.Background(), foreign); err != nil {
+		t.Fatal(err)
+	}
+	foreignCopy := credentialCopy{name: "agc-cred-foreign", sourceNamespace: "llm", sourceName: "api-key", key: "token"}
+	if exists, isOwned, err := r.credentialCopyOwned(context.Background(), "tenant-a", foreignCopy); err != nil || !exists || isOwned {
+		t.Fatalf("foreign copy: exists=%v owned=%v err=%v, want owned=false", exists, isOwned, err)
+	}
+}
