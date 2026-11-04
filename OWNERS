@@ -9,6 +9,8 @@ approvers:
   - bartoszmajsak
   - didierofrivia
   - crstrn13
+  - dmytro-zaharnytskyi
+  - jrhyness
 reviewers:
   - nerdalert
   - jland-redhat
@@ -21,3 +23,5 @@ reviewers:
   - bartoszmajsak
   - didierofrivia
   - crstrn13
+  - dmytro-zaharnytskyi
+  - jrhyness
