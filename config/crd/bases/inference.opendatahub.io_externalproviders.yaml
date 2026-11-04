@@ -107,7 +107,8 @@ spec:
               provider:
                 description: |-
                   Provider identifies the API type for this provider.
-                  e.g. "openai", "anthropic", "azure", "aws-bedrock", "vertex".
+                  e.g. "openai", "anthropic", "azure", "aws-bedrock", "vertex", "bedrock-openai".
+                  Use "bedrock-openai" for Bedrock Mantle's OpenAI-compatible API; it does not mean Bedrock Runtime.
                 maxLength: 63
                 minLength: 1
                 type: string

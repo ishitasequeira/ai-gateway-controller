@@ -183,7 +183,8 @@ func TestRender_APIKeyRejectsUnqualifiedCombinations(t *testing.T) {
 		{"anthropic with openai chat format", "anthropic", "openai-chat"},
 		{"openai with anthropic messages format", "openai", "messages"},
 		{"azure with anthropic messages format", "azure", "messages"},
-		{"aws-bedrock with openai chat format", "aws-bedrock", "openai-chat"},
+		{"Bedrock Runtime provider name with openai chat format", "aws-bedrock", "openai-chat"},
+		{"Bedrock Mantle with messages format", "bedrock-openai", "messages"},
 		{"vertex with anthropic messages format", "vertex", "messages"},
 		{"anthropic with unknown format", "anthropic", "completions"},
 		{"unknown provider with known format", "mistral", "openai-chat"},
@@ -202,6 +203,35 @@ func TestRender_APIKeyRejectsUnqualifiedCombinations(t *testing.T) {
 				t.Errorf("error must name both the provider and the API format, got %v", err)
 			}
 		})
+	}
+}
+
+func TestRender_BedrockMantleMapsAPIKeyToBearerReference(t *testing.T) {
+	r := route("m1", "bedrock", 1)
+	r.ProviderType = "bedrock-openai"
+	r.APIFormat = "openai-chat"
+	r.Endpoint = "bedrock-mantle.us-east-2.api.aws"
+	r.Path = "/v1/chat/completions"
+	r.TargetModel = "openai.gpt-oss-20b"
+	env, err := Render(routeSet(resolver.ModelRoutes{ModelRef: "ns1/m1", Routes: []resolver.Route{r}}), scope(), Revision{}, Options{
+		IncludeProviderProfiles: true,
+	})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	candidate := env.Overlay.Candidates[0]
+	if candidate.Credential == nil || candidate.Credential.Strategy != "bearer_token" {
+		t.Fatalf("Bedrock Mantle credential = %+v, want reference-only bearer_token", candidate.Credential)
+	}
+	if candidate.Path != "/v1/chat/completions" || candidate.TargetModel != "openai.gpt-oss-20b" {
+		t.Fatalf("Bedrock Mantle profile = %+v", candidate)
+	}
+	raw, err := json.Marshal(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "fixture-only-secret") {
+		t.Fatal("credential value appeared in reference-only overlay")
 	}
 }
 

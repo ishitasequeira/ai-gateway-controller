@@ -168,7 +168,6 @@ func TestResolveRejectsUnqualifiedActiveProviderBindings(t *testing.T) {
 		apiFormat    string
 	}{
 		{name: "Vertex OpenAI", providerType: "vertex-openai", apiFormat: "openai-chat"},
-		{name: "Bedrock OpenAI", providerType: "bedrock-openai", apiFormat: "openai-chat"},
 		{name: "custom provider", providerType: "custom", apiFormat: "openai-chat"},
 		{name: "custom format", providerType: "openai", apiFormat: "vendor-chat"},
 	}
@@ -190,6 +189,26 @@ func TestResolveRejectsUnqualifiedActiveProviderBindings(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestResolveBedrockMantleOpenAIChat(t *testing.T) {
+	model := model("ns1", "mantle-model", ref("bedrock", "openai.gpt-oss-20b", "/v1/chat/completions"))
+	provider := provider("ns1", "bedrock", PhaseReady, "bedrock-mantle.us-east-2.api.aws", nil)
+	provider.Spec.Provider = "bedrock-openai"
+
+	set, err := ResolveWithAPITranslation([]*v1alpha1.ExternalModel{model}, []*v1alpha1.ExternalProvider{provider}, false)
+	if err != nil {
+		t.Fatalf("ResolveWithAPITranslation(): %v", err)
+	}
+	if len(set.Routes()) != 1 {
+		t.Fatalf("routes = %+v, want one Mantle route", set.Routes())
+	}
+	route := set.Routes()[0]
+	if route.ProviderType != "bedrock-openai" || route.APIFormat != "openai-chat" ||
+		route.Endpoint != "bedrock-mantle.us-east-2.api.aws" ||
+		route.Path != "/v1/chat/completions" || route.TargetModel != "openai.gpt-oss-20b" || route.AuthType != "apikey" {
+		t.Fatalf("resolved Bedrock Mantle route = %+v", route)
 	}
 }
 

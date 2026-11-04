@@ -489,13 +489,14 @@ func IsQualifiedAuthHeader(header string) bool {
 // StrategyFor maps only the currently qualified provider API-key contracts to
 // Praxis wire strategies, returning the strategy and — for apikey strategies —
 // the provider-boundary header the credential_inject filter must inject into
-// (see defaultAuthHeaders): openai + openai-chat maps to bearer_token
-// (Authorization: Bearer at the provider boundary, header fixed filter-side so
-// none is returned); anthropic + messages and azure/azure-openai + openai-chat
-// map to apikey, injected into x-api-key and api-key respectively. The wire
-// stays reference-only either way. Provider API keys are not interchangeable:
-// other provider/API-format combinations fail closed until their header
-// semantics are explicitly supported.
+// (see defaultAuthHeaders). OpenAI and Bedrock Mantle openai-chat use
+// bearer_token (Authorization: Bearer is fixed filter-side, so no header is
+// returned); anthropic + messages and azure/azure-openai + openai-chat use
+// apikey, injected into x-api-key and api-key respectively. Bedrock support is
+// limited to its Mantle OpenAI-compatible API; it does not cover Bedrock Runtime
+// SigV4 or Converse. The wire stays reference-only either way. Other
+// provider/API-format combinations fail closed until their header semantics are
+// explicitly supported.
 //
 // This is the single qualification authority: Render stamps overlay
 // candidates with the strategy this function returns, and the tenant
@@ -515,6 +516,8 @@ func StrategyFor(route resolver.Route) (strategy, header string, err error) {
 			return "apikey", defaultAuthHeaders["anthropic"], nil
 		case (route.ProviderType == "azure" || route.ProviderType == "azure-openai") && route.APIFormat == "openai-chat":
 			return "apikey", defaultAuthHeaders[route.ProviderType], nil
+		case route.ProviderType == "bedrock-openai" && route.APIFormat == "openai-chat":
+			return "bearer_token", "", nil
 		}
 		return "", "", fmt.Errorf("%w: auth.type apikey for provider %q and API format %q", ErrUnsupportedCredential, route.ProviderType, route.APIFormat)
 	case "sigv4", "oauth2":

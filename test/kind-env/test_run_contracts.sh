@@ -161,4 +161,45 @@ rg -q 'make_katan_tls provider-proof-c-tls provider-proof-c-ext' <<<"$run_source
   exit 1
 }
 
-echo "Kind run harness contracts passed (image identities, runtime pod filtering, exact MaaS image identity, and static-weight receipt fixtures)."
+
+(
+  handoff_poll=$(sed -n '/^    handoff_ready=false$/,/^    if \[\[ "$handoff_ready" != true \]\]; then$/p' \
+    "$ROOT/test/kind-env/run.sh" | sed '$d')
+  [[ -n "$handoff_poll" ]] || { echo 'could not extract the bootstrap Deployment handoff poll' >&2; exit 1; }
+  KCTL=(mock_kubectl)
+  deployment_name=payload-processing
+  seq() { printf '%s\n' 1 2 3; }
+  sleep() { :; }
+  mock_kubectl() {
+    [[ "$*" == '-n maas-system get deployment payload-processing --ignore-not-found -o json' ]] || return 1
+    case "$scenario" in
+      absent) return 0 ;;
+      owned) printf '%s\n' '{"metadata":{"labels":{"app.kubernetes.io/managed-by":"ai-gateway-controller"}}}' ;;
+      unowned) printf '%s\n' '{"metadata":{"labels":{}}}' ;;
+      denied) return 1 ;;
+      timeout) return 124 ;;
+      partial) printf '%s\n' '{"metadata":{"labels":{"app.kubernetes.io/managed-by":"ai-gateway-controller"}}}'; return 1 ;;
+      recovering)
+        if [[ ! -e "$handoff_tmp/retried" ]]; then
+          touch "$handoff_tmp/retried"
+          return 124
+        fi
+        printf '%s\n' '{"metadata":{"labels":{"app.kubernetes.io/managed-by":"ai-gateway-controller"}}}'
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  handoff_tmp=$(mktemp -d)
+  trap 'rm -rf "$handoff_tmp"' EXIT
+  for scenario in denied timeout partial unowned; do
+    eval "$handoff_poll"
+    [[ "$handoff_ready" == false ]] || { echo "handoff must not succeed for $scenario Deployment reads" >&2; exit 1; }
+  done
+  for scenario in absent owned recovering; do
+    eval "$handoff_poll"
+    [[ "$handoff_ready" == true ]] || { echo "handoff must accept a confirmed $scenario Deployment" >&2; exit 1; }
+  done
+)
+
+
+echo "Kind run harness contracts passed (image identity, handoff read errors, and static-weight receipt fixtures)."
