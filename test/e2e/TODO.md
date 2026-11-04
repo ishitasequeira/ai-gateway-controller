@@ -42,7 +42,7 @@ Some e2e fixes from the vendored branch (`ci/maas-e2e-konflux-group-test`) are *
 | **Upstream MaaS PR** (preferred) | Fix belongs in shared MaaS tests (praxis log skip, `_poll_status` flakes, duplicate-header warmup) | All MaaS consumers benefit; slower until merged |
 | **aigc post-fetch patch** (`patch-maas-tests-for-aigc.sh`, not added yet) | Short-term CI unblock while upstream PR is open | Duplicated logic; must re-apply after every lock bump |
 
-**Current choice:** MaaS source @ `7879675` (see `test/maas-e2e.lock`), including the [#1546](https://github.com/opendatahub-io/models-as-a-service/pull/1546) short TRLP subscription IDs and the [#1537](https://github.com/opendatahub-io/models-as-a-service/pull/1537) rate-grouping test. Deploy patches stay in `patch-maas-deploy-for-aigc.sh`. IPP migration **workarounds remain removed** from aigc (no pod labeling / managed-by stamp / MaasTenantConfig retry loop).
+**Current choice:** MaaS source @ `08858542` (see `test/maas-e2e.lock`), including the [#1815](https://github.com/opendatahub-io/models-as-a-service/pull/1815) smoke e2e subset, [#1721](https://github.com/opendatahub-io/models-as-a-service/pull/1721) producer telemetry scope, [#1767](https://github.com/opendatahub-io/models-as-a-service/pull/1767) effect-based e2e waits, and [#1728](https://github.com/opendatahub-io/models-as-a-service/pull/1728) client-facing external model identity. Deploy patches stay in `patch-maas-deploy-for-aigc.sh`. IPP migration **workarounds remain removed** from aigc (no pod labeling / managed-by stamp / MaasTenantConfig retry loop).
 
 ---
 

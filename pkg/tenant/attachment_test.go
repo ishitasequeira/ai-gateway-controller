@@ -13,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/constants"
@@ -111,6 +112,49 @@ func TestAttachedOverlayCandidatesRestoreCredentialHeader(t *testing.T) {
 	}
 	if headers["team/bogus/team/azure"] != "" {
 		t.Fatalf("unqualified header value = %q, want empty", headers["team/bogus/team/azure"])
+	}
+}
+
+func TestAttachedOverlayCandidatesLiveReadFallback(t *testing.T) {
+	// The overlay ConfigMap event that triggers a tenant reconcile can arrive
+	// before the Secret informer observed the credential copy written
+	// alongside it. Simulate that lag — the cached client answers NotFound,
+	// the API server serves the Secret — and require the candidate to be
+	// admitted instead of silently skipped; a skipped candidate is dropped
+	// from the rendered ExtProc mount until the next event.
+	copyName := "agc-cred-lagged"
+	candidates := []envelope.Candidate{
+		{Cluster: "provider-openai", StableID: "team/chat/team/openai", Name: "chat",
+			Credential: &envelope.Credential{Strategy: "bearer_token", SecretRef: envelope.SecretRef{Name: copyName, Namespace: "tenant-b", Key: "api-key"}}},
+	}
+	data, err := json.Marshal(envelope.Envelope{Overlay: envelope.Overlay{Candidates: candidates}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	overlay := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: praxisOverlayName, Namespace: "tenant-b", Labels: map[string]string{managedByLabel: ManagedByAIGatewayController}},
+		Data:       map[string]string{praxisOverlayDataKey: string(data)},
+	}
+	live := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: copyName, Namespace: "tenant-b",
+		Labels: map[string]string{LabelManagedBy: ManagedByAIGatewayController, LabelCredentialCopy: "true"}}}
+	base := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(overlay, live).Build()
+	r := &Reconciler{
+		Client: interceptor.NewClient(base, interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, meta := obj.(*metav1.PartialObjectMetadata); meta && key.Name == copyName {
+					return apierrors.NewNotFound(corev1.Resource("secrets"), copyName)
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+		}),
+		APIReader: base,
+	}
+	got, unreadable, err := r.attachedOverlayCandidates(context.Background(), "tenant-b")
+	if err != nil || unreadable {
+		t.Fatalf("attachedOverlayCandidates: unreadable=%t err=%v", unreadable, err)
+	}
+	if len(got) != 1 || got[0].StableID != "team/chat/team/openai" {
+		t.Fatalf("attached candidates = %#v, want the lagged-cache candidate admitted via the live read", got)
 	}
 }
 

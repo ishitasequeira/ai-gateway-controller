@@ -103,8 +103,8 @@ type ExternalProviderRef struct {
 
 	// Config holds model-specific configuration as key-value pairs.
 	// Overrides the ExternalProvider config for this model-provider binding,
-	// except tls.caCertificates, which configures shared provider transport and
-	// must be set on the ExternalProvider.
+	// except tls.caCertificates and tls.credentialName, which configure shared
+	// provider transport and must be set on the ExternalProvider.
 	// +optional
 	Config map[string]string `json:"config,omitempty"`
 
@@ -114,10 +114,12 @@ type ExternalProviderRef struct {
 	// +optional
 	Auth *AuthConfig `json:"auth,omitempty"`
 
-	// Weight controls eligibility for this provider binding. Zero disables the
-	// binding; an omitted weight defaults to one. Multiple eligible providers
-	// for the same client model must have equal positive weights and are selected
-	// uniformly. Unequal positive weights are not supported.
+	// Weight controls relative traffic among eligible providers for this
+	// client model. Zero disables the binding; an omitted weight defaults to
+	// one. Equal positive weights are selected uniformly (Praxis mode random).
+	// Unequal positive weights are selected proportionally (Praxis mode
+	// weightedRandom); the CRD value (1–100) is passed through as overlay
+	// traffic_weight (Praxis accepts 1–1000).
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=100

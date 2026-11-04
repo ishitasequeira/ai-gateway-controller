@@ -36,7 +36,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	aigatewayv1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/aigateway/v1alpha1"
@@ -111,19 +113,147 @@ type Reconciler struct {
 	Log logr.Logger
 }
 
+// tenantEventPredicates returns the watch predicates that filter the tenant
+// reconciler's watches so that only events that can change the rendered
+// praxis stack enqueue a reconcile.
+//
+// Without predicates, every update to a watched object — including status-only
+// writes and Secret metadata bumps — re-applied the whole tenant stack. In
+// busy namespaces (maas-controller status writebacks, test-driven model churn,
+// this controller's own ExternalModel status writes) that produced one full
+// praxis re-apply per unrelated event at event cadence.
+//
+// GenerationChangedPredicate admits creates, deletes, generic events, and
+// updates whose spec changed (metadata.generation bumped); it drops status-only
+// and metadata-only updates, which cannot change the rendered output.
+//
+// The AITenant watch additionally needs status updates that the enqueue
+// mapper or the apply path reads: status.tenantNamespace (the mapper reads
+// it, so the event that first populates it must be admitted or a new
+// AITenant would never map to its MaasTenantConfig), and status.gatewayRef /
+// DeployReady transitions (the apply path targets the Gateway they name, and
+// steady state returns without a requeue). Other status-only writes are
+// dropped. The MaasTenantConfig watch additionally admits changes to the
+// AnnotationPayloadProcessingType annotation, which selects the praxis vs
+// legacy-IPP backend without bumping metadata.generation.
+func tenantEventPredicates() map[string]predicate.Predicate {
+	aitenantUpdate := predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			if e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration() ||
+				aitenantConfigNamespace(e.ObjectOld) != aitenantConfigNamespace(e.ObjectNew) {
+				return true
+			}
+			// The reconcile reads status.gatewayRef and DeployReady to pick
+			// the target Gateway, and the steady-state path returns without
+			// scheduling a requeue: admit their transitions so a gateway
+			// re-claim or Ready↔Failed flip reconciles promptly instead of
+			// waiting out the resync interval.
+			old, oldOK := asUnstructured(e.ObjectOld)
+			current, currentOK := asUnstructured(e.ObjectNew)
+			if !oldOK || !currentOK {
+				return false
+			}
+			oldName, oldNamespace, oldReady := GatewayRef(old)
+			newName, newNamespace, newReady := GatewayRef(current)
+			return oldName != newName || oldNamespace != newNamespace || oldReady != newReady ||
+				DeployReady(old) != DeployReady(current)
+		},
+	}
+	// The payload-processing backend is selected by annotation, which does
+	// not bump metadata.generation. An IPP→praxis flip on an existing
+	// MaasTenantConfig must reconcile promptly: the IPP path returns without
+	// scheduling a requeue, so the resync interval would be the only backstop.
+	maastenantconfigUpdate := predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			return e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration() ||
+				PayloadProcessingType(mustUnstructured(e.ObjectOld)) != PayloadProcessingType(mustUnstructured(e.ObjectNew))
+		},
+	}
+	return map[string]predicate.Predicate{
+		"maastenantconfig": maastenantconfigUpdate,
+		"aitenant":         aitenantUpdate,
+		"externalmodel":    predicate.GenerationChangedPredicate{},
+		"externalprovider": predicate.GenerationChangedPredicate{},
+	}
+}
+
+// asUnstructured converts a watch object to *unstructured.Unstructured.
+func asUnstructured(obj client.Object) (*unstructured.Unstructured, bool) {
+	u, ok := obj.(*unstructured.Unstructured)
+	return u, ok
+}
+
+// mustUnstructured converts a watch object to *unstructured.Unstructured,
+// returning an empty object when the type does not match (annotations of an
+// empty object read as unset, making the comparison a no-op).
+func mustUnstructured(obj client.Object) *unstructured.Unstructured {
+	u, _ := asUnstructured(obj)
+	if u == nil {
+		return &unstructured.Unstructured{}
+	}
+	return u
+}
+
+// aitenantConfigNamespace reads the MaasTenantConfig namespace an AITenant's
+// status points at; empty when unset or the object is not an AITenant.
+func aitenantConfigNamespace(obj client.Object) string {
+	u, ok := obj.(*unstructured.Unstructured)
+	if !ok {
+		return ""
+	}
+	namespace, _ := ConfigNamespace(u)
+	return namespace
+}
+
+// notControllerOwnedSecret reports whether a Secret was not rendered by this
+// controller, i.e. is a credential source rather than controller output.
+func notControllerOwnedSecret(obj client.Object) bool {
+	return obj.GetLabels()[managedByLabel] != render.FieldOwner
+}
+
+// tenantSecretPredicate filters the tenant Secret watch. The watch exists to
+// react to credential sources changing in the tenant namespace; without the
+// filter it also fired on this controller's own output — projected credential
+// copies (agc-cred-*) and the payload-processing ServiceAccount's dockercfg —
+// self-triggering a full praxis re-apply per write. OpenShift-injected
+// dockercfg churn (builder/deployer/default tokens) is not excludable at watch
+// time, but it only occurs at namespace lifecycle boundaries, before the
+// MaasTenantConfig it would enqueue exists.
+//
+// Deletes are always admitted, including of controller-owned copies: a copy
+// is removed by the attachment reconciler acting on the model in the model's
+// namespace, which no tenant-side watch maps back to this tenant, so the
+// Secret delete is the only event that can trigger the tenant reconcile
+// dropping the candidate (and its Secret mount) from the rendered stack.
+// Dropping it would leave the ExtProc mounting a deleted Secret — blocking
+// new pods — until the resync interval.
+func tenantSecretPredicate() predicate.Funcs {
+	return predicate.Funcs{
+		CreateFunc:  func(e event.CreateEvent) bool { return notControllerOwnedSecret(e.Object) },
+		UpdateFunc:  func(e event.UpdateEvent) bool { return notControllerOwnedSecret(e.ObjectNew) },
+		GenericFunc: func(e event.GenericEvent) bool { return notControllerOwnedSecret(e.Object) },
+		DeleteFunc:  func(event.DeleteEvent) bool { return true },
+	}
+}
+
 // SetupWithManager registers the MaasTenantConfig watch (primary trigger)
-// and a secondary AITenant watch mapped back to the owning MaasTenantConfig,
+// and secondary watches mapped back to the owning MaasTenantConfig,
 // mirroring maas-controller's own TenantReconciler.SetupWithManager shape.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
+	preds := tenantEventPredicates()
 	return ctrl.NewControllerManagedBy(mgr).
-		For(NewMaasTenantConfig()).
+		For(NewMaasTenantConfig(), builder.WithPredicates(preds["maastenantconfig"])).
 		Watches(
 			NewAITenant(),
 			handler.EnqueueRequestsFromMapFunc(r.enqueueMaasTenantConfigForAITenant),
+			builder.WithPredicates(preds["aitenant"]),
 		).
-		Watches(&v1alpha1.ExternalModel{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace)).
-		Watches(&v1alpha1.ExternalProvider{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace)).
-		WatchesMetadata(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace)).
+		Watches(&v1alpha1.ExternalModel{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace),
+			builder.WithPredicates(preds["externalmodel"])).
+		Watches(&v1alpha1.ExternalProvider{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace),
+			builder.WithPredicates(preds["externalprovider"])).
+		WatchesMetadata(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace),
+			builder.WithPredicates(tenantSecretPredicate())).
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForRoutingOverlay)).
 		Watches(&aigatewayv1alpha1.AIGuardrail{},
 			handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace),
@@ -583,19 +713,17 @@ func (r *Reconciler) resolvePraxisRuntimeCandidates(
 	if err != nil {
 		return nil, false, false, "", err
 	}
+	homeCandidates, policyExcludedOnly, homeErr := r.runtimeCandidates(ctx, tenantNamespace, gatewayName, gatewayNamespace, apiTranslation)
+	if homeErr != nil && !errors.Is(homeErr, resolver.ErrNoRoutes) {
+		return nil, false, false, "", homeErr
+	}
 	// An unreadable overlay may still carry attachments: keep the processor
 	// and let routingOverlayReady report it, as for the tenant's own models.
-	serving := hasModels || len(attached) > 0 || unreadableOverlay
+	serving := hasModels || len(homeCandidates) > 0 || len(attached) > 0 || unreadableOverlay
 	if !serving {
 		return nil, false, true, "", nil
 	}
 
-	var homeCandidates []envelope.Candidate
-	var homeErr error
-	var policyExcludedOnly bool
-	if hasModels {
-		homeCandidates, policyExcludedOnly, homeErr = r.runtimeCandidates(ctx, tenantNamespace, gatewayName, gatewayNamespace, apiTranslation)
-	}
 	if policyExcludedOnly && len(attached) == 0 && !unreadableOverlay {
 		// The model controller has withdrawn every home route on purpose. Its
 		// overlay may already be gone, so do not wait for it before applying
@@ -726,6 +854,9 @@ func (r *Reconciler) providersForTenant(ctx context.Context, namespace, gatewayN
 	referenced := map[string]bool{}
 	required := map[string]bool{}
 	for i := range models {
+		if !models[i].DeletionTimestamp.IsZero() {
+			continue
+		}
 		for _, ref := range models[i].Spec.ExternalProviderRefs {
 			name := ref.Ref.Name
 			// A provider in another namespace is never a same-named local one.
@@ -742,7 +873,7 @@ func (r *Reconciler) providersForTenant(ctx context.Context, namespace, gatewayN
 	result := make([]v1alpha1.ExternalProvider, 0, len(providers.Items))
 	availableRequired := make(map[string]bool, len(required))
 	for i := range providers.Items {
-		if referenced[providers.Items[i].Name] {
+		if providers.Items[i].DeletionTimestamp.IsZero() && referenced[providers.Items[i].Name] {
 			result = append(result, providers.Items[i])
 			if required[providers.Items[i].Name] {
 				availableRequired[providers.Items[i].Name] = true
@@ -765,6 +896,9 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayNa
 	}
 	modelPtrs := make([]*v1alpha1.ExternalModel, 0, len(models))
 	for i := range models {
+		if !models[i].DeletionTimestamp.IsZero() {
+			continue
+		}
 		// Providers in other namespaces are loaded from the published overlay
 		// (attachedOverlayCandidates), so a model referencing only those has
 		// no local runtime candidates.
@@ -774,43 +908,30 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayNa
 			modelPtrs = append(modelPtrs, &models[i])
 		}
 	}
-	if len(modelPtrs) == 0 {
-		return nil, false, nil
-	}
+
 	providerPtrs := make([]*v1alpha1.ExternalProvider, 0, len(providers.Items))
 	for i := range providers.Items {
-		providerPtrs = append(providerPtrs, &providers.Items[i])
+		if providers.Items[i].DeletionTimestamp.IsZero() {
+			providerPtrs = append(providerPtrs, &providers.Items[i])
+		}
 	}
 	runtimeSet, err := resolver.ResolveAllWithAPITranslation(modelPtrs, providerPtrs, apiTranslationEnabled)
 	policyExcludedOnly := allRuntimeRoutesExcludedByPolicy(runtimeSet)
-	if err != nil {
+	if err != nil && !errors.Is(err, resolver.ErrNoRoutes) {
 		return nil, policyExcludedOnly, fmt.Errorf("resolve ExtProc runtime provider set: %w", err)
 	}
-	candidates := make([]envelope.Candidate, 0, len(runtimeSet.Routes()))
-	for _, route := range runtimeSet.Routes() {
-		strategy, header, err := envelope.StrategyFor(route)
-		if err != nil {
-			return nil, false, fmt.Errorf("resolve ExtProc runtime credential for model %s provider %s: %w", route.Model, route.Provider, err)
-		}
-		candidate := envelope.Candidate{
-			Cluster: route.Cluster, StableID: envelope.CandidateStableID(route.Model, route.Provider),
-			Kind: "inference_model", Name: route.ClientName, Fresh: true,
-		}
-		if apiTranslationEnabled {
-			candidate.APIFormat = route.APIFormat
-			candidate.Path = route.Path
-			candidate.TargetModel = route.TargetModel
-		}
-		if strategy != "" {
-			candidate.Credential = &envelope.Credential{
-				Strategy:  strategy,
-				Header:    header,
-				SecretRef: envelope.SecretRef{Name: route.SecretName, Namespace: route.Namespace, Key: route.SecretKey},
-			}
-		}
-		candidates = append(candidates, candidate)
+	candidates, candidateErr := ExternalModelRuntimeCandidates(runtimeSet, apiTranslationEnabled)
+	if candidateErr != nil {
+		return nil, false, candidateErr
 	}
-	return candidates, false, nil
+	candidates, candidateErr = RetainHomeRuntimeCandidates(ctx, r.Client, namespace, candidates, apiTranslationEnabled)
+	if candidateErr != nil {
+		return nil, false, candidateErr
+	}
+	if errors.Is(err, resolver.ErrNoRoutes) && len(candidates) == 0 && len(modelPtrs) > 0 {
+		return nil, policyExcludedOnly, fmt.Errorf("resolve ExtProc runtime provider set: %w", err)
+	}
+	return candidates, policyExcludedOnly, nil
 }
 
 // allRuntimeRoutesExcludedByPolicy distinguishes an intentional translation
@@ -856,6 +977,8 @@ func combineRuntimeCandidates(home, attached []envelope.Candidate, homeErr error
 // A candidate whose copy no longer exists is skipped: its attachment was
 // removed and the entry is inert until the next overlay publish drops it,
 // so mounting the missing Secret would only block the ExtProc rollout.
+// Absence is confirmed against the API server, because the metadata cache can
+// lag the copy written alongside the overlay that triggered this reconcile.
 // The bool reports a controller-owned overlay that cannot be parsed.
 func (r *Reconciler) attachedOverlayCandidates(ctx context.Context, namespace string) ([]envelope.Candidate, bool, error) {
 	var configMap corev1.ConfigMap
@@ -883,10 +1006,26 @@ func (r *Reconciler) attachedOverlayCandidates(ctx context.Context, namespace st
 			copySecret.SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("Secret"))
 			key := client.ObjectKey{Namespace: candidate.Credential.SecretRef.Namespace, Name: candidate.Credential.SecretRef.Name}
 			if err := r.Client.Get(ctx, key, copySecret); err != nil {
-				if apierrors.IsNotFound(err) {
+				if !apierrors.IsNotFound(err) {
+					return nil, false, fmt.Errorf("get credential copy %s: %w", key, err)
+				}
+				// The cache can lag the write that published this overlay
+				// entry: the overlay ConfigMap event that triggered this
+				// reconcile can arrive before the Secret informer observed
+				// the copy written alongside it. Read the API server before
+				// concluding the copy is gone — answering the lag as absence
+				// silently drops the candidate from the rendered ExtProc
+				// mount until the next event. Mirrors the live-read fallback
+				// in the attachment reconciler's credentialCopyOwned.
+				if r.APIReader == nil {
 					continue
 				}
-				return nil, false, fmt.Errorf("get credential copy %s: %w", key, err)
+				if err := r.APIReader.Get(ctx, key, copySecret); err != nil {
+					if apierrors.IsNotFound(err) {
+						continue
+					}
+					return nil, false, fmt.Errorf("live get credential copy %s: %w", key, err)
+				}
 			}
 			// Credential.Header is json:"-" and is lost on the overlay round-trip;
 			// restore it from the copy Secret stamped at attach time — but only from

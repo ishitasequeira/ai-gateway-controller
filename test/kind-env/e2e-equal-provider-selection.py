@@ -58,6 +58,7 @@ ISTIO_ACCESS_LOG_CHANGED = False
 KNOWN_OVERLAYS = {}
 PORT = 19000 + (os.getpid() % 1000)
 GATEWAY_PORT = PORT + 1
+PROVIDER_CLEANUP_TIMEOUT_SECONDS = 600
 
 
 def run(args, *, input_text=None, check=True, timeout=90):
@@ -489,11 +490,11 @@ def set_refs(refs, wait=True):
     return wait_model() if wait else None
 
 
-def make_ref(name):
+def make_ref(name, weight=1):
     return {
         "ref": {"name": name}, "targetModel": "demo", "apiFormat": "openai-chat",
         "path": "/v1/chat/completions",
-        "weight": 1,
+        "weight": weight,
     }
 
 
@@ -564,7 +565,7 @@ def overlay_snapshot(label):
         "deployment_unavailable_replicas": dep.get("status", {}).get("unavailableReplicas", 0),
         "deployment_terminating_replicas": dep.get("status", {}).get("terminatingReplicas", 0),
         "candidates": [
-            {k: c.get(k) for k in ("cluster", "kind", "name", "selection_group")}
+            {k: c.get(k) for k in ("cluster", "kind", "name", "selection_group", "traffic_weight")}
             for c in wire.get("overlay", {}).get("candidates", [])
         ],
     }
@@ -1063,7 +1064,7 @@ def current_provider_path_snapshot():
         "inference.opendatahub.io/routing-overlay-content-digest", "")
     KNOWN_OVERLAYS[published] = {
         "candidates": [
-            {key: candidate.get(key) for key in ("cluster", "kind", "name", "selection_group")}
+            {key: candidate.get(key) for key in ("cluster", "kind", "name", "selection_group", "traffic_weight")}
             for candidate in wire.get("overlay", {}).get("candidates", [])
         ],
         "selection_policy": wire.get("overlay", {}).get("selection_policy"),
@@ -1206,6 +1207,130 @@ def transition_probe(name, allowed_providers, publication, requests=20):
         RESULT["transition_failure"] = True
     write_json(EVIDENCE / "results.json", RESULT)
     print(f"OBSERVED {name}: {diagnostic}")
+
+
+def wait_for_withdrawal_route_cleanup(label, timeout_seconds=900):
+    expected = {"provider-provider-proof-a"}
+    observations = []
+    deadline = time.monotonic() + timeout_seconds
+    last_pod_capture = 0.0
+    pods = []
+    endpoints = {}
+    provider_ingress_before = provider_ingress_counters()
+    write_json(EVIDENCE / f"{label}-route-drain-start.json", {
+        "observed_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "provider_ingress": provider_ingress_before,
+        "pod_revisions": capture_pod_revisions(f"{label}-route-drain-start"),
+        "endpoints": capture_ready_endpoints(),
+        "provider_path": current_provider_path_snapshot(),
+    })
+    while time.monotonic() < deadline:
+        route_result = kubectl("-n", NAMESPACE, "get", "httproute", f"external-model-{MODEL}", "-o", "json", check=False)
+        route_obj = json.loads(route_result.stdout) if route_result.returncode == 0 else {}
+        route_providers = set()
+        for rule in route_obj.get("spec", {}).get("rules", []):
+            for backend in rule.get("backendRefs", []):
+                name = backend.get("name", "")
+                if name.startswith("provider-provider-"):
+                    route_providers.add(name)
+        deployment_result = kubectl("-n", NAMESPACE, "get", "deployment", DEPLOYMENT, "-o", "json", check=False)
+        deployment = json.loads(deployment_result.stdout) if deployment_result.returncode == 0 else {}
+        status = deployment.get("status", {})
+        endpoints_result = kubectl("-n", NAMESPACE, "get", "endpointslices", "-l",
+                                   f"kubernetes.io/service-name={DEPLOYMENT}", "-o", "json", check=False)
+        slice_items = json.loads(endpoints_result.stdout).get("items", []) if endpoints_result.returncode == 0 else []
+        endpoint_state = []
+        for item in slice_items:
+            for endpoint in item.get("endpoints", []):
+                endpoint_state.append({
+                    "pod": endpoint.get("targetRef", {}).get("name"),
+                    "uid": endpoint.get("targetRef", {}).get("uid"),
+                    "ready": endpoint.get("conditions", {}).get("ready"),
+                    "serving": endpoint.get("conditions", {}).get("serving"),
+                    "terminating": endpoint.get("conditions", {}).get("terminating"),
+                })
+        now = time.monotonic()
+        if now - last_pod_capture >= 30:
+            pods = capture_pod_revisions(f"{label}-route-drain-{len(observations)}")
+            endpoints = capture_ready_endpoints()
+            last_pod_capture = now
+        observation = {
+            "observed_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "route_generation": route_obj.get("metadata", {}).get("generation"),
+            "route_providers": sorted(route_providers),
+            "deployment_generation": deployment.get("metadata", {}).get("generation"),
+            "deployment_observed_generation": status.get("observedGeneration"),
+            "deployment_replicas": status.get("replicas"),
+            "deployment_updated_replicas": status.get("updatedReplicas"),
+            "deployment_ready_replicas": status.get("readyReplicas"),
+            "deployment_available_replicas": status.get("availableReplicas"),
+            "deployment_terminating_replicas": status.get("terminatingReplicas", 0),
+            "endpoints": endpoint_state,
+            "pod_revisions": pods,
+        }
+        observations.append(observation)
+        write_json(EVIDENCE / f"{label}-route-drain-observations.json", observations)
+        replicas = deployment.get("spec", {}).get("replicas", 1)
+        rollout_ok = (
+            deployment_result.returncode == 0
+            and status.get("observedGeneration") == deployment.get("metadata", {}).get("generation")
+            and status.get("replicas") == replicas
+            and status.get("updatedReplicas") == replicas
+            and status.get("readyReplicas") == replicas
+            and status.get("availableReplicas") == replicas
+            and status.get("unavailableReplicas", 0) == 0
+            and status.get("terminatingReplicas", 0) == 0
+        )
+        if route_result.returncode == 0 and route_providers == expected and rollout_ok:
+            state = overlay_snapshot(f"{label}-after-route-cleanup")
+            pods = capture_pod_revisions(f"{label}-after-route-cleanup")
+            endpoints = capture_ready_endpoints()
+            provider_ingress_after = provider_ingress_counters()
+            expected_revision = state["published_digest"]
+            revisions_ok = (
+                bool(expected_revision)
+                and expected_revision == state["mounted_digest"] == state["accepted_revision"] == state["serving_revision"]
+                and all(pod["ready"] and not pod["deleting"]
+                        and pod["accepted_revision"] == expected_revision
+                        and pod["serving_revision"] == expected_revision
+                        and "provider-provider-proof-b" not in pod["mounted_runtime_clusters"]
+                        and all(secret["name"] != "provider-proof-b-credentials" for secret in pod["projected_secrets"])
+                        for pod in pods)
+                and all(secret["name"] != "provider-proof-b-credentials" for secret in state["mounted_secrets"])
+            )
+            ingress_delta = counter_delta(provider_ingress_before, provider_ingress_after)
+            cleanup_evidence = {
+                "label": label,
+                "route_providers": sorted(route_providers),
+                "expected_route_providers": sorted(expected),
+                "overlay": state,
+                "pod_revisions": pods,
+                "endpoints": endpoints,
+                "provider_ingress_before": provider_ingress_before,
+                "provider_ingress_after": provider_ingress_after,
+                "provider_ingress_delta_during_drain": ingress_delta,
+                "provider_b_object_still_present": kubectl("-n", NAMESPACE, "get", "externalprovider", "provider-proof-b", check=False).returncode == 0,
+                "provider_b_service_still_provider_owned": kubectl("-n", NAMESPACE, "get", "service", "provider-provider-proof-b", check=False).returncode == 0,
+                "provider_b_serviceentry_still_provider_owned": kubectl("-n", NAMESPACE, "get", "serviceentry.networking.istio.io", "provider-provider-proof-b", check=False).returncode == 0,
+                "provider_b_route_and_credential_projection_removed": route_providers == expected and revisions_ok,
+                "revisions_converged": revisions_ok,
+            }
+            write_json(EVIDENCE / f"{label}-route-cleanup.json", cleanup_evidence)
+            record("two_to_one_route_and_credential_cleanup",
+                   cleanup_evidence["provider_b_route_and_credential_projection_removed"],
+                   json.dumps({k: v for k, v in cleanup_evidence.items() if k not in ("overlay", "pod_revisions", "endpoints")}, sort_keys=True))
+            return cleanup_evidence
+        time.sleep(5)
+    write_json(EVIDENCE / f"{label}-route-cleanup-timeout.json", {
+        "route_providers": sorted(route_providers),
+        "expected_route_providers": sorted(expected),
+        "deployment": deployment,
+        "endpoints": endpoint_state,
+        "pod_revisions": pods,
+        "observations": observations,
+    })
+    record("two_to_one_route_and_credential_cleanup", False,
+           f"B route or credential projection remained after {timeout_seconds}s; last route providers={sorted(route_providers)}")
 
 
 def converged(expected, label):
@@ -1383,7 +1508,7 @@ def gateway_request(session=None):
     }
 
 
-def sample(name):
+def sample(name, a_min=35, a_max=65, b_min=35, b_max=65, label="roughly_even_split", require_a_gt_b=False):
     a = b = failures = 0
     status_counts = {}
     for _ in range(100):
@@ -1395,16 +1520,19 @@ def sample(name):
             a += 1
         else:
             b += 1
-    # For 100 independent draws from an equal-weight pair, allow a broad
-    # 35–65 band so ordinary random variation passes while skew is visible.
-    roughly_even = 35 <= a <= 65 and 35 <= b <= 65
+    # Broad bands absorb ordinary random variation while still catching
+    # uniform-vs-proportional skew (equal: 35–65; 80/20: prefer A and a > b).
+    biased = a_min <= a <= a_max and b_min <= b <= b_max
+    if require_a_gt_b:
+        biased = biased and a > b
     result = {"name": name, "requests": 100, "proof_a": a, "proof_b": b, "failures": failures,
               "status_counts": status_counts,
               "strict_https_sni_authority_credential": True,
-              "roughly_even_split": roughly_even, "accepted_per_provider": "35-65"}
+              label: biased, "a_gt_b": a > b,
+              "accepted_proof_a": f"{a_min}-{a_max}", "accepted_proof_b": f"{b_min}-{b_max}"}
     RESULT["samples"].append(result)
     write_json(EVIDENCE / "results.json", RESULT)
-    record(name, failures == 0 and roughly_even, str(result))
+    record(name, failures == 0 and biased, str(result))
 
 
 def sample_single_provider(name, expected_provider):
@@ -1436,12 +1564,10 @@ def main():
     source_head = run(["git", "-C", PRAXIS_EXTPROC_REPO, "rev-parse", "HEAD"]).stdout.strip()
     source_branch = run(["git", "-C", PRAXIS_EXTPROC_REPO, "branch", "--show-current"]).stdout.strip()
     source_status = run(["git", "-C", PRAXIS_EXTPROC_REPO, "status", "--porcelain"]).stdout.strip()
-    if source_branch != "main":
-        raise RuntimeError(f"ExtProc source checkout must be on main, got {source_branch!r}")
     if source_status:
-        raise RuntimeError("ExtProc main checkout must be clean")
+        raise RuntimeError(f"ExtProc source checkout must be clean, got dirty worktree on {source_branch!r}")
     if EXPECTED_EXTPROC_MAIN_SHA and source_head != EXPECTED_EXTPROC_MAIN_SHA:
-        raise RuntimeError(f"ExtProc main SHA mismatch: expected={EXPECTED_EXTPROC_MAIN_SHA}, got={source_head}")
+        raise RuntimeError(f"ExtProc source SHA mismatch: expected={EXPECTED_EXTPROC_MAIN_SHA}, got={source_head}")
     node = f"{CLUSTER}-control-plane"
     node_images = run(["docker", "exec", node, "crictl", "images", "-o", "json"])
     expected_node_tag = f"docker.io/library/{EXTPROC_IMAGE}"
@@ -1727,6 +1853,40 @@ def main():
 
     resume_controller()
     converged({"provider-provider-proof-a", "provider-provider-proof-b"}, "two-provider-after-affinity")
+
+    # Proportional 80/20 selection (#122). Band is intentionally wide: prove
+    # bias toward A without requiring an exact ratio over 100 draws.
+    ref_a80, ref_b20 = make_ref("provider-proof-a", 80), make_ref("provider-proof-b", 20)
+    set_refs([ref_a80, ref_b20])
+    weighted = converged({"provider-provider-proof-a", "provider-provider-proof-b"}, "unequal-weight-80-20")
+    weights = {c.get("cluster"): c.get("traffic_weight") for c in weighted["candidates"]}
+    record("unequal_weight_wire_metadata",
+           weighted["selection_policy"] == {"mode": "weightedRandom"}
+           and weights.get("provider-provider-proof-a") == 80
+           and weights.get("provider-provider-proof-b") == 20
+           and {c.get("selection_group") for c in weighted["candidates"]} == {0},
+           json.dumps({"selection_policy": weighted["selection_policy"], "traffic_weights": weights},
+                      sort_keys=True))
+    sample("sample_unequal_80_20", a_min=55, a_max=95, b_min=5, b_max=45,
+           label="roughly_proportional_80_20", require_a_gt_b=True)
+
+    # weight 0 disables the second provider while keeping the ref.
+    set_refs([ref_a, make_ref("provider-proof-b", 0)])
+    disabled = converged({"provider-provider-proof-a"}, "weight-zero-disabled")
+    record("weight_zero_wire_metadata",
+           len(disabled["candidates"]) == 1
+           and disabled["candidates"][0].get("cluster") == "provider-provider-proof-a"
+           and not disabled.get("selection_policy"),
+           json.dumps(disabled, sort_keys=True))
+    disabled_sample = sample_single_provider("sample_weight_zero_disabled", "proof-a")
+    RESULT["samples"].append(disabled_sample)
+    write_json(EVIDENCE / "results.json", RESULT)
+    record("sample_weight_zero_disabled",
+           disabled_sample["failures"] == 0 and disabled_sample["proof_a"] == 100,
+           str(disabled_sample))
+
+    set_refs([ref_a, ref_b])
+    converged({"provider-provider-proof-a", "provider-provider-proof-b"}, "two-provider-before-withdrawal")
     set_refs([ref_a], wait=False)
     first_one = wait_for_published_candidates({"provider-provider-proof-a"}, "two-to-one")
     transition_probe("two_to_one_first_publication", {"proof-a", "proof-b"}, first_one)
@@ -1736,6 +1896,19 @@ def main():
     record("one_provider_after_withdrawal",
            all(r["status"] == 200 and r["provider"] == "proof-a" and r["checks"] for r in deterministic),
            "20 requests all attributed to proof-a after 2-to-1")
+    wait_for_withdrawal_route_cleanup("two-to-one")
+    post_cleanup_ingress_before = provider_ingress_counters()
+    post_cleanup = [gateway_request() for _ in range(20)]
+    post_cleanup_ingress_after = provider_ingress_counters()
+    write_json(EVIDENCE / "post-withdrawal-route-cleanup-requests.json", {
+        "requests": post_cleanup,
+        "provider_ingress_before": post_cleanup_ingress_before,
+        "provider_ingress_after": post_cleanup_ingress_after,
+        "provider_ingress_delta": counter_delta(post_cleanup_ingress_before, post_cleanup_ingress_after),
+    })
+    record("one_provider_after_route_cleanup",
+           all(r["status"] == 200 and r["provider"] == "proof-a" and r["checks"] for r in post_cleanup),
+           "20 requests reached A with successful HTTPS checks after B route cleanup")
 
 
 def cleanup():
@@ -1781,14 +1954,42 @@ def cleanup():
         (EVIDENCE / "cleanup.txt").write_text("provider proof resources retained; restore incomplete\n")
     elif (not MAIN_FAILURE and RESULT["assertions"] and all(a["result"] == "PASS" for a in RESULT["assertions"])
           and not RESULT.get("transition_failure")):
-        kubectl("-n", NAMESPACE, "delete", "externalprovider", "provider-proof-a", "provider-proof-b",
-                "--ignore-not-found", "--wait=true", check=False)
-        kubectl("-n", NAMESPACE, "delete", "secret", "provider-proof-a-credentials",
-                "provider-proof-b-credentials", "--ignore-not-found", "--wait=true", check=False)
-        if API_DB_EGRESS_POLICY:
-            kubectl("-n", API_NAMESPACE, "delete", "networkpolicy", "provider-selection-api-to-fixture-postgres",
-                    "--ignore-not-found", "--wait=true", check=False)
-        (EVIDENCE / "cleanup.txt").write_text("provider conditions and events captured before fixture Secret and CR cleanup; Kind API-to-Postgres policy removed\n")
+        try:
+            provider_delete = kubectl(
+                "-n", NAMESPACE, "delete", "externalprovider", "provider-proof-a", "provider-proof-b",
+                "--ignore-not-found", "--wait=true", check=False,
+                timeout=PROVIDER_CLEANUP_TIMEOUT_SECONDS,
+            )
+            write_json(EVIDENCE / "provider-cleanup-command.json", {
+                "timeout_seconds": PROVIDER_CLEANUP_TIMEOUT_SECONDS,
+                "returncode": provider_delete.returncode,
+                "stdout": scrub(provider_delete.stdout),
+                "stderr": scrub(provider_delete.stderr),
+            })
+            if provider_delete.returncode:
+                raise RuntimeError(f"ExternalProvider cleanup returned {provider_delete.returncode}")
+        except Exception as e:
+            RESULT["cleanup_failure"] = True
+            (EVIDENCE / "provider-cleanup-error.txt").write_text(str(e) + "\n")
+        if not RESULT.get("cleanup_failure"):
+            try:
+                secret_delete = kubectl(
+                    "-n", NAMESPACE, "delete", "secret", "provider-proof-a-credentials",
+                    "provider-proof-b-credentials", "--ignore-not-found", "--wait=true", check=False,
+                )
+                if secret_delete.returncode:
+                    raise RuntimeError(f"proof Secret cleanup returned {secret_delete.returncode}")
+                if API_DB_EGRESS_POLICY:
+                    policy_delete = kubectl(
+                        "-n", API_NAMESPACE, "delete", "networkpolicy", "provider-selection-api-to-fixture-postgres",
+                        "--ignore-not-found", "--wait=true", check=False,
+                    )
+                    if policy_delete.returncode:
+                        raise RuntimeError(f"fixture NetworkPolicy cleanup returned {policy_delete.returncode}")
+                (EVIDENCE / "cleanup.txt").write_text("provider conditions and events captured before staged ExternalProvider cleanup; fixture Secrets and Kind API-to-Postgres policy removed\n")
+            except Exception as e:
+                RESULT["cleanup_failure"] = True
+                (EVIDENCE / "provider-dependent-cleanup-error.txt").write_text(str(e) + "\n")
     else:
         (EVIDENCE / "cleanup.txt").write_text("provider proof resources preserved for diagnosis\n")
     if API_KEY_ID:
