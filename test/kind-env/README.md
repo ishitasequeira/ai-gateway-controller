@@ -60,7 +60,10 @@ status-gate loss/recovery. An
 explicitly non-Ready provider is excluded from the next resolved route set;
 the previously distributed overlay remains intact until a valid replacement
 is published. A newly-created provider with an empty phase is admitted once
-for bootstrap so its transport resources can establish Ready.
+for bootstrap so its transport resources can establish Ready. Provider A's
+private CA is also trusted through `tls.credentialName`: a missing CA Secret
+fails the provider's status, creating it restores traffic, and with no CA the
+Gateway rejects the provider certificate.
 
 The local configuration now provisions two independently serving tenant
 stacks. Tenant A is `models-as-a-service`; tenant B is

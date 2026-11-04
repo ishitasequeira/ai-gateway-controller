@@ -3,6 +3,7 @@ package controller
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -70,6 +71,10 @@ const (
 )
 
 var errCredentialNotReady = errors.New("effective provider credential is not ready")
+
+// errProviderCANotReady reports a tls.credentialName Secret that is missing or
+// has no CA, without saying which (see validateProviderCACredential).
+var errProviderCANotReady = errors.New("tls.credentialName must name a Secret in the Gateway namespace with a PEM CA certificate in key cacert or ca.crt")
 
 // Reconciler coordinates Praxis ExternalModel routes and ExternalProvider
 // transport. The model loop resolves one namespace-scoped route set and
@@ -153,9 +158,14 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r); err != nil {
 		return err
 	}
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &v1alpha1.ExternalProvider{}, providerCredentialNameIndex, indexProviderByCredentialName); err != nil {
+		return fmt.Errorf("index ExternalProviders by tls.credentialName: %w", err)
+	}
 	return builder.ControllerManagedBy(mgr).
 		For(&v1alpha1.ExternalProvider{}, builder.WithPredicates(inScope)).
-		WatchesMetadata(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.secretProviders), builder.WithPredicates(inScope)).
+		// Unfiltered: a tls.credentialName Secret is in the Gateway namespace,
+		// which can be outside the scope; secretProviders applies the scope.
+		WatchesMetadata(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.secretProviders)).
 		WatchesRawSource(source.Kind(mgr.GetCache(), tenant.NewMaasTenantConfig(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.tenantProviders))).
 		WatchesRawSource(source.Kind(mgr.GetCache(), tenant.NewAITenant(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.aitenantProviders))).
 		Complete(&providerReconciler{Reconciler: r})
@@ -167,19 +177,49 @@ func (r *providerReconciler) Reconcile(ctx context.Context, req reconcile.Reques
 	return r.ReconcileProvider(ctx, req)
 }
 
+// providerCredentialNameIndex indexes ExternalProviders by the Secret names
+// Istio reads for tls.credentialName, so a CA Secret event in a Gateway
+// namespace finds providers in any tenant.
+const providerCredentialNameIndex = "spec.config.tls.credentialName" //nolint:gosec // field index name, not a credential
+
+// istioCASuffix names the separate CA Secret Istio prefers for a credential.
+const istioCASuffix = "-cacert"
+
+func indexProviderByCredentialName(obj client.Object) []string {
+	provider, ok := obj.(*v1alpha1.ExternalProvider)
+	if !ok {
+		return nil
+	}
+	if name := strings.TrimSpace(provider.Spec.Config["tls.credentialName"]); name != "" {
+		return []string{name, name + istioCASuffix}
+	}
+	return nil
+}
+
 func (r *Reconciler) secretProviders(ctx context.Context, obj client.Object) []reconcile.Request {
-	if !r.namespaceAllowed(obj.GetNamespace()) {
-		return nil
+	var requests []reconcile.Request
+	if r.namespaceAllowed(obj.GetNamespace()) {
+		var providers v1alpha1.ExternalProviderList
+		if err := r.List(ctx, &providers, client.InNamespace(obj.GetNamespace())); err != nil {
+			r.Log.Error(err, "list providers for Secret event", "secret", obj.GetName())
+			return nil
+		}
+		for i := range providers.Items {
+			if providers.Items[i].Spec.Auth.SecretRef.Name == obj.GetName() {
+				requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&providers.Items[i])})
+			}
+		}
 	}
-	var providers v1alpha1.ExternalProviderList
-	if err := r.List(ctx, &providers, client.InNamespace(obj.GetNamespace())); err != nil {
-		r.Log.Error(err, "list providers for Secret event", "secret", obj.GetName())
-		return nil
+	// The name alone matches: which Gateway namespace a provider uses is
+	// decided by its tenant, and a redundant reconcile is harmless.
+	var trusting v1alpha1.ExternalProviderList
+	if err := r.List(ctx, &trusting, client.MatchingFields{providerCredentialNameIndex: obj.GetName()}); err != nil {
+		r.Log.Error(err, "list providers for CA Secret event", "secret", obj.GetName())
+		return requests
 	}
-	requests := make([]reconcile.Request, 0, len(providers.Items))
-	for i := range providers.Items {
-		if providers.Items[i].Spec.Auth.SecretRef.Name == obj.GetName() {
-			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&providers.Items[i])})
+	for i := range trusting.Items {
+		if r.namespaceAllowed(trusting.Items[i].Namespace) {
+			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&trusting.Items[i])})
 		}
 	}
 	return requests
@@ -275,6 +315,16 @@ func (r *Reconciler) secretModels(ctx context.Context, obj client.Object) []reco
 		}
 	}
 	requests := r.modelsReferencingProviders(ctx, obj.GetNamespace(), providerNames)
+	// Attachments and cross-namespace references check a provider's CA Secret
+	// in their own Gateway's namespace, so its events reach their models.
+	var trusting v1alpha1.ExternalProviderList
+	if err := r.List(ctx, &trusting, client.MatchingFields{providerCredentialNameIndex: obj.GetName()}); err != nil {
+		r.Log.Error(err, "list providers for CA Secret event", "secret", obj.GetName())
+		return requests
+	}
+	for i := range trusting.Items {
+		requests = append(requests, r.modelsReferencingProviders(ctx, trusting.Items[i].Namespace, map[string]bool{trusting.Items[i].Name: true})...)
+	}
 	// Models re-validate an auth override Secret, and credential copies
 	// follow it, whether or not they attach to other tenants.
 	var models v1alpha1.ExternalModelList
@@ -549,28 +599,16 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 		// attachments: its provider has no tenant-local transport, so only its
 		// own configuration is reported. While IPP serves the default tenant,
 		// it serves this namespace's models and reports their providers'
-		// status instead. A tenant namespace whose MaasTenantConfig
-		// maas-controller has not created yet falls through and is claimed
-		// below.
+		// status instead. Every tenant Gateway is in the configured Gateway
+		// namespace, where its CA Secret must be. A tenant namespace whose
+		// MaasTenantConfig maas-controller has not created yet falls through
+		// and is claimed below.
 		tenantNamespace, err := r.tenantNamespace(ctx, provider.Namespace)
 		if err != nil {
 			return reconcile.Result{}, err
 		}
 		if !tenantNamespace {
-			if err := r.releaseUnusedAttachmentProvider(ctx, &provider); err != nil {
-				return reconcile.Result{}, err
-			}
-			if _, _, ipp, err := r.defaultTenantGateway(ctx); err != nil || ipp {
-				return reconcile.Result{}, err
-			}
-			result := reconcile.Result{}
-			if controllerutil.ContainsFinalizer(&provider, externalProviderFinalizer) {
-				result.RequeueAfter = 30 * time.Second
-			}
-			if validationErr != nil {
-				return result, r.updateProviderStatus(ctx, &provider, providerPhaseFailed, reasonReconcileFailed, validationErr.Error())
-			}
-			return result, r.updateProviderStatus(ctx, &provider, resolver.PhaseReady, reasonValidated, "provider Secret reference is ready; Gateway attachments apply its transport")
+			return r.reconcileAttachmentOnlyProvider(ctx, &provider, validationErr)
 		}
 	}
 	// Claim the provider before any tenant gate: an absent MaasTenantConfig is
@@ -591,6 +629,14 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 		apiTranslationEnabled: live.apiTranslationEnabled,
 	}
 
+	if validationErr == nil {
+		validationErr = r.validateProviderCACredential(ctx, &provider, gatewayNamespace)
+		if transientReadError(validationErr) {
+			// A failed Secret read is not the provider's own failure: retry
+			// instead of withdrawing its transport and reporting it Failed.
+			return reconcile.Result{}, validationErr
+		}
+	}
 	if validationErr != nil {
 		cleanupErr := r.cleanupProviderTransport(ctx, provider.Namespace, provider.Name)
 		if statusErr := r.updateProviderStatus(ctx, &provider, providerPhaseFailed, reasonReconcileFailed, validationErr.Error()); statusErr != nil {
@@ -627,6 +673,34 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 		return reconcile.Result{}, err
 	}
 	return reconcile.Result{}, nil
+}
+
+// reconcileAttachmentOnlyProvider reports the status of a provider in a
+// namespace no tenant claims, given the result of its own validation, and
+// releases its deletion protection once no attachment uses it.
+func (r *Reconciler) reconcileAttachmentOnlyProvider(ctx context.Context, provider *v1alpha1.ExternalProvider, validationErr error) (reconcile.Result, error) {
+	if err := r.releaseUnusedAttachmentProvider(ctx, provider); err != nil {
+		return reconcile.Result{}, err
+	}
+	if _, _, ipp, err := r.defaultTenantGateway(ctx); err != nil || ipp {
+		return reconcile.Result{}, err
+	}
+	if validationErr == nil {
+		validationErr = r.validateProviderCACredential(ctx, provider, r.gatewayNamespace())
+		if transientReadError(validationErr) {
+			// A failed Secret read is not the provider's own failure: retry
+			// instead of reporting it Failed.
+			return reconcile.Result{}, validationErr
+		}
+	}
+	result := reconcile.Result{}
+	if controllerutil.ContainsFinalizer(provider, externalProviderFinalizer) {
+		result.RequeueAfter = 30 * time.Second
+	}
+	if validationErr != nil {
+		return result, r.updateProviderStatus(ctx, provider, providerPhaseFailed, reasonReconcileFailed, validationErr.Error())
+	}
+	return result, r.updateProviderStatus(ctx, provider, resolver.PhaseReady, reasonValidated, "provider Secret reference is ready; Gateway attachments apply its transport")
 }
 
 func (r *Reconciler) ensureExternalProviderFinalizer(ctx context.Context, provider *v1alpha1.ExternalProvider) error {
@@ -760,7 +834,7 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 	}
 
 	modelPtrs, modelOwners := homeModelInputs(models.Items, gatewayName, gatewayNamespace)
-	foreign, unready, err := r.foreignProviders(ctx, req.Namespace, modelPtrs)
+	foreign, unready, err := r.foreignProviders(ctx, req.Namespace, gatewayNamespace, modelPtrs)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
@@ -1372,7 +1446,7 @@ func (r *Reconciler) resolveRemainingHomeModels(
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	foreign, unready, err := r.foreignProviders(ctx, deleted.Namespace, modelPtrs)
+	foreign, unready, err := r.foreignProviders(ctx, deleted.Namespace, gatewayNamespace, modelPtrs)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
@@ -1639,6 +1713,7 @@ func (r *Reconciler) applyProviderTransport(ctx context.Context, provider *v1alp
 	route := resolver.Route{
 		Namespace: provider.Namespace, Provider: provider.Name, ProviderType: provider.Spec.Provider,
 		Endpoint: provider.Spec.Endpoint, Port: port, TLSCACertificates: strings.TrimSpace(provider.Spec.Config["tls.caCertificates"]),
+		TLSCredentialName: strings.TrimSpace(provider.Spec.Config["tls.credentialName"]),
 	}
 	service := providerService(route, provider.Namespace)
 	serviceEntry := providerServiceEntry(route, provider.Namespace)
@@ -1960,9 +2035,45 @@ func (r *Reconciler) validateProvider(_ context.Context, p *v1alpha1.ExternalPro
 	if p.Spec.Auth.SecretRef.Name == "" {
 		return errors.New("auth.secretRef.name is required")
 	}
-	if caCertificates := strings.TrimSpace(p.Spec.Config["tls.caCertificates"]); caCertificates != "" &&
-		(!strings.HasPrefix(caCertificates, "/") || strings.Contains(caCertificates, "..")) {
-		return errors.New("config tls.caCertificates must be an absolute mounted file path")
+	if err := resolver.ValidateProviderTrust(p.Spec.Config); err != nil {
+		return fmt.Errorf("config %w", err)
+	}
+	return nil
+}
+
+// validateProviderCACredential checks the tls.credentialName Secret in the
+// Gateway namespace, where Istio reads it. Without it the Gateway cannot verify
+// the provider, so this is reported on the provider instead of failing TLS.
+// Like Istio, it reads <name>-cacert and falls back to <name> only when that
+// Secret does not exist, taking the CA from the cacert key, or from ca.crt.
+// Tenants cannot read the Gateway namespace, so a missing Secret and one
+// without a CA return the same errProviderCANotReady; a failed read is
+// returned for retry.
+func (r *Reconciler) validateProviderCACredential(ctx context.Context, p *v1alpha1.ExternalProvider, gatewayNamespace string) error {
+	name := strings.TrimSpace(p.Spec.Config["tls.credentialName"])
+	if name == "" {
+		return nil
+	}
+	if r.APIReader == nil {
+		return errors.New("APIReader is required for CA Secret reads")
+	}
+	var secret corev1.Secret
+	err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: gatewayNamespace, Name: name + istioCASuffix}, &secret)
+	if apierrors.IsNotFound(err) {
+		err = r.APIReader.Get(ctx, client.ObjectKey{Namespace: gatewayNamespace, Name: name}, &secret)
+	}
+	if apierrors.IsNotFound(err) {
+		return errProviderCANotReady
+	}
+	if err != nil {
+		return fmt.Errorf("read tls.credentialName Secret: %w", err)
+	}
+	ca := secret.Data["cacert"]
+	if len(ca) == 0 {
+		ca = secret.Data["ca.crt"]
+	}
+	if !x509.NewCertPool().AppendCertsFromPEM(ca) {
+		return errProviderCANotReady
 	}
 	return nil
 }
@@ -2681,6 +2792,9 @@ func providerDestinationRuleAtGateway(route resolver.Route, gatewayName, ns, ten
 	tls := map[string]any{"mode": "SIMPLE", "sni": endpoint.host}
 	if route.TLSCACertificates != "" {
 		tls["caCertificates"] = route.TLSCACertificates
+	}
+	if route.TLSCredentialName != "" {
+		tls["credentialName"] = route.TLSCredentialName
 	}
 	name := providerServicePrefix + route.Provider
 	if tenantID != "" && tenantID != "models-as-a-service" {

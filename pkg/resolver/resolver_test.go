@@ -672,6 +672,58 @@ func TestResolve_RejectsUnsafeTLSCAPath(t *testing.T) {
 	}
 }
 
+func TestResolve_CarriesProviderTLSCredentialName(t *testing.T) {
+	m := model("ns1", "m", ref("p", "target", "/v1"))
+	p := provider("ns1", "p", PhaseReady, "provider.example.com", map[string]string{"tls.credentialName": "provider-ca"})
+	set, err := Resolve([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{p})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if got := set.Routes()[0].TLSCredentialName; got != "provider-ca" {
+		t.Fatalf("TLS credential name = %q", got)
+	}
+}
+
+func TestResolve_RejectsModelSpecificTLSCredentialNameOverride(t *testing.T) {
+	m := model("ns1", "m", ref("p", "target", "/v1"))
+	m.Spec.ExternalProviderRefs[0].Config = map[string]string{"tls.credentialName": "model-ca"}
+	p := provider("ns1", "p", PhaseReady, "provider.example.com", nil)
+
+	_, err := Resolve([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{p})
+	if err == nil || !strings.Contains(err.Error(), "tls.credentialName cannot override ExternalProvider p") {
+		t.Fatalf("Resolve error = %v, want explicit shared-transport credential override error", err)
+	}
+}
+
+func TestValidateProviderTrust(t *testing.T) {
+	cases := []struct {
+		name   string
+		config map[string]string
+		want   string
+	}{
+		{"none", nil, ""},
+		{"CA file", map[string]string{"tls.caCertificates": "/etc/provider-ca/ca.crt"}, ""},
+		{"credential name", map[string]string{"tls.credentialName": " provider-ca "}, ""},
+		{"relative CA file", map[string]string{"tls.caCertificates": "ca.crt"}, "tls.caCertificates must be an absolute mounted file path"},
+		{"invalid Secret name", map[string]string{"tls.credentialName": "provider/ca"}, "tls.credentialName must be a valid Secret name"},
+		{"both", map[string]string{"tls.caCertificates": "/etc/provider-ca/ca.crt", "tls.credentialName": "provider-ca"}, "mutually exclusive"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateProviderTrust(tc.config)
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("ValidateProviderTrust() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("ValidateProviderTrust() = %v, want error containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestResolve_PathErrors(t *testing.T) {
 	cases := []struct {
 		name string

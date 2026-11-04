@@ -1186,15 +1186,22 @@ func (r *Reconciler) resolveAttachedModel(ctx context.Context, t attachmentTenan
 		// The provider's own configuration decides, not the status another
 		// writer may have left. An invalid provider is kept as Failed, so the
 		// model reports why it cannot be used rather than that it is missing.
+		// Its CA Secret is checked where this tenant's Gateway reads it.
 		checked := providers.Items[i].DeepCopy()
 		checked.Status.Phase, checked.Status.Conditions = resolver.PhaseReady, nil
-		if err := r.validateProvider(ctx, checked); err != nil {
+		err := r.validateProvider(ctx, checked)
+		if err == nil {
+			if err = r.validateProviderCACredential(ctx, checked, t.gateway.Namespace); transientReadError(err) {
+				return err
+			}
+		}
+		if err != nil {
 			checked.Status.Phase = providerPhaseFailed
 			setCondition(&checked.Status.Conditions, conditionReady, metav1.ConditionFalse, reasonReconcileFailed, err.Error())
 		}
 		providerPtrs = append(providerPtrs, checked)
 	}
-	foreign, unready, err := r.foreignProviders(ctx, m.Namespace, []*v1alpha1.ExternalModel{m})
+	foreign, unready, err := r.foreignProviders(ctx, m.Namespace, t.gateway.Namespace, []*v1alpha1.ExternalModel{m})
 	if err != nil {
 		return err
 	}

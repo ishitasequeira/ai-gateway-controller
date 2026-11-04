@@ -2183,6 +2183,83 @@ func TestTransientCredentialReadKeepsServedAttachment(t *testing.T) {
 	}
 }
 
+func TestAttachmentChecksProviderCAInItsGatewayNamespace(t *testing.T) {
+	provider, secret := attachmentProvider("team")
+	provider.Spec.Config = map[string]string{"tls.credentialName": "provider-ca"}
+	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), gatewayB)
+	// The provider's own check passes in the configured Gateway namespace, but
+	// gateway-b, whose DestinationRule names the Secret, has no CA.
+	objects := append([]client.Object{provider, secret, model, providerCASecret(t, "openshift-ingress")},
+		attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := controllerTestClient(t, objects...)
+	r.Network, r.GatewayNamespace = "external-model", "openshift-ingress"
+	ctx := context.Background()
+	if _, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(provider)}); err != nil {
+		t.Fatal(err)
+	}
+	var got v1alpha1.ExternalProvider
+	if err := r.Get(ctx, client.ObjectKeyFromObject(provider), &got); err != nil || got.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("provider phase = %q, %v; want Ready", got.Status.Phase, err)
+	}
+	ruleName := attachmentDestinationRuleName(gatewayB, "team", "openai")
+
+	reconcileModel(t, r, model)
+	result := apiMeta.FindStatusCondition(gatewayResult(t, getModel(t, r, model), gatewayB).Conditions, conditionReady)
+	if result == nil || result.Reason != reasonProviderNotReady || !strings.Contains(result.Message, errProviderCANotReady.Error()) {
+		t.Fatalf("attachment without a CA in its Gateway namespace = %#v, want %s", result, reasonProviderNotReady)
+	}
+	if attachmentRouteExists(t, r, model) {
+		t.Fatal("attachment without a CA in its Gateway namespace has a route")
+	}
+	if _, err := getUnstructured(r, destinationRuleGVK, gatewayB.Namespace, ruleName); !apierrors.IsNotFound(err) {
+		t.Fatalf("attachment DestinationRule without its CA: %v", err)
+	}
+
+	caSecret := providerCASecret(t, gatewayB.Namespace)
+	if err := r.Create(ctx, caSecret); err != nil {
+		t.Fatal(err)
+	}
+	reconcileModel(t, r, model)
+	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, model)
+	if len(overlayEnvelope(t, r, "tenant-b").Overlay.Candidates) != 1 {
+		t.Fatal("the attachment is not served once its Gateway namespace has the CA")
+	}
+	rule, err := getUnstructured(r, destinationRuleGVK, gatewayB.Namespace, ruleName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name := nestedString(t, rule.Object, "spec", "trafficPolicy", "tls", "credentialName"); name != "provider-ca" {
+		t.Fatalf("attachment DestinationRule credentialName = %q, want provider-ca", name)
+	}
+
+	// A failed read is retried and keeps the served attachment.
+	reader := r.APIReader
+	r.APIReader = failingCASecretReader{Reader: reader, namespace: gatewayB.Namespace}
+	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); !apierrors.IsServiceUnavailable(err) {
+		t.Fatalf("reconcile on a failed CA Secret read = %v, want ServiceUnavailable to retry", err)
+	}
+	if len(overlayEnvelope(t, r, "tenant-b").Overlay.Candidates) != 1 {
+		t.Fatal("a failed CA Secret read withdrew the served attachment")
+	}
+
+	// Without its CA the provider leaves the overlay at once, so no new request
+	// selects it; its route and transport stay until in-flight requests drain.
+	r.APIReader = reader
+	if err := r.Delete(ctx, caSecret); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil || res.RequeueAfter != withdrawalRequeueInterval {
+		t.Fatalf("stage the withdrawal of a provider without its CA: result=%#v err=%v", res, err)
+	}
+	if candidates := overlayEnvelope(t, r, "tenant-b").Overlay.Candidates; len(candidates) != 0 {
+		t.Fatalf("overlay without the CA = %#v, want no candidates", candidates)
+	}
+	if ready := apiMeta.FindStatusCondition(gatewayResult(t, getModel(t, r, model), gatewayB).Conditions, conditionReady); ready == nil || ready.Status == metav1.ConditionTrue {
+		t.Fatalf("attachment without its CA = %#v, want not Ready", ready)
+	}
+}
+
 func TestServedAzureAttachmentStampsCredentialHeaderAnnotation(t *testing.T) {
 	// Azure apikey auth qualifies to strategy apikey + api-key header. The
 	// header is json:"-" on Credential and cannot survive the overlay

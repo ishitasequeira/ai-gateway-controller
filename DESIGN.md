@@ -568,6 +568,42 @@ omitted or equal namespace stays local and needs no grant.
   the tenant's own. Model-namespace transport is collected after the reconcile,
   once no HTTPRoute in the namespace uses it.
 
+### Provider TLS trust
+
+The Gateway reaches every provider with `tls.mode: SIMPLE` and the endpoint
+host as SNI, and verifies the provider certificate against its system roots.
+A provider whose certificate is signed by a private CA
+([RHOAIENG-102015](https://redhat.atlassian.net/browse/RHOAIENG-102015)) sets
+one of two `ExternalProvider` `spec.config` keys, which the Gateway-namespace
+DestinationRule carries for the provider's own tenant and for attachments:
+
+- **`tls.credentialName`** (preferred) names a Secret in the Gateway
+  namespace (`--gateway-namespace`, `openshift-ingress` by default), where
+  maas-controller places every tenant Gateway. Its `cacert` key holds the PEM
+  CA; Istio also reads `ca.crt`. Istio first reads a separate Secret named
+  `<credentialName>-cacert` and falls back to `<credentialName>` only when
+  that Secret does not exist. Istio delivers it to the Gateway over SDS, so
+  nothing is mounted and an updated Secret applies without a restart.
+- **`tls.caCertificates`** is the absolute path of a CA file already mounted
+  in the Gateway pod. The controller mounts nothing.
+
+Either CA must contain the full chain up to the root that issued the provider
+certificate. Istio accepts only one of the two keys, so setting both is
+rejected, as is an invalid Secret name. An `ExternalModel` reference cannot
+override either key, because the provider transport is shared. The controller
+reads the `tls.credentialName` Secret the way Istio does, in the namespace of
+the Gateway whose DestinationRule names it: the provider reconciler in its
+tenant's Gateway namespace, or in the configured Gateway namespace for a
+provider only attachments serve, and each attachment or cross-namespace
+reference in its own Gateway's namespace. A missing Secret, or one without a
+PEM CA, fails the provider's `Ready` condition, or excludes the provider from
+that attachment or reference, instead of a TLS failure at request time.
+Tenants cannot read the Gateway namespace, so both cases report the same
+message, which names neither the Secret read nor its namespace. A failed read
+is retried and does not withdraw what is served. Events for either Secret name
+in any namespace re-reconcile the providers naming it and the models that
+reference them.
+
 ### Consumer portal auth proxy
 
 `pkg/consumerportal` reconciles the MaaS consumer portal OIDC auth proxy

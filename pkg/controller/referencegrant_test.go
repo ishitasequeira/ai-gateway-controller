@@ -555,6 +555,46 @@ func TestUnreadyProviderCredentialSkipsOnlyInheritingReferences(t *testing.T) {
 	}
 }
 
+func TestForeignProviderCAIsCheckedInTheModelGatewayNamespace(t *testing.T) {
+	sharedProvider, sharedSecret := attachmentProvider("shared")
+	sharedProvider.Spec.Config = map[string]string{"tls.credentialName": "provider-ca"}
+	model := referenceProvider(attachmentModel("chat", "tenant-b", "chat-model", time.Unix(100, 0)), "shared")
+	// The provider's own check passes in the configured Gateway namespace, not
+	// in gateway-b, where the model's Gateway reads the CA.
+	objects := append([]client.Object{sharedProvider, sharedSecret, model, referenceGrant("shared", "tenant-b", ""), providerCASecret(t, "openshift-ingress")},
+		attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := controllerTestClient(t, objects...)
+	r.Network, r.GatewayNamespace = "external-model", "openshift-ingress"
+	ctx := context.Background()
+	if _, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(sharedProvider)}); err != nil {
+		t.Fatal(err)
+	}
+	ruleName := attachmentDestinationRuleName(gatewayB, "shared", "openai")
+
+	_, _ = r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+	if got := getModel(t, r, model); got.Status.Phase != modelPhaseFailed || readyReason(got) != reasonProviderNotReady {
+		t.Fatalf("model without a CA in its Gateway namespace = %q/%q %q, want ProviderNotReady", got.Status.Phase, readyReason(got), readyMessage(got))
+	}
+	if _, err := getUnstructured(r, destinationRuleGVK, gatewayB.Namespace, ruleName); !apierrors.IsNotFound(err) {
+		t.Fatalf("DestinationRule without its CA: %v", err)
+	}
+
+	if err := r.Create(ctx, providerCASecret(t, gatewayB.Namespace)); err != nil {
+		t.Fatal(err)
+	}
+	reconcileModel(t, r, model)
+	if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("model with a CA in its Gateway namespace = %q/%q %q, want Ready", got.Status.Phase, readyReason(got), readyMessage(got))
+	}
+	rule, err := getUnstructured(r, destinationRuleGVK, gatewayB.Namespace, ruleName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name := nestedString(t, rule.Object, "spec", "trafficPolicy", "tls", "credentialName"); name != "provider-ca" {
+		t.Fatalf("DestinationRule credentialName = %q, want provider-ca", name)
+	}
+}
+
 func TestOverrideSecretEventsReconcileTenantLocalModels(t *testing.T) {
 	sharedProvider, sharedSecret := attachmentProvider("shared")
 	modelSecret := func() *corev1.Secret {
