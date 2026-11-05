@@ -3,6 +3,7 @@
 package envtest_test
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -114,6 +115,17 @@ func awaitModelPublished(t *testing.T, c client.Client, model *inferencev1alpha1
 	t.Helper()
 	var routeName string
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		// The model is Ready only once its tenant's ExtProc is available.
+		// envtest runs no Deployment controller, so mark it available as its
+		// pods would make it.
+		var extProc appsv1.Deployment
+		require.NoError(collect, c.Get(t.Context(), client.ObjectKey{
+			Namespace: model.Namespace, Name: "payload-processing-external-model-" + model.Namespace,
+		}, &extProc))
+		require.NoError(collect, markAvailable(t.Context(), c, &extProc))
+		// It also waits for the Gateway to accept its route; envtest runs no
+		// Gateway controller either.
+		require.NoError(collect, markRouteAccepted(t.Context(), c, model.Namespace, "external-model-"+model.Name))
 		var actual inferencev1alpha1.ExternalModel
 		require.NoError(collect, c.Get(t.Context(), client.ObjectKeyFromObject(model), &actual))
 		require.Contains(collect, actual.Finalizers, externalModelFinalizer)
@@ -147,6 +159,21 @@ func awaitModelPublished(t *testing.T, c client.Client, model *inferencev1alpha1
 		routeName = actual.Status.HTTPRouteName
 	}, eventuallyTimeout, pollInterval, "the requested model and provider must be published with their workload")
 	return routeName
+}
+
+// awaitModelFailed waits until model reports Failed with reason and names no
+// HTTPRoute.
+func awaitModelFailed(t *testing.T, c client.Client, model *inferencev1alpha1.ExternalModel, reason string) {
+	t.Helper()
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		var actual inferencev1alpha1.ExternalModel
+		require.NoError(collect, c.Get(t.Context(), client.ObjectKeyFromObject(model), &actual))
+		require.Equal(collect, "Failed", actual.Status.Phase)
+		ready := apimeta.FindStatusCondition(actual.Status.Conditions, "Ready")
+		require.NotNil(collect, ready)
+		require.Equal(collect, reason, ready.Reason, ready.Message)
+		require.Empty(collect, actual.Status.HTTPRouteName)
+	}, eventuallyTimeout, pollInterval, "the model must report %s", reason)
 }
 
 // awaitGuardrailEnforced accepts one guardrail, attaches it through a
@@ -258,6 +285,51 @@ func awaitModelRemoved(t *testing.T, c client.Client, model *inferencev1alpha1.E
 		key.Name = "payload-processing-external-model-" + model.Namespace
 		require.True(collect, apierrors.IsNotFound(c.Get(t.Context(), key, &appsv1.Deployment{})), "ExtProc workload remains")
 	}, eventuallyTimeout, pollInterval, "deleting the last model must remove its routing and workload")
+}
+
+// markAvailable sets the Deployment's Available condition.
+func markAvailable(ctx context.Context, c client.Client, deployment *appsv1.Deployment) error {
+	for _, condition := range deployment.Status.Conditions {
+		if condition.Type == appsv1.DeploymentAvailable && condition.Status == corev1.ConditionTrue {
+			return nil
+		}
+	}
+	deployment.Status.Conditions = append(deployment.Status.Conditions, appsv1.DeploymentCondition{
+		Type: appsv1.DeploymentAvailable, Status: corev1.ConditionTrue, Reason: "MinimumReplicasAvailable",
+	})
+	return c.Status().Update(ctx, deployment)
+}
+
+// markRouteAccepted reports the HTTPRoute Accepted by the tenant's gateway, as
+// its Gateway controller would.
+func markRouteAccepted(ctx context.Context, c client.Client, namespace, name string) error {
+	route := &unstructured.Unstructured{}
+	route.SetAPIVersion("gateway.networking.k8s.io/v1")
+	route.SetKind("HTTPRoute")
+	if err := c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, route); err != nil {
+		return err
+	}
+	// Accepted already, unless for an earlier generation of the route.
+	if parents, _, _ := unstructured.NestedSlice(route.Object, "status", "parents"); len(parents) == 1 {
+		parent, _ := parents[0].(map[string]any)
+		if conditions, _, _ := unstructured.NestedSlice(parent, "conditions"); len(conditions) == 1 {
+			if condition, _ := conditions[0].(map[string]any); condition["observedGeneration"] == route.GetGeneration() {
+				return nil
+			}
+		}
+	}
+	parents := []any{map[string]any{
+		"parentRef":      map[string]any{"group": "gateway.networking.k8s.io", "kind": "Gateway", "name": gatewayName, "namespace": gatewayNamespace},
+		"controllerName": "istio.io/gateway-controller",
+		"conditions": []any{map[string]any{
+			"type": "Accepted", "status": string(metav1.ConditionTrue), "reason": "Accepted", "message": "Route was valid",
+			"observedGeneration": route.GetGeneration(), "lastTransitionTime": metav1.Now().UTC().Format(time.RFC3339),
+		}},
+	}}
+	if err := unstructured.SetNestedSlice(route.Object, parents, "status", "parents"); err != nil {
+		return err
+	}
+	return c.Status().Update(ctx, route)
 }
 
 func projectedSecretNames(deployment appsv1.Deployment) []string {
