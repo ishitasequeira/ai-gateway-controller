@@ -1,19 +1,22 @@
 # Pinned models-as-a-service source for ai-gateway-controller e2e.
 #
-# Latest main as of 2026-10-30 (7879675): 58 commits on from ccce775. Picked up
-# the AITenant/MaasTenantConfig deletion-deadlock fix (#1771), the not-ready
-# model re-check timer (#1787), TRLP update-conflict retries (#1758), the e2e
-# wait-timeout standardisation (#1759) and metadata-only CRD watches (#1711).
+# Latest main with published maas-api + maas-controller images as of 2026-11-04
+# (08858542). Tip of main (5e51759 chore(deps) #1811) had not published those
+# image tags yet. Seven commits on from 7879675, including the low-churn smoke
+# e2e subset (#1815), authoritative producer telemetry scope (#1721), consumer
+# portal path exemption (#1804), effect-based e2e waits (#1767), 3.5→3.6
+# migration fixes (#1781), geo-fencing routing (#1778), and client-facing
+# external model identity (#1728).
 #
 # Validate e2e when bumping this pin. E2E also deploys the MaaS images built from this
 # commit (test/e2e/scripts/maas-image-defaults.sh), so pin a models-as-a-service main commit
 # that published both maas-api and maas-controller images (maas-api builds only on its changes).
 # Both were published for this commit:
-#   docker manifest inspect quay.io/opendatahub/maas-api:7879675aa66d002425c7b32375d6d0156eaa0c56
-#   docker manifest inspect quay.io/opendatahub/maas-controller:7879675aa66d002425c7b32375d6d0156eaa0c56
+#   docker manifest inspect quay.io/opendatahub/maas-api:08858542cd3bba18175e02ba9b8418547f22ade2
+#   docker manifest inspect quay.io/opendatahub/maas-controller:08858542cd3bba18175e02ba9b8418547f22ade2
 # Override for one-off runs without editing this file:
 #   MAAS_COMMIT=<sha> ./test/e2e/scripts/prow_run_ai_gateway_controller_test.sh
 maas_repo=https://github.com/opendatahub-io/models-as-a-service
-maas_commit=7879675aa66d002425c7b32375d6d0156eaa0c56
+maas_commit=08858542cd3bba18175e02ba9b8418547f22ade2
 maas_ref=main
-updated_at=2026-10-30T00:00:00Z
+updated_at=2026-11-04T00:41:39Z

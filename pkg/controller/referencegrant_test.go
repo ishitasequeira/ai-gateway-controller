@@ -253,14 +253,44 @@ func TestAttachedModelOverrideCredentialIsModelLocalWithoutFallback(t *testing.T
 	if len(candidates) != 1 || candidates[0].StableID != "team/chat/shared/openai" || candidates[0].Credential.SecretRef.Name != modelCopy {
 		t.Fatalf("overlay candidates = %#v", candidates)
 	}
+	seedSafeExternalModelRuntime(t, r, "tenant-b", "tenant-b", nil)
 
 	// A missing model-local override never falls back to the provider-namespace Secret.
 	if err := r.Delete(context.Background(), modelSecret); err != nil {
 		t.Fatal(err)
 	}
-	reconcileModel(t, r, model)
+	request := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}
+	result, err := r.Reconcile(context.Background(), request)
+	if err != nil || result.RequeueAfter != withdrawalRequeueInterval {
+		t.Fatalf("stage attachment withdrawal after model-local credential loss: result=%#v err=%v", result, err)
+	}
+	if got := getModel(t, r, model); readyReason(got) != reasonAttachmentPending {
+		t.Fatalf("status = %q %q, want staged withdrawal while the old serving revision may select the provider", readyReason(got), readyMessage(got))
+	}
+	if !attachmentRouteExists(t, r, model) {
+		t.Fatal("accepted route was removed before the reduced ExtProc revision served")
+	}
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: modelCopy}, &copied); err != nil {
+		t.Fatalf("model-local credential copy removed before the drain: %v", err)
+	}
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: sharedCopy}, &copied); !apierrors.IsNotFound(err) {
+		t.Fatalf("provider default credential copy unexpectedly appeared during withdrawal: %v", err)
+	}
+	if candidates := overlayEnvelope(t, r, "tenant-b").Overlay.Candidates; len(candidates) != 0 {
+		t.Fatalf("reduced overlay = %#v, want no candidates", candidates)
+	}
+	markSafeExternalModelRuntimeCurrent(t, r, tenant.ID("tenant-b"), "tenant-b", false)
+	result, err = r.Reconcile(context.Background(), request)
+	if err != nil || result.RequeueAfter != withdrawalDrainDuration {
+		t.Fatalf("begin model-local credential drain after rollout: result=%#v err=%v", result, err)
+	}
+	markWithdrawalDrainElapsed(t, r, "tenant-b")
+	result, err = r.Reconcile(context.Background(), request)
+	if err != nil || result.RequeueAfter != 0 {
+		t.Fatalf("finish model-local credential drain: result=%#v err=%v", result, err)
+	}
 	if got := getModel(t, r, model); readyReason(got) != reasonProviderNotReady || !strings.Contains(readyMessage(got), "team/openai-key") {
-		t.Fatalf("status = %q %q, want the missing model-local Secret", readyReason(got), readyMessage(got))
+		t.Fatalf("status = %q %q, want the missing model-local Secret after cleanup", readyReason(got), readyMessage(got))
 	}
 	for _, name := range []string{modelCopy, sharedCopy} {
 		if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: name}, &copied); !apierrors.IsNotFound(err) {
@@ -340,6 +370,51 @@ func TestUnpermittedSiblingKeepsLastServingState(t *testing.T) {
 	}
 }
 
+func TestAllZeroCrossNamespaceReferenceWithdrawsAfterGrantRevocation(t *testing.T) {
+	ctx := context.Background()
+	sharedProvider, sharedSecret := attachmentProvider("shared")
+	model := referenceProvider(attachmentModel("chat", "tenant-b", "chat-model", time.Unix(100, 0)), "shared")
+	grant := referenceGrant("shared", "tenant-b", "openai")
+	objects := append([]client.Object{sharedProvider, sharedSecret, model, grant},
+		attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	request := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}
+	if _, err := r.Reconcile(ctx, request); err != nil {
+		t.Fatalf("initial granted serving reconcile: %v", err)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, model.Namespace, modelRouteName(model.Name)); err != nil {
+		t.Fatalf("initial granted route: %v", err)
+	}
+	if len(overlayEnvelope(t, r, model.Namespace).Overlay.Candidates) != 1 {
+		t.Fatal("expected the granted provider to be published before withdrawal")
+	}
+	var current v1alpha1.ExternalModel
+	if err := r.Get(ctx, client.ObjectKeyFromObject(model), &current); err != nil {
+		t.Fatal(err)
+	}
+	zero := 0
+	current.Spec.ExternalProviderRefs[0].Weight = &zero
+	if err := r.Update(ctx, &current); err != nil {
+		t.Fatalf("set cross-namespace provider weight to zero: %v", err)
+	}
+	if err := r.Delete(ctx, grant); err != nil {
+		t.Fatalf("revoke ReferenceGrant: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, request); !errors.Is(err, resolver.ErrNoRoutes) {
+		t.Fatalf("all-zero revoked-reference reconcile = %v, want ErrNoRoutes", err)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, model.Namespace, modelRouteName(model.Name)); !apierrors.IsNotFound(err) {
+		t.Fatalf("revoked zero-weight route = %v, want NotFound", err)
+	}
+	assertNoTenantOverlay(t, r)
+	got := getModel(t, r, model)
+	if got.Status.Phase != modelPhaseFailed || got.Status.ObservedGeneration != got.Generation ||
+		readyReason(got) != reasonNoRoutes {
+		t.Fatalf("revoked zero-weight model status = %q/%q at %d/%d, want current-generation Failed/NoRoutes",
+			got.Status.Phase, readyReason(got), got.Status.ObservedGeneration, got.Generation)
+	}
+}
+
 func TestLocalProviderCannotTakeOverHashedTransport(t *testing.T) {
 	sharedProvider, sharedSecret := attachmentProvider("shared")
 	_, localSecret := attachmentProvider("tenant-b")
@@ -391,9 +466,44 @@ func TestProviderTransportOutlivesTheRouteThatUsesIt(t *testing.T) {
 	if _, err := getUnstructured(r, serviceGVK, "tenant-b", serviceName); err != nil {
 		t.Fatalf("provider Service deleted while a route uses it: %v", err)
 	}
-	reconcileModel(t, r, model)
-	if _, err := getUnstructured(r, serviceGVK, "tenant-b", serviceName); !apierrors.IsNotFound(err) {
-		t.Fatalf("provider Service remains after its route stopped using it: %v", err)
+	result, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+	if err != nil {
+		t.Fatalf("reconcile provider namespace change: %v", err)
+	}
+	if result.RequeueAfter != withdrawalRequeueInterval {
+		t.Fatalf("withdrawal requeue = %s, want %s while the old serving revision is unverified", result.RequeueAfter, withdrawalRequeueInterval)
+	}
+	if _, err := getUnstructured(r, serviceGVK, "tenant-b", serviceName); err != nil {
+		// The old overlay may still select the cross-namespace provider. Its
+		// Service must remain until the replacement ExtProc revision is proven.
+		t.Fatalf("provider Service was removed during staged withdrawal: %v", err)
+	}
+	route := newHTTPRoute()
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: modelRouteName(model.Name)}, route); err != nil {
+		t.Fatalf("read route while withdrawal is pending: %v", err)
+	}
+	rules, _, err := unstructured.NestedSlice(route.Object, "spec", "rules")
+	if err != nil {
+		t.Fatal(err)
+	}
+	retainedOldBackend := false
+	for _, raw := range rules {
+		rule, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		backends, _, _ := unstructured.NestedSlice(rule, "backendRefs")
+		if len(backends) == 0 {
+			continue
+		}
+		backend, _ := backends[0].(map[string]any)
+		name, _ := backend["name"].(string)
+		if name == serviceName {
+			retainedOldBackend = true
+		}
+	}
+	if !retainedOldBackend {
+		t.Fatalf("HTTPRoute lost old cross-namespace backend %q before the replacement ExtProc revision was serving", serviceName)
 	}
 }
 
@@ -442,6 +552,46 @@ func TestUnreadyProviderCredentialSkipsOnlyInheritingReferences(t *testing.T) {
 	if len(candidates) != 1 || candidates[0].StableID != "tenant-b/override/shared/openai" ||
 		candidates[0].Credential.SecretRef != (envelope.SecretRef{Name: "openai-key", Namespace: "tenant-b", Key: "api-key"}) {
 		t.Fatalf("overlay candidates = %#v, want only the override", candidates)
+	}
+}
+
+func TestForeignProviderCAIsCheckedInTheModelGatewayNamespace(t *testing.T) {
+	sharedProvider, sharedSecret := attachmentProvider("shared")
+	sharedProvider.Spec.Config = map[string]string{"tls.credentialName": "provider-ca"}
+	model := referenceProvider(attachmentModel("chat", "tenant-b", "chat-model", time.Unix(100, 0)), "shared")
+	// The provider's own check passes in the configured Gateway namespace, not
+	// in gateway-b, where the model's Gateway reads the CA.
+	objects := append([]client.Object{sharedProvider, sharedSecret, model, referenceGrant("shared", "tenant-b", ""), providerCASecret(t, "openshift-ingress")},
+		attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := controllerTestClient(t, objects...)
+	r.Network, r.GatewayNamespace = "external-model", "openshift-ingress"
+	ctx := context.Background()
+	if _, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(sharedProvider)}); err != nil {
+		t.Fatal(err)
+	}
+	ruleName := attachmentDestinationRuleName(gatewayB, "shared", "openai")
+
+	_, _ = r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+	if got := getModel(t, r, model); got.Status.Phase != modelPhaseFailed || readyReason(got) != reasonProviderNotReady {
+		t.Fatalf("model without a CA in its Gateway namespace = %q/%q %q, want ProviderNotReady", got.Status.Phase, readyReason(got), readyMessage(got))
+	}
+	if _, err := getUnstructured(r, destinationRuleGVK, gatewayB.Namespace, ruleName); !apierrors.IsNotFound(err) {
+		t.Fatalf("DestinationRule without its CA: %v", err)
+	}
+
+	if err := r.Create(ctx, providerCASecret(t, gatewayB.Namespace)); err != nil {
+		t.Fatal(err)
+	}
+	reconcileModel(t, r, model)
+	if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("model with a CA in its Gateway namespace = %q/%q %q, want Ready", got.Status.Phase, readyReason(got), readyMessage(got))
+	}
+	rule, err := getUnstructured(r, destinationRuleGVK, gatewayB.Namespace, ruleName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name := nestedString(t, rule.Object, "spec", "trafficPolicy", "tls", "credentialName"); name != "provider-ca" {
+		t.Fatalf("DestinationRule credentialName = %q, want provider-ca", name)
 	}
 }
 

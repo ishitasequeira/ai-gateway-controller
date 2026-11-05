@@ -3,9 +3,16 @@ package controller
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"math/big"
 	"reflect"
 	"slices"
 	"strings"
@@ -83,7 +90,11 @@ func TestEnableExternalModelRoutesKeepsPostAuthForCompiledChecks(t *testing.T) {
 				return nil
 			}
 			routes := []resolver.Route{{Model: "demo-model", ClientName: "demo", Provider: "provider-a"}}
-			if err := r.enableExternalModelRoutes(context.Background(), "tenant-a", "tenant-a", "test-gateway", "gateway-system", routes); err != nil {
+			testTenant := attachmentTenant{
+				namespace: "tenant-a", tenantID: "tenant-a",
+				gateway: v1alpha1.NamespacedObjectReference{Name: "test-gateway", Namespace: "gateway-system"},
+			}
+			if _, err := r.enableExternalModelRoutes(context.Background(), testTenant, routes); err != nil {
 				t.Fatal(err)
 			}
 			patches := nestedSlice(t, applied.Object, "spec", "configPatches")
@@ -124,8 +135,21 @@ func controllerTestClient(t *testing.T, objects ...client.Object) *Reconciler {
 	scheme.AddKnownTypeWithName(tenant.MaasTenantConfigGVK.GroupVersion().WithKind("MaasTenantConfigList"), &unstructured.UnstructuredList{})
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&v1alpha1.ExternalModel{}, &v1alpha1.ExternalProvider{}).
+		WithIndex(&v1alpha1.ExternalProvider{}, providerCredentialNameIndex, indexProviderByCredentialName).
 		WithObjects(objects...).Build()
-	return &Reconciler{Client: fakeClient, APIReader: fakeClient}
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient}
+	r.readPodLogs = func(ctx context.Context, namespace, _, container string) (string, error) {
+		if container != externalModelExtProcContainer {
+			return "", fmt.Errorf("unexpected ExtProc container %q", container)
+		}
+		env, err := r.readPublishedEnvelope(ctx, namespace)
+		if err != nil || env == nil {
+			return "", err
+		}
+		revision := env.Revision.Value
+		return `accepted_revision="` + revision + `" serving_revision="` + revision + `"`, nil
+	}
+	return r
 }
 
 func legacyExternalModelRouteFilter(name, namespace, managedBy string) *unstructured.Unstructured {
@@ -182,7 +206,9 @@ func TestEnableExternalModelRoutesScopesHeaderPhaseFilterToGeneratedRoutes(t *te
 		expectedRoutes[name] = false
 		expectedResponseModeByRoute[name] = expectedResponseModes[index]
 	}
-	if err := r.enableExternalModelRoutes(context.Background(), "tenant-a", "tenant-a", "test-gateway", "gateway-system", routes); err != nil {
+	testTenant := attachmentTenant{namespace: "tenant-a", tenantID: "tenant-a",
+		gateway: v1alpha1.NamespacedObjectReference{Name: "test-gateway", Namespace: "gateway-system"}}
+	if _, err := r.enableExternalModelRoutes(context.Background(), testTenant, routes); err != nil {
 		t.Fatal(err)
 	}
 	if applied.GetName() != tenant.PayloadProcessingExternalModelEnvoyFilterName("tenant-a") {
@@ -197,13 +223,13 @@ func TestEnableExternalModelRoutesScopesHeaderPhaseFilterToGeneratedRoutes(t *te
 	}
 	patches := nestedSlice(t, applied.Object, "spec", "configPatches")
 	assertExternalModelRoutePatches(t, patches, expectedRoutes, expectedResponseModeByRoute, len(renderedRules))
-	if err := r.enableExternalModelRoutes(context.Background(), "tenant-a", "tenant-a", "test-gateway", "gateway-system", routes[:1]); err != nil {
+	if _, err := r.enableExternalModelRoutes(context.Background(), testTenant, routes[:1]); err != nil {
 		t.Fatal(err)
 	}
 	// stream_usage_inject needs the complete body with translation off too.
 	assertOpenAIOnlyRouteModes(t, nestedSlice(t, applied.Object, "spec", "configPatches"), "BUFFERED")
 	routes[0].APITranslationEnabled = true
-	if err := r.enableExternalModelRoutes(context.Background(), "tenant-a", "tenant-a", "test-gateway", "gateway-system", routes[:1]); err != nil {
+	if _, err := r.enableExternalModelRoutes(context.Background(), testTenant, routes[:1]); err != nil {
 		t.Fatal(err)
 	}
 	assertOpenAIOnlyRouteModes(t, nestedSlice(t, applied.Object, "spec", "configPatches"), "BUFFERED")
@@ -323,7 +349,9 @@ func TestEnableExternalModelRoutesDeletesOnlyOwnedRouteFilterWhenEmpty(t *testin
 	neighbor.SetLabels(map[string]string{"app.kubernetes.io/managed-by": "ai-gateway-controller", externalTenantLabel: "tenant-b"})
 	r := controllerTestClient(t, owned, foreign, neighbor)
 
-	if err := r.enableExternalModelRoutes(context.Background(), "tenant-a", "tenant-a", "test-gateway", "gateway-system", nil); err != nil {
+	testTenant := attachmentTenant{namespace: "tenant-a", tenantID: "tenant-a",
+		gateway: v1alpha1.NamespacedObjectReference{Name: "test-gateway", Namespace: "gateway-system"}}
+	if _, err := r.enableExternalModelRoutes(context.Background(), testTenant, nil); err != nil {
 		t.Fatal(err)
 	}
 	var got unstructured.Unstructured
@@ -829,6 +857,47 @@ func TestProviderTransportUsesConfiguredCAFileWithoutDisablingVerification(t *te
 	}
 	if got, found, err := unstructured.NestedBool(destination.Object, "spec", "trafficPolicy", "tls", "insecureSkipVerify"); err != nil || found && got {
 		t.Fatalf("provider TLS must retain verification: found=%v value=%v err=%v", found, got, err)
+	}
+}
+
+func TestProviderTransportUsesCredentialNameForCATrust(t *testing.T) {
+	route := resolver.Route{Provider: "provider", Endpoint: "provider.example.com", TLSCredentialName: "provider-ca"}
+	destination := providerDestinationRuleAtGateway(route, "gateway", "gateway-system", "models-as-a-service")
+	tls, _, _ := unstructured.NestedMap(destination.Object, "spec", "trafficPolicy", "tls")
+	want := map[string]any{"mode": "SIMPLE", "sni": "provider.example.com", "credentialName": "provider-ca"}
+	if !reflect.DeepEqual(tls, want) {
+		t.Fatalf("DestinationRule TLS = %#v, want %#v", tls, want)
+	}
+}
+
+func TestValidateProviderTLSConfig(t *testing.T) {
+	tests := []struct {
+		name   string
+		config map[string]string
+		want   string
+	}{
+		{name: "credential name", config: map[string]string{"tls.credentialName": "provider-ca"}},
+		{name: "CA file", config: map[string]string{"tls.caCertificates": "/etc/provider-ca/ca.crt"}},
+		{name: "invalid Secret name", config: map[string]string{"tls.credentialName": "Provider_CA"}, want: "config tls.credentialName must be a valid Secret name"},
+		{name: "both", config: map[string]string{"tls.caCertificates": "/etc/provider-ca/ca.crt", "tls.credentialName": "provider-ca"}, want: "config tls.caCertificates and tls.credentialName are mutually exclusive"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			provider := &v1alpha1.ExternalProvider{ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "tenant-a"}, Spec: v1alpha1.ExternalProviderSpec{
+				Endpoint: "provider.example.com", Config: tc.config,
+				Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "credentials"}},
+			}}
+			err := (&Reconciler{}).validateProvider(context.Background(), provider)
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("validateProvider() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("validateProvider() = %v, want error containing %q", err, tc.want)
+			}
+		})
 	}
 }
 
@@ -1853,6 +1922,286 @@ func TestReconcileRecoversProviderAfterSecretDeletionAndRestoration(t *testing.T
 	}
 }
 
+// testCACertificatePEM returns a self-signed CA certificate in PEM form.
+func testCACertificatePEM(t *testing.T) []byte {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "provider-ca"},
+		NotBefore: time.Now(), NotAfter: time.Now().Add(time.Hour),
+		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+// providerCASecret returns a provider-ca Secret holding a CA in namespace.
+func providerCASecret(t *testing.T, namespace string) *corev1.Secret {
+	t.Helper()
+	return &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "provider-ca", Namespace: namespace}, Data: map[string][]byte{"cacert": testCACertificatePEM(t)}}
+}
+
+func TestReconcileProviderReportsTLSCredentialSecretInGatewayNamespace(t *testing.T) {
+	provider := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "tenant-a", UID: "provider-uid"},
+		Spec: v1alpha1.ExternalProviderSpec{
+			Provider: "openai", Endpoint: "api.example.com",
+			Auth:   v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "credentials"}},
+			Config: map[string]string{"tls.credentialName": "provider-ca"},
+		},
+	}
+	credentials := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "credentials", Namespace: "tenant-a"}, Data: map[string][]byte{"api-key": []byte("secret")}}
+	// A same-named Secret in the provider namespace is not the one Istio reads.
+	decoy := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "provider-ca", Namespace: "tenant-a"}, Data: map[string][]byte{"cacert": testCACertificatePEM(t)}}
+	ait := controllerAITenant("tenant", "models-as-a-service", "tenant-a", "gateway", "gateway-system")
+	mtc := controllerMaasTenantConfig("tenant-a", "tenant", "models-as-a-service", "praxis")
+	r := controllerTestClient(t, provider, credentials, decoy, ait, mtc)
+	ctx := context.Background()
+	req := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(provider)}
+	getRule := func() (*unstructured.Unstructured, error) {
+		rule := &unstructured.Unstructured{}
+		rule.SetGroupVersionKind(destinationRuleGVK)
+		return rule, r.Get(ctx, client.ObjectKey{Namespace: "gateway-system", Name: "provider-provider-tenant"}, rule)
+	}
+
+	reconcileStatus := func() v1alpha1.ExternalProviderStatus {
+		t.Helper()
+		if _, err := r.ReconcileProvider(ctx, req); err != nil {
+			t.Fatalf("ReconcileProvider() = %v", err)
+		}
+		var got v1alpha1.ExternalProvider
+		if err := r.Get(ctx, req.NamespacedName, &got); err != nil {
+			t.Fatal(err)
+		}
+		return got.Status
+	}
+	// A missing Secret and one without a CA read the same, so the tenant's
+	// status does not disclose what the Gateway namespace holds.
+	assertFailed := func() {
+		t.Helper()
+		status := reconcileStatus()
+		ready := apiMeta.FindStatusCondition(status.Conditions, conditionReady)
+		if status.Phase != providerPhaseFailed || ready == nil || ready.Status != metav1.ConditionFalse || ready.Message != errProviderCANotReady.Error() {
+			t.Fatalf("provider status = %#v, want Failed with %q", status, errProviderCANotReady)
+		}
+		if _, err := getRule(); !apierrors.IsNotFound(err) {
+			t.Fatalf("DestinationRule without its CA Secret: err = %v, want NotFound", err)
+		}
+	}
+
+	assertFailed()
+
+	caSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "provider-ca", Namespace: "gateway-system"}, Data: map[string][]byte{"tls.crt": testCACertificatePEM(t)}}
+	if err := r.Create(ctx, caSecret); err != nil {
+		t.Fatal(err)
+	}
+	assertFailed()
+
+	caSecret.Data = map[string][]byte{"cacert": testCACertificatePEM(t)}
+	if err := r.Update(ctx, caSecret); err != nil {
+		t.Fatal(err)
+	}
+	if status := reconcileStatus(); status.Phase != resolver.PhaseReady {
+		t.Fatalf("provider status with CA Secret = %#v, want Ready", status)
+	}
+	destination, err := getRule()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := nestedString(t, destination.Object, "spec", "trafficPolicy", "tls", "credentialName"); got != "provider-ca" {
+		t.Fatalf("DestinationRule credentialName = %q, want provider-ca", got)
+	}
+}
+
+func TestSharedProviderReportsTLSCredentialSecretInGatewayNamespace(t *testing.T) {
+	provider, secret := attachmentProvider("team")
+	provider.Spec.Config = map[string]string{"tls.credentialName": "provider-ca"}
+	r := controllerTestClient(t, provider, secret)
+	r.GatewayNamespace = "openshift-ingress"
+	ctx := context.Background()
+	reconcileStatus := func() (string, *metav1.Condition) {
+		t.Helper()
+		if _, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(provider)}); err != nil {
+			t.Fatal(err)
+		}
+		var got v1alpha1.ExternalProvider
+		if err := r.Get(ctx, client.ObjectKeyFromObject(provider), &got); err != nil {
+			t.Fatal(err)
+		}
+		return got.Status.Phase, apiMeta.FindStatusCondition(got.Status.Conditions, conditionReady)
+	}
+
+	// No MaasTenantConfig serves this namespace; attachments still render the
+	// credential, so its Secret is checked in the Gateway namespace.
+	if phase, ready := reconcileStatus(); phase != providerPhaseFailed || ready == nil || ready.Message != errProviderCANotReady.Error() {
+		t.Fatalf("provider = %s/%#v, want Failed with %q", phase, ready, errProviderCANotReady)
+	}
+	caSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "provider-ca", Namespace: "openshift-ingress"}, Data: map[string][]byte{"cacert": testCACertificatePEM(t)}}
+	if err := r.Create(ctx, caSecret); err != nil {
+		t.Fatal(err)
+	}
+	if phase, ready := reconcileStatus(); phase != resolver.PhaseReady || ready == nil || ready.Reason != reasonValidated {
+		t.Fatalf("provider with its CA Secret = %s/%#v, want Ready/%s", phase, ready, reasonValidated)
+	}
+}
+
+// failingCASecretReader fails reads of the provider-ca Secrets in namespace.
+type failingCASecretReader struct {
+	client.Reader
+	namespace string
+}
+
+func (r failingCASecretReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*corev1.Secret); ok && key.Namespace == r.namespace && strings.HasPrefix(key.Name, "provider-ca") {
+		return apierrors.NewServiceUnavailable("etcd is unavailable")
+	}
+	return r.Reader.Get(ctx, key, obj, opts...)
+}
+
+func TestReconcileProviderRetriesTransientCASecretRead(t *testing.T) {
+	provider := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "tenant-a", UID: "provider-uid"},
+		Spec: v1alpha1.ExternalProviderSpec{
+			Provider: "openai", Endpoint: "api.example.com",
+			Auth:   v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "credentials"}},
+			Config: map[string]string{"tls.credentialName": "provider-ca"},
+		},
+	}
+	credentials := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "credentials", Namespace: "tenant-a"}, Data: map[string][]byte{"api-key": []byte("secret")}}
+	caSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "provider-ca", Namespace: "gateway-system"}, Data: map[string][]byte{"cacert": testCACertificatePEM(t)}}
+	ait := controllerAITenant("tenant", "models-as-a-service", "tenant-a", "gateway", "gateway-system")
+	mtc := controllerMaasTenantConfig("tenant-a", "tenant", "models-as-a-service", "praxis")
+	r := controllerTestClient(t, provider, credentials, caSecret, ait, mtc)
+	ctx := context.Background()
+	req := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(provider)}
+	if _, err := r.ReconcileProvider(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := r.APIReader
+	r.APIReader = failingCASecretReader{Reader: reader, namespace: "gateway-system"}
+	if _, err := r.ReconcileProvider(ctx, req); !apierrors.IsServiceUnavailable(err) {
+		t.Fatalf("ReconcileProvider() on a failed CA Secret read = %v, want ServiceUnavailable to retry", err)
+	}
+	var got v1alpha1.ExternalProvider
+	if err := r.Get(ctx, req.NamespacedName, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("provider phase after a failed CA Secret read = %q, want Ready", got.Status.Phase)
+	}
+	rule := &unstructured.Unstructured{}
+	rule.SetGroupVersionKind(destinationRuleGVK)
+	if err := r.Get(ctx, client.ObjectKey{Namespace: "gateway-system", Name: "provider-provider-tenant"}, rule); err != nil {
+		t.Fatalf("DestinationRule after a failed CA Secret read: %v", err)
+	}
+
+	r.APIReader = reader
+	if _, err := r.ReconcileProvider(ctx, req); err != nil {
+		t.Fatalf("recovery reconcile = %v", err)
+	}
+}
+
+func TestSharedProviderRetriesTransientCASecretRead(t *testing.T) {
+	provider, secret := attachmentProvider("team")
+	provider.Spec.Config = map[string]string{"tls.credentialName": "provider-ca"}
+	caSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "provider-ca", Namespace: "openshift-ingress"}, Data: map[string][]byte{"cacert": testCACertificatePEM(t)}}
+	r := controllerTestClient(t, provider, secret, caSecret)
+	r.GatewayNamespace = "openshift-ingress"
+	ctx := context.Background()
+	req := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(provider)}
+	if _, err := r.ReconcileProvider(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+
+	r.APIReader = failingCASecretReader{Reader: r.APIReader, namespace: "openshift-ingress"}
+	if _, err := r.ReconcileProvider(ctx, req); !apierrors.IsServiceUnavailable(err) {
+		t.Fatalf("ReconcileProvider() on a failed CA Secret read = %v, want ServiceUnavailable to retry", err)
+	}
+	var got v1alpha1.ExternalProvider
+	if err := r.Get(ctx, req.NamespacedName, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("provider phase after a failed CA Secret read = %q, want Ready", got.Status.Phase)
+	}
+}
+
+func TestValidateProviderCACredentialFollowsIstioLookup(t *testing.T) {
+	provider := &v1alpha1.ExternalProvider{Spec: v1alpha1.ExternalProviderSpec{Config: map[string]string{"tls.credentialName": "provider-ca"}}}
+	ca := map[string][]byte{"cacert": testCACertificatePEM(t)}
+	noCA := map[string][]byte{"tls.crt": testCACertificatePEM(t)}
+	secret := func(name string, data map[string][]byte) client.Object {
+		return &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "gateway-system"}, Data: data}
+	}
+	elsewhere := secret("provider-ca", ca)
+	elsewhere.SetNamespace("tenant-a")
+	for name, tc := range map[string]struct {
+		secrets []client.Object
+		wantErr error
+	}{
+		"single Secret":             {secrets: []client.Object{secret("provider-ca", ca)}},
+		"ca.crt key":                {secrets: []client.Object{secret("provider-ca", map[string][]byte{"ca.crt": ca["cacert"]})}},
+		"separate CA Secret":        {secrets: []client.Object{secret("provider-ca-cacert", ca)}},
+		"separate CA Secret first":  {secrets: []client.Object{secret("provider-ca", ca), secret("provider-ca-cacert", noCA)}, wantErr: errProviderCANotReady},
+		"neither Secret":            {wantErr: errProviderCANotReady},
+		"only in another namespace": {secrets: []client.Object{elsewhere}, wantErr: errProviderCANotReady},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := controllerTestClient(t, tc.secrets...)
+			if err := r.validateProviderCACredential(context.Background(), provider, "gateway-system"); !errors.Is(err, tc.wantErr) {
+				t.Fatalf("validateProviderCACredential() = %v, want %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestCACredentialSecretEventsEnqueueTrustingProviders(t *testing.T) {
+	trusting := &v1alpha1.ExternalProvider{ObjectMeta: metav1.ObjectMeta{Name: "trusting", Namespace: "tenant-a"}, Spec: v1alpha1.ExternalProviderSpec{
+		Config: map[string]string{"tls.credentialName": "provider-ca"},
+	}}
+	other := &v1alpha1.ExternalProvider{ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: "tenant-b"}, Spec: v1alpha1.ExternalProviderSpec{
+		Config: map[string]string{"tls.credentialName": "other-ca"},
+	}}
+	r := controllerTestClient(t, trusting, other)
+	secret := &metav1.PartialObjectMetadata{ObjectMeta: metav1.ObjectMeta{Name: "provider-ca", Namespace: "gateway-system"}}
+	want := []reconcile.Request{{NamespacedName: client.ObjectKeyFromObject(trusting)}}
+	if got := r.secretProviders(context.Background(), secret); !reflect.DeepEqual(got, want) {
+		t.Fatalf("secretProviders() = %v, want %v", got, want)
+	}
+	// Istio prefers a separate <name>-cacert Secret, so its events count too.
+	separate := &metav1.PartialObjectMetadata{ObjectMeta: metav1.ObjectMeta{Name: "provider-ca-cacert", Namespace: "gateway-system"}}
+	if got := r.secretProviders(context.Background(), separate); !reflect.DeepEqual(got, want) {
+		t.Fatalf("secretProviders(%s) = %v, want %v", separate.Name, got, want)
+	}
+	r.Namespace = "tenant-b"
+	if got := r.secretProviders(context.Background(), secret); len(got) != 0 {
+		t.Fatalf("secretProviders() outside the namespace scope = %v, want none", got)
+	}
+}
+
+func TestCACredentialSecretEventsEnqueueModelsOfTrustingProviders(t *testing.T) {
+	provider, secret := attachmentProvider("team")
+	provider.Spec.Config = map[string]string{"tls.credentialName": "provider-ca"}
+	attached := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), gatewayB)
+	// A same-named provider in another namespace does not trust the Secret.
+	unrelated := attachmentModel("other", "elsewhere", "other-model", time.Unix(100, 0), gatewayB)
+	r := controllerTestClient(t, provider, secret, attached, unrelated)
+	want := []reconcile.Request{{NamespacedName: client.ObjectKeyFromObject(attached)}}
+	for _, name := range []string{"provider-ca", "provider-ca-cacert"} {
+		event := &metav1.PartialObjectMetadata{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: gatewayB.Namespace}}
+		if got := r.secretModels(context.Background(), event); !reflect.DeepEqual(got, want) {
+			t.Fatalf("secretModels(%s) = %v, want %v", name, got, want)
+		}
+	}
+}
+
 func TestModelTransportFailureDoesNotRewriteProviderReadiness(t *testing.T) {
 	r, model := reconcilerFixture(t)
 	req := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}
@@ -1928,11 +2277,46 @@ func TestExternalModelDeletionRepublishesRemainingRoutes(t *testing.T) {
 	if err := r.Delete(context.Background(), model); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
+	result, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+	if err != nil {
 		t.Fatal(err)
+	}
+	if result.RequeueAfter <= 0 {
+		t.Fatalf("deleted model withdrawal requeue = %s, want old route drain", result.RequeueAfter)
 	}
 	deletedRoute := &unstructured.Unstructured{}
 	deletedRoute.SetGroupVersionKind(schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"})
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: modelRouteName(model.Name)}, deletedRoute); err != nil {
+		t.Fatalf("deleted model route should remain until the old ExtProc drains: %v", err)
+	}
+	seedSafeExternalModelRuntime(t, r, "tenant", model.Namespace, []*v1alpha1.ExternalModel{sibling})
+	result, err = r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RequeueAfter != withdrawalDrainDuration {
+		t.Fatalf("deleted model drain requeue = %s, want %s", result.RequeueAfter, withdrawalDrainDuration)
+	}
+	var drainOverlay corev1.ConfigMap
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: model.Namespace, Name: "routing-overlay"}, &drainOverlay); err != nil {
+		t.Fatal(err)
+	}
+	var drainState withdrawalDrainState
+	if err := json.Unmarshal([]byte(drainOverlay.Annotations[withdrawalDrainAnnotation]), &drainState); err != nil {
+		t.Fatalf("decode drain state: %v", err)
+	}
+	drainState.StartedAt = time.Now().Add(-withdrawalDrainDuration - time.Second)
+	drainStateRaw, err := json.Marshal(drainState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainOverlay.Annotations[withdrawalDrainAnnotation] = string(drainStateRaw)
+	if err := r.Update(context.Background(), &drainOverlay); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
+		t.Fatal(err)
+	}
 	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: modelRouteName(model.Name)}, deletedRoute); !apierrors.IsNotFound(err) {
 		t.Fatalf("deleted model route = %v, want NotFound", err)
 	}
@@ -2124,16 +2508,8 @@ func TestReconcileAppliesCandidateTransportBeforePublishingRandomSelection(t *te
 	}
 }
 
-func TestReconcileRejectsUnequalWeightsBeforeTransportOrPublication(t *testing.T) {
+func TestReconcileAcceptsUnequalWeightsAndPublishesWeightedRandom(t *testing.T) {
 	r, model := reconcilerFixture(t)
-	var providerA v1alpha1.ExternalProvider
-	if err := r.Get(context.Background(), client.ObjectKey{Namespace: model.Namespace, Name: "provider"}, &providerA); err != nil {
-		t.Fatal(err)
-	}
-	providerA.Status.Phase = resolver.PhaseReady
-	if err := r.Status().Update(context.Background(), &providerA); err != nil {
-		t.Fatal(err)
-	}
 	providerB := &v1alpha1.ExternalProvider{
 		ObjectMeta: metav1.ObjectMeta{Name: "provider-b", Namespace: model.Namespace, UID: "provider-b-uid"},
 		Spec: v1alpha1.ExternalProviderSpec{Provider: "openai", Endpoint: "b.example.com",
@@ -2149,35 +2525,328 @@ func TestReconcileRejectsUnequalWeightsBeforeTransportOrPublication(t *testing.T
 	}); err != nil {
 		t.Fatal(err)
 	}
-	unequalWeight := 2
-	model.Spec.ExternalProviderRefs = append(model.Spec.ExternalProviderRefs, v1alpha1.ExternalProviderRef{
-		Ref: v1alpha1.ExternalProviderReference{Name: "provider-b"}, TargetModel: "gpt-b", APIFormat: "openai-chat",
-		Path: "/v1/chat/completions", Weight: &unequalWeight,
-	})
+	if _, err := r.ReconcileProvider(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(providerB)}); err != nil {
+		t.Fatalf("ReconcileProvider provider-b: %v", err)
+	}
+	weightEighty, weightTwenty := 80, 20
+	model.Spec.ExternalProviderRefs = []v1alpha1.ExternalProviderRef{
+		{Ref: v1alpha1.ExternalProviderReference{Name: "provider"}, TargetModel: "gpt", APIFormat: "openai-chat",
+			Path: "/v1/chat/completions", Weight: &weightEighty},
+		{Ref: v1alpha1.ExternalProviderReference{Name: "provider-b"}, TargetModel: "gpt-b", APIFormat: "openai-chat",
+			Path: "/v1/chat/completions", Weight: &weightTwenty},
+	}
 	if err := r.Update(context.Background(), model); err != nil {
 		t.Fatal(err)
 	}
 	r.KnownClusters = append(r.KnownClusters, "provider-provider-b")
-	transportApplied, overlayPublished := false, false
-	r.ApplyResource = func(context.Context, client.Client, unstructured.Unstructured) error {
-		transportApplied = true
-		return nil
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
+		t.Fatalf("Reconcile error = %v, want success for unequal weights", err)
 	}
-	r.PublishOverlay = func(context.Context, *resolver.ResolvedRouteSet, envelope.Scope, envelope.Options) (publisher.Result, error) {
-		overlayPublished = true
-		return publisher.Result{}, nil
+	var published corev1.ConfigMap
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: model.Namespace, Name: "routing-overlay"}, &published); err != nil {
+		t.Fatal(err)
 	}
-	_, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
-	if !errors.Is(err, envelope.ErrWeightUnsupported) {
-		t.Fatalf("Reconcile error = %v, want WeightUnsupported", err)
+	var env envelope.Envelope
+	if err := json.Unmarshal([]byte(published.Data["routing-overlay.json"]), &env); err != nil {
+		t.Fatal(err)
 	}
-	if transportApplied || overlayPublished {
-		t.Fatalf("unsupported weights changed serving resources: transportApplied=%t overlayPublished=%t",
-			transportApplied, overlayPublished)
+	var policy struct {
+		Mode string `json:"mode"`
+	}
+	if err := json.Unmarshal(env.Overlay.SelectionPolicy, &policy); err != nil || policy.Mode != "weightedRandom" || len(env.Overlay.Candidates) != 2 {
+		t.Fatalf("overlay = policy %s candidates %#v, want weightedRandom with two candidates (err=%v)",
+			env.Overlay.SelectionPolicy, env.Overlay.Candidates, err)
+	}
+	want := map[string]uint32{"provider-provider": 80, "provider-provider-b": 20}
+	for _, candidate := range env.Overlay.Candidates {
+		if candidate.SelectionGroup == nil || *candidate.SelectionGroup != 0 {
+			t.Fatalf("candidate %s selection_group = %v, want 0", candidate.Cluster, candidate.SelectionGroup)
+		}
+		if candidate.TrafficWeight == nil || *candidate.TrafficWeight != want[candidate.Cluster] {
+			t.Fatalf("candidate %s traffic_weight = %v, want %d", candidate.Cluster, candidate.TrafficWeight, want[candidate.Cluster])
+		}
+	}
+	var got v1alpha1.ExternalModel
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(model), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("model phase = %q, want Ready", got.Status.Phase)
 	}
 }
 
-func TestUnequalWeightModelDoesNotFailOrBlockHealthySiblingDeletion(t *testing.T) {
+func TestReconcileAllZeroWeightsWithdrawsPreviouslyPublishedRoute(t *testing.T) {
+	ctx := context.Background()
+	r, model := reconcilerFixture(t)
+	req := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("initial serving reconcile: %v", err)
+	}
+	var overlay corev1.ConfigMap
+	if err := r.Get(ctx, client.ObjectKey{Namespace: model.Namespace, Name: "routing-overlay"}, &overlay); err != nil {
+		t.Fatalf("initial serving overlay: %v", err)
+	}
+	route := &unstructured.Unstructured{}
+	route.SetGroupVersionKind(schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"})
+	if err := r.Get(ctx, client.ObjectKey{Namespace: model.Namespace, Name: modelRouteName(model.Name)}, route); err != nil {
+		t.Fatalf("initial serving HTTPRoute: %v", err)
+	}
+	var current v1alpha1.ExternalModel
+	if err := r.Get(ctx, client.ObjectKeyFromObject(model), &current); err != nil {
+		t.Fatal(err)
+	}
+	zero := 0
+	current.Spec.ExternalProviderRefs[0].Weight = &zero
+	if err := r.Update(ctx, &current); err != nil {
+		t.Fatalf("set all provider weights to zero: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); !errors.Is(err, resolver.ErrNoRoutes) {
+		t.Fatalf("all-zero reconcile = %v, want ErrNoRoutes", err)
+	}
+	var residualOverlay corev1.ConfigMap
+	if err := r.Get(ctx, client.ObjectKey{Namespace: model.Namespace, Name: "routing-overlay"}, &residualOverlay); !apierrors.IsNotFound(err) {
+		t.Fatalf("overlay after all-zero update = err %v, labels %v, annotations %v, data %v; want NotFound",
+			err, residualOverlay.Labels, residualOverlay.Annotations, residualOverlay.Data)
+	}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: model.Namespace, Name: modelRouteName(model.Name)}, route); !apierrors.IsNotFound(err) {
+		t.Fatalf("HTTPRoute after all-zero update = %v, want NotFound", err)
+	}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(model), &current); err != nil {
+		t.Fatal(err)
+	}
+	if current.Status.Phase != "Failed" || current.Status.ObservedGeneration != current.Generation ||
+		!hasConditionReason(current.Status.Conditions, conditionReady, reasonNoRoutes) {
+		t.Fatalf("all-zero ExternalModel status = %#v, want current generation Failed with Ready=False/NoRoutes", current.Status)
+	}
+}
+
+func TestReconcileAllZeroWeightsWithdrawsDespiteProviderFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		providerGone bool
+	}{
+		{name: "unready provider"},
+		{name: "missing provider", providerGone: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			r, model := reconcilerFixture(t)
+			req := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}
+			if _, err := r.Reconcile(ctx, req); err != nil {
+				t.Fatalf("initial serving reconcile: %v", err)
+			}
+			routeKey := client.ObjectKey{Namespace: model.Namespace, Name: modelRouteName(model.Name)}
+			if _, err := getUnstructured(r, httpRouteGVK, routeKey.Namespace, routeKey.Name); err != nil {
+				t.Fatalf("initial serving HTTPRoute: %v", err)
+			}
+
+			var provider v1alpha1.ExternalProvider
+			providerKey := client.ObjectKey{Namespace: model.Namespace, Name: "provider"}
+			if err := r.Get(ctx, providerKey, &provider); err != nil {
+				t.Fatal(err)
+			}
+			if tc.providerGone {
+				if err := r.Delete(ctx, &provider); err != nil {
+					t.Fatalf("delete provider: %v", err)
+				}
+			} else {
+				provider.Status.Phase = "Pending"
+				provider.Status.Conditions = []metav1.Condition{{
+					Type: conditionReady, Status: metav1.ConditionFalse, Reason: "Reconciling",
+					Message: "test provider is unavailable", LastTransitionTime: metav1.Now(),
+				}}
+				if err := r.Status().Update(ctx, &provider); err != nil {
+					t.Fatalf("mark provider unready: %v", err)
+				}
+			}
+			var current v1alpha1.ExternalModel
+			if err := r.Get(ctx, client.ObjectKeyFromObject(model), &current); err != nil {
+				t.Fatal(err)
+			}
+			zero := 0
+			current.Spec.ExternalProviderRefs[0].Weight = &zero
+			if err := r.Update(ctx, &current); err != nil {
+				t.Fatalf("set explicit zero weight: %v", err)
+			}
+			if _, err := r.Reconcile(ctx, req); !errors.Is(err, resolver.ErrNoRoutes) {
+				t.Fatalf("all-zero reconcile = %v, want ErrNoRoutes", err)
+			}
+			if _, err := getUnstructured(r, httpRouteGVK, routeKey.Namespace, routeKey.Name); !apierrors.IsNotFound(err) {
+				t.Fatalf("HTTPRoute after all-zero update = %v, want NotFound", err)
+			}
+			var residual corev1.ConfigMap
+			if err := r.Get(ctx, client.ObjectKey{Namespace: model.Namespace, Name: "routing-overlay"}, &residual); !apierrors.IsNotFound(err) {
+				t.Fatalf("routing overlay after all-zero update = %v, want NotFound", err)
+			}
+			if err := r.Get(ctx, client.ObjectKeyFromObject(model), &current); err != nil {
+				t.Fatal(err)
+			}
+			if current.Status.ObservedGeneration != current.Generation || current.Status.Phase != "Failed" ||
+				!hasConditionReason(current.Status.Conditions, conditionReady, reasonNoRoutes) {
+				t.Fatalf("all-zero ExternalModel status = %#v, want current-generation Failed/NoRoutes", current.Status)
+			}
+		})
+	}
+}
+
+func reconcilerWithSiblingProvider(t *testing.T) (*Reconciler, *v1alpha1.ExternalModel, *v1alpha1.ExternalModel, *v1alpha1.ExternalProvider) {
+	t.Helper()
+	r, model := reconcilerFixture(t)
+	providerB := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "provider-b", Namespace: model.Namespace, UID: "provider-b-uid"},
+		Spec: v1alpha1.ExternalProviderSpec{Provider: "openai", Endpoint: "b.example.com",
+			Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "provider-b-credentials"}}},
+		Status: v1alpha1.ExternalProviderStatus{Phase: resolver.PhaseReady},
+	}
+	if err := r.Create(context.Background(), providerB); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Create(context.Background(), &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "provider-b-credentials", Namespace: model.Namespace},
+		Data:       map[string][]byte{"api-key": []byte("fixture-only-provider-b-secret")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.ReconcileProvider(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(providerB)}); err != nil {
+		t.Fatalf("ReconcileProvider provider-b: %v", err)
+	}
+	sibling := model.DeepCopy()
+	sibling.Name, sibling.UID, sibling.ResourceVersion = "sibling", "sibling-uid", ""
+	sibling.Status = v1alpha1.ExternalModelStatus{}
+	sibling.Spec.ExternalProviderRefs = []v1alpha1.ExternalProviderRef{{
+		Ref: v1alpha1.ExternalProviderReference{Name: providerB.Name}, TargetModel: "gpt-sibling",
+		APIFormat: "openai-chat", Path: "/v1/chat/completions",
+	}}
+	if err := r.Create(context.Background(), sibling); err != nil {
+		t.Fatal(err)
+	}
+	r.KnownClusters = append(r.KnownClusters, "provider-provider-b")
+	return r, model, sibling, providerB
+}
+
+func TestAllZeroModelWithdrawsWithoutAffectingHealthySibling(t *testing.T) {
+	ctx := context.Background()
+	r, model, sibling, _ := reconcilerWithSiblingProvider(t)
+	for _, current := range []*v1alpha1.ExternalModel{model, sibling} {
+		if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(current)}); err != nil {
+			t.Fatalf("initial reconcile %s: %v", current.Name, err)
+		}
+	}
+	zero := 0
+	var current v1alpha1.ExternalModel
+	if err := r.Get(ctx, client.ObjectKeyFromObject(model), &current); err != nil {
+		t.Fatal(err)
+	}
+	current.Spec.ExternalProviderRefs[0].Weight = &zero
+	if err := r.Update(ctx, &current); err != nil {
+		t.Fatalf("set model weight to zero: %v", err)
+	}
+	result, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+	if err != nil || result.RequeueAfter <= 0 {
+		t.Fatalf("reconcile all-zero model beside healthy sibling: %v", err)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, model.Namespace, modelRouteName(model.Name)); err != nil {
+		t.Fatalf("disabled model HTTPRoute should remain during the serving-revision drain: %v", err)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, sibling.Namespace, modelRouteName(sibling.Name)); err != nil {
+		t.Fatalf("healthy sibling HTTPRoute was removed: %v", err)
+	}
+	var overlay corev1.ConfigMap
+	if err := r.Get(ctx, client.ObjectKey{Namespace: model.Namespace, Name: "routing-overlay"}, &overlay); err != nil {
+		t.Fatalf("sibling routing overlay: %v", err)
+	}
+	var published envelope.Envelope
+	if err := json.Unmarshal([]byte(overlay.Data["routing-overlay.json"]), &published); err != nil {
+		t.Fatal(err)
+	}
+	if len(published.Overlay.Candidates) != 1 || published.Overlay.Candidates[0].StableID != "sibling/provider-provider-b" {
+		t.Fatalf("overlay candidates after model withdrawal = %#v, want only sibling provider", published.Overlay.Candidates)
+	}
+	if _, err := getUnstructured(r, serviceGVK, model.Namespace, providerServicePrefix+"provider-b"); err != nil {
+		t.Fatalf("healthy sibling provider Service was removed: %v", err)
+	}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(model), &current); err != nil {
+		t.Fatal(err)
+	}
+	if current.Status.Phase != "Failed" || current.Status.ObservedGeneration != current.Generation ||
+		!hasConditionReason(current.Status.Conditions, conditionReady, reasonNoRoutes) {
+		t.Fatalf("disabled model status = %#v, want current-generation Failed/NoRoutes", current.Status)
+	}
+	seedSafeExternalModelRuntime(t, r, "tenant", model.Namespace, []*v1alpha1.ExternalModel{&current, sibling})
+	result, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+	if err != nil || result.RequeueAfter != withdrawalDrainDuration {
+		t.Fatalf("start all-zero model drain: result=%#v err=%v", result, err)
+	}
+	markWithdrawalDrainElapsed(t, r, model.Namespace)
+	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
+		t.Fatalf("finish all-zero model drain: %v", err)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, model.Namespace, modelRouteName(model.Name)); !apierrors.IsNotFound(err) {
+		t.Fatalf("disabled model HTTPRoute after serving revision drained = %v, want NotFound", err)
+	}
+}
+
+func TestAllZeroModelWithdrawalPreservesSiblingLastKnownGoodOnResolutionFailure(t *testing.T) {
+	ctx := context.Background()
+	r, model, sibling, providerB := reconcilerWithSiblingProvider(t)
+	for _, current := range []*v1alpha1.ExternalModel{model, sibling} {
+		if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(current)}); err != nil {
+			t.Fatalf("initial reconcile %s: %v", current.Name, err)
+		}
+	}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(providerB), providerB); err != nil {
+		t.Fatal(err)
+	}
+	providerB.Status.Phase = "Pending"
+	providerB.Status.Conditions = []metav1.Condition{{
+		Type: conditionReady, Status: metav1.ConditionFalse, Reason: "Reconciling",
+		Message: "temporary test failure", LastTransitionTime: metav1.Now(),
+	}}
+	if err := r.Status().Update(ctx, providerB); err != nil {
+		t.Fatalf("mark sibling provider unready: %v", err)
+	}
+	zero := 0
+	var current v1alpha1.ExternalModel
+	if err := r.Get(ctx, client.ObjectKeyFromObject(model), &current); err != nil {
+		t.Fatal(err)
+	}
+	current.Spec.ExternalProviderRefs[0].Weight = &zero
+	if err := r.Update(ctx, &current); err != nil {
+		t.Fatalf("set disabled model weight to zero: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); !errors.Is(err, resolver.ErrNoRoutes) {
+		t.Fatalf("reconcile with unready sibling = %v, want ErrNoRoutes", err)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, model.Namespace, modelRouteName(model.Name)); !apierrors.IsNotFound(err) {
+		t.Fatalf("disabled model HTTPRoute = %v, want NotFound", err)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, sibling.Namespace, modelRouteName(sibling.Name)); err != nil {
+		t.Fatalf("sibling last-known HTTPRoute was removed: %v", err)
+	}
+	var overlay corev1.ConfigMap
+	if err := r.Get(ctx, client.ObjectKey{Namespace: model.Namespace, Name: "routing-overlay"}, &overlay); err != nil {
+		t.Fatalf("last-known overlay: %v", err)
+	}
+	var published envelope.Envelope
+	if err := json.Unmarshal([]byte(overlay.Data["routing-overlay.json"]), &published); err != nil {
+		t.Fatal(err)
+	}
+	if len(published.Overlay.Candidates) != 1 || published.Overlay.Candidates[0].StableID != "sibling/provider-provider-b" {
+		t.Fatalf("overlay candidates = %#v, want only sibling last-known candidate", published.Overlay.Candidates)
+	}
+	if _, err := getUnstructured(r, serviceGVK, model.Namespace, providerServicePrefix+"provider-b"); err != nil {
+		t.Fatalf("sibling last-known provider Service was removed: %v", err)
+	}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(model), &current); err != nil {
+		t.Fatal(err)
+	}
+	if current.Status.Phase != "Failed" || current.Status.ObservedGeneration != current.Generation ||
+		!hasConditionReason(current.Status.Conditions, conditionReady, reasonNoRoutes) {
+		t.Fatalf("disabled model status = %#v, want current-generation Failed/NoRoutes", current.Status)
+	}
+}
+
+func TestUnequalWeightModelStaysReadyBesideHealthySibling(t *testing.T) {
 	ctx := context.Background()
 	r, healthy := reconcilerFixture(t)
 	providerB := &v1alpha1.ExternalProvider{
@@ -2197,18 +2866,22 @@ func TestUnequalWeightModelDoesNotFailOrBlockHealthySiblingDeletion(t *testing.T
 		t.Fatalf("ReconcileProvider provider-b: %v", err)
 	}
 	weightOne, weightTwo := 1, 2
-	bad := healthy.DeepCopy()
-	bad.Name, bad.UID, bad.ResourceVersion = "bad", "bad-uid", ""
-	bad.Status = v1alpha1.ExternalModelStatus{}
-	bad.Spec.ExternalProviderRefs = []v1alpha1.ExternalProviderRef{
+	weighted := healthy.DeepCopy()
+	weighted.Name, weighted.UID, weighted.ResourceVersion = "weighted", "weighted-uid", ""
+	weighted.Status = v1alpha1.ExternalModelStatus{}
+	weighted.Spec.ExternalProviderRefs = []v1alpha1.ExternalProviderRef{
 		{Ref: v1alpha1.ExternalProviderReference{Name: "provider"}, TargetModel: "gpt", APIFormat: "openai-chat", Path: "/v1/chat/completions", Weight: &weightOne},
 		{Ref: v1alpha1.ExternalProviderReference{Name: "provider-b"}, TargetModel: "gpt-b", APIFormat: "openai-chat", Path: "/v1/chat/completions", Weight: &weightTwo},
 	}
-	if err := r.Create(ctx, bad); err != nil {
+	if err := r.Create(ctx, weighted); err != nil {
 		t.Fatal(err)
 	}
+	r.KnownClusters = append(r.KnownClusters, "provider-provider-b")
+	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(weighted)}); err != nil {
+		t.Fatalf("unequal-weight model reconciliation failed: %v", err)
+	}
 	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(healthy)}); err != nil {
-		t.Fatalf("healthy sibling reconciliation failed due to invalid weights: %v", err)
+		t.Fatalf("healthy sibling reconciliation failed: %v", err)
 	}
 	var published corev1.ConfigMap
 	if err := r.Get(ctx, client.ObjectKey{Namespace: healthy.Namespace, Name: "routing-overlay"}, &published); err != nil {
@@ -2218,124 +2891,117 @@ func TestUnequalWeightModelDoesNotFailOrBlockHealthySiblingDeletion(t *testing.T
 	if err := json.Unmarshal([]byte(published.Data["routing-overlay.json"]), &overlay); err != nil {
 		t.Fatal(err)
 	}
-	if len(overlay.Overlay.Candidates) != 1 || overlay.Overlay.Candidates[0].Name != healthy.Name {
-		t.Fatalf("published candidates = %#v, want only healthy model", overlay.Overlay.Candidates)
+	if len(overlay.Overlay.Candidates) < 2 {
+		t.Fatalf("published candidates = %#v, want both models", overlay.Overlay.Candidates)
 	}
-	var gotBad v1alpha1.ExternalModel
-	if err := r.Get(ctx, client.ObjectKeyFromObject(bad), &gotBad); err != nil {
+	for _, model := range []*v1alpha1.ExternalModel{healthy, weighted} {
+		var got v1alpha1.ExternalModel
+		if err := r.Get(ctx, client.ObjectKeyFromObject(model), &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Status.Phase != resolver.PhaseReady {
+			t.Fatalf("model %s phase = %q, want Ready", model.Name, got.Status.Phase)
+		}
+	}
+	if err := r.Delete(ctx, healthy); err != nil {
 		t.Fatal(err)
 	}
-	if gotBad.Status.Phase != "Failed" {
-		t.Fatalf("invalid model phase = %q, want Failed", gotBad.Status.Phase)
+	result, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(healthy)})
+	if err != nil || result.RequeueAfter <= 0 {
+		t.Fatalf("stage healthy model deletion: result=%#v err=%v", result, err)
 	}
-	var gotHealthy v1alpha1.ExternalModel
-	if err := r.Get(ctx, client.ObjectKeyFromObject(healthy), &gotHealthy); err != nil {
-		t.Fatal(err)
+	seedSafeExternalModelRuntime(t, r, "tenant", healthy.Namespace, []*v1alpha1.ExternalModel{weighted})
+	result, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(healthy)})
+	if err != nil || result.RequeueAfter != withdrawalDrainDuration {
+		t.Fatalf("start healthy model deletion drain: result=%#v err=%v", result, err)
 	}
-	if gotHealthy.Status.Phase != resolver.PhaseReady {
-		t.Fatalf("healthy model phase = %q, want Ready", gotHealthy.Status.Phase)
-	}
-	if err := r.Delete(ctx, &gotHealthy); err != nil {
-		t.Fatal(err)
-	}
+	markWithdrawalDrainElapsed(t, r, healthy.Namespace)
 	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(healthy)}); err != nil {
-		t.Fatalf("healthy sibling deletion blocked by invalid weights: %v", err)
+		t.Fatalf("finish healthy model deletion: %v", err)
 	}
-	if err := r.Get(ctx, client.ObjectKeyFromObject(healthy), &gotHealthy); !apierrors.IsNotFound(err) {
+	if err := r.Get(ctx, client.ObjectKeyFromObject(healthy), &v1alpha1.ExternalModel{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("deleted healthy model still exists: %v", err)
-	}
-	if err := r.Get(ctx, client.ObjectKey{Namespace: healthy.Namespace, Name: "routing-overlay"}, &published); !apierrors.IsNotFound(err) {
-		t.Fatalf("stale overlay remains after healthy sibling deletion: %v", err)
 	}
 }
 
-func TestCrossModelSelectionConflictsDoNotBlockUnrelatedModel(t *testing.T) {
-	weightOne, weightTwo := 1, 2
-	for _, tc := range []struct {
-		name       string
-		firstRefs  []v1alpha1.ExternalProviderRef
-		secondRefs []v1alpha1.ExternalProviderRef
-		wantErr    error
-	}{
-		{name: "unequal weights", firstRefs: []v1alpha1.ExternalProviderRef{{Ref: v1alpha1.ExternalProviderReference{Name: "provider"}, Weight: &weightOne}},
-			secondRefs: []v1alpha1.ExternalProviderRef{{Ref: v1alpha1.ExternalProviderReference{Name: "provider-b"}, Weight: &weightTwo}}, wantErr: envelope.ErrWeightUnsupported},
-		{name: "repeated provider", firstRefs: []v1alpha1.ExternalProviderRef{{Ref: v1alpha1.ExternalProviderReference{Name: "provider"}}, {Ref: v1alpha1.ExternalProviderReference{Name: "provider-b"}}},
-			secondRefs: []v1alpha1.ExternalProviderRef{{Ref: v1alpha1.ExternalProviderReference{Name: "provider"}}}, wantErr: envelope.ErrDuplicateProvider},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
-			r, healthy := reconcilerFixture(t)
-			providerB := &v1alpha1.ExternalProvider{ObjectMeta: metav1.ObjectMeta{Name: "provider-b", Namespace: healthy.Namespace, UID: "provider-b-uid"},
-				Spec: v1alpha1.ExternalProviderSpec{Provider: "openai", Endpoint: "b.example.com",
-					Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "provider-b-credentials"}}},
-				Status: v1alpha1.ExternalProviderStatus{Phase: resolver.PhaseReady}}
-			if err := r.Create(ctx, providerB); err != nil {
-				t.Fatal(err)
-			}
-			if err := r.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "provider-b-credentials", Namespace: healthy.Namespace},
-				Data: map[string][]byte{"api-key": []byte("fixture-only-secret")}}); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(providerB)}); err != nil {
-				t.Fatalf("ReconcileProvider provider-b: %v", err)
-			}
-			newAlias := func(name string, refs []v1alpha1.ExternalProviderRef) *v1alpha1.ExternalModel {
-				for i := range refs {
-					refs[i].TargetModel, refs[i].APIFormat, refs[i].Path = "gpt", "openai-chat", "/v1/chat/completions"
-				}
-				return &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: healthy.Namespace, UID: types.UID(name + "-uid")},
-					Spec: v1alpha1.ExternalModelSpec{ModelName: "shared", ExternalProviderRefs: refs}}
-			}
-			first, second := newAlias("first", tc.firstRefs), newAlias("second", tc.secondRefs)
-			for _, model := range []*v1alpha1.ExternalModel{first, second} {
-				if err := r.Create(ctx, model); err != nil {
-					t.Fatal(err)
-				}
-			}
-			r.KnownClusters = append(r.KnownClusters, "provider-provider-b")
-			if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(healthy)}); err != nil {
-				t.Fatalf("unrelated model reconciliation failed: %v", err)
-			}
-			var overlay corev1.ConfigMap
-			if err := r.Get(ctx, client.ObjectKey{Namespace: healthy.Namespace, Name: "routing-overlay"}, &overlay); err != nil {
-				t.Fatal(err)
-			}
-			var published envelope.Envelope
-			if err := json.Unmarshal([]byte(overlay.Data["routing-overlay.json"]), &published); err != nil {
-				t.Fatal(err)
-			}
-			if len(published.Overlay.Candidates) != 1 || published.Overlay.Candidates[0].Name != healthy.Name {
-				t.Fatalf("unrelated model overlay candidates = %#v", published.Overlay.Candidates)
-			}
-			for _, model := range []*v1alpha1.ExternalModel{first, second} {
-				var got v1alpha1.ExternalModel
-				if err := r.Get(ctx, client.ObjectKeyFromObject(model), &got); err != nil {
-					t.Fatal(err)
-				}
-				if got.Status.Phase != "Failed" {
-					t.Fatalf("conflicting model status = %#v, want %v", got.Status, tc.wantErr)
-				}
-			}
-			if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(first)}); !errors.Is(err, tc.wantErr) {
-				t.Fatalf("conflicting model error = %v, want %v", err, tc.wantErr)
-			}
-			var current v1alpha1.ExternalModel
-			if err := r.Get(ctx, client.ObjectKeyFromObject(healthy), &current); err != nil {
-				t.Fatal(err)
-			}
-			if current.Status.Phase != resolver.PhaseReady {
-				t.Fatalf("unrelated model phase = %q, want Ready", current.Status.Phase)
-			}
-			if err := r.Delete(ctx, &current); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(healthy)}); err != nil {
-				t.Fatalf("unrelated model deletion blocked: %v", err)
-			}
-			if err := r.Get(ctx, client.ObjectKeyFromObject(healthy), &current); !apierrors.IsNotFound(err) {
-				t.Fatalf("unrelated model remains after deletion: %v", err)
-			}
-		})
+func TestCrossModelDuplicateProviderDoesNotBlockUnrelatedModel(t *testing.T) {
+	ctx := context.Background()
+	r, healthy := reconcilerFixture(t)
+	providerB := &v1alpha1.ExternalProvider{ObjectMeta: metav1.ObjectMeta{Name: "provider-b", Namespace: healthy.Namespace, UID: "provider-b-uid"},
+		Spec: v1alpha1.ExternalProviderSpec{Provider: "openai", Endpoint: "b.example.com",
+			Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "provider-b-credentials"}}},
+		Status: v1alpha1.ExternalProviderStatus{Phase: resolver.PhaseReady}}
+	if err := r.Create(ctx, providerB); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "provider-b-credentials", Namespace: healthy.Namespace},
+		Data: map[string][]byte{"api-key": []byte("fixture-only-secret")}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(providerB)}); err != nil {
+		t.Fatalf("ReconcileProvider provider-b: %v", err)
+	}
+	newAlias := func(name string, refs []v1alpha1.ExternalProviderRef) *v1alpha1.ExternalModel {
+		for i := range refs {
+			refs[i].TargetModel, refs[i].APIFormat, refs[i].Path = "gpt", "openai-chat", "/v1/chat/completions"
+		}
+		return &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: healthy.Namespace, UID: types.UID(name + "-uid")},
+			Spec: v1alpha1.ExternalModelSpec{ModelName: "shared", ExternalProviderRefs: refs}}
+	}
+	first := newAlias("first", []v1alpha1.ExternalProviderRef{
+		{Ref: v1alpha1.ExternalProviderReference{Name: "provider"}},
+		{Ref: v1alpha1.ExternalProviderReference{Name: "provider-b"}},
+	})
+	second := newAlias("second", []v1alpha1.ExternalProviderRef{
+		{Ref: v1alpha1.ExternalProviderReference{Name: "provider"}},
+	})
+	for _, model := range []*v1alpha1.ExternalModel{first, second} {
+		if err := r.Create(ctx, model); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r.KnownClusters = append(r.KnownClusters, "provider-provider-b")
+	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(healthy)}); err != nil {
+		t.Fatalf("unrelated model reconciliation failed: %v", err)
+	}
+	var overlay corev1.ConfigMap
+	if err := r.Get(ctx, client.ObjectKey{Namespace: healthy.Namespace, Name: "routing-overlay"}, &overlay); err != nil {
+		t.Fatal(err)
+	}
+	var published envelope.Envelope
+	if err := json.Unmarshal([]byte(overlay.Data["routing-overlay.json"]), &published); err != nil {
+		t.Fatal(err)
+	}
+	if len(published.Overlay.Candidates) != 1 || published.Overlay.Candidates[0].Name != healthy.Name {
+		t.Fatalf("unrelated model overlay candidates = %#v", published.Overlay.Candidates)
+	}
+	for _, model := range []*v1alpha1.ExternalModel{first, second} {
+		var got v1alpha1.ExternalModel
+		if err := r.Get(ctx, client.ObjectKeyFromObject(model), &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Status.Phase != "Failed" {
+			t.Fatalf("conflicting model status = %#v, want Failed", got.Status)
+		}
+	}
+	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(first)}); !errors.Is(err, envelope.ErrDuplicateProvider) {
+		t.Fatalf("conflicting model error = %v, want ErrDuplicateProvider", err)
+	}
+	var current v1alpha1.ExternalModel
+	if err := r.Get(ctx, client.ObjectKeyFromObject(healthy), &current); err != nil {
+		t.Fatal(err)
+	}
+	if current.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("unrelated model phase = %q, want Ready", current.Status.Phase)
+	}
+	if err := r.Delete(ctx, &current); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(healthy)}); err != nil {
+		t.Fatalf("unrelated model deletion blocked: %v", err)
+	}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(healthy), &current); !apierrors.IsNotFound(err) {
+		t.Fatalf("unrelated model remains after deletion: %v", err)
 	}
 }
 
@@ -4036,5 +4702,134 @@ func TestProviderTenantReadinessMessageAbsentMaasTenantConfig(t *testing.T) {
 	}
 	if !strings.Contains(msg, "missing") {
 		t.Fatalf("message = %q", msg)
+	}
+}
+
+func TestAllZeroScopedModelWithdrawalPreservesSameAliasSiblingLastKnownGood(t *testing.T) {
+	ctx := context.Background()
+	r, model, sibling, providerB := reconcilerWithSiblingProvider(t)
+	r.Namespace = ""
+	shared, secret := attachmentProvider("shared")
+	r.KnownClusters = append(r.KnownClusters, (resolver.Route{Namespace: model.Namespace, ProviderNamespace: shared.Namespace, Provider: shared.Name}).ServiceName())
+	grant := referenceGrant("shared", model.Namespace, shared.Name)
+	for _, obj := range []client.Object{shared, secret, grant} {
+		if err := r.Create(ctx, obj); err != nil {
+			t.Fatal(err)
+		}
+	}
+	model.Spec.ModelName = "shared-client-alias"
+	model.Spec.ExternalProviderRefs = []v1alpha1.ExternalProviderRef{{
+		Ref:         v1alpha1.ExternalProviderReference{Name: shared.Name, Namespace: shared.Namespace},
+		TargetModel: "gpt", APIFormat: "openai-chat", Path: "/v1/chat/completions",
+	}}
+	sibling.Spec.ModelName = model.Spec.ModelName
+	for _, m := range []*v1alpha1.ExternalModel{model, sibling} {
+		if err := r.Update(ctx, m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, m := range []*v1alpha1.ExternalModel{model, sibling} {
+		reconcileModel(t, r, m)
+	}
+	expectedScoped := envelope.ScopedStableID(model.Namespace, model.Name, shared.Namespace, shared.Name)
+	before := overlayEnvelope(t, r, model.Namespace)
+	found := false
+	for _, candidate := range before.Overlay.Candidates {
+		found = found || candidate.StableID == expectedScoped
+	}
+	if !found || len(before.Overlay.Candidates) != 2 {
+		t.Fatalf("initial overlay must include scoped model and same-alias sibling: %#v", before.Overlay.Candidates)
+	}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(providerB), providerB); err != nil {
+		t.Fatal(err)
+	}
+	providerB.Status.Phase = "Pending"
+	providerB.Status.Conditions = []metav1.Condition{{Type: conditionReady, Status: metav1.ConditionFalse, Reason: "Reconciling", Message: "temporary failure", LastTransitionTime: metav1.Now()}}
+	if err := r.Status().Update(ctx, providerB); err != nil {
+		t.Fatal(err)
+	}
+	var current v1alpha1.ExternalModel
+	if err := r.Get(ctx, client.ObjectKeyFromObject(model), &current); err != nil {
+		t.Fatal(err)
+	}
+	zero := 0
+	current.Spec.ExternalProviderRefs[0].Weight = &zero
+	if err := r.Update(ctx, &current); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); !errors.Is(err, resolver.ErrNoRoutes) {
+		t.Fatalf("withdrawal error=%v, want ErrNoRoutes", err)
+	}
+	after := overlayEnvelope(t, r, model.Namespace)
+	if len(after.Overlay.Candidates) != 1 || after.Overlay.Candidates[0].StableID != envelope.CandidateStableID(sibling.Name, providerB.Name) {
+		t.Fatalf("expected only sibling last-known candidate: %#v", after.Overlay.Candidates)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, model.Namespace, modelRouteName(model.Name)); !apierrors.IsNotFound(err) {
+		t.Fatalf("disabled route remains: %v", err)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, sibling.Namespace, modelRouteName(sibling.Name)); err != nil {
+		t.Fatalf("sibling route removed: %v", err)
+	}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(model), &current); err != nil {
+		t.Fatal(err)
+	}
+	if current.Status.Phase != "Failed" || current.Status.ObservedGeneration != current.Generation || !hasConditionReason(current.Status.Conditions, conditionReady, reasonNoRoutes) {
+		t.Fatalf("withdrawal status=%#v", current.Status)
+	}
+}
+
+func TestExcludedScopedCandidateIDsSupportHashedIdentitiesAndFailOnUnreadableModel(t *testing.T) {
+	ctx := context.Background()
+	model := &v1alpha1.ExternalModel{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "tenant-a", Name: strings.Repeat("m", 220)},
+		Spec: v1alpha1.ExternalModelSpec{ModelName: "alias", ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
+			Ref: v1alpha1.ExternalProviderReference{Namespace: "shared", Name: strings.Repeat("p", 60)},
+		}}},
+	}
+	r := controllerTestClient(t, model)
+	excluded := map[string]bool{model.Namespace + "/" + model.Name: true}
+	ids, err := r.excludedScopedCandidateIDs(ctx, model.Namespace, excluded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := envelope.ScopedStableID(model.Namespace, model.Name, "shared", strings.Repeat("p", 60))
+	if !strings.HasPrefix(expected, "sha256:") || len(ids) != 1 || !ids[expected] {
+		t.Fatalf("hashed candidate identity was not preserved: %#v", ids)
+	}
+	excluded[model.Namespace+"/missing"] = true
+	if _, err := r.excludedScopedCandidateIDs(ctx, model.Namespace, excluded); !apierrors.IsNotFound(err) {
+		t.Fatalf("unreadable excluded model must fail closed: %v", err)
+	}
+}
+
+func TestHomeModelPublicationReportsOneStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		publication homeModelPublication
+		wantReason  string
+	}{
+		{name: "weight disabled takes precedence", publication: homeModelPublication{weightDisabled: true, denied: "denied", unserved: "unready", unroutedReason: reasonNoRoutes}, wantReason: reasonNoRoutes},
+		{name: "denied reference", publication: homeModelPublication{denied: "denied", unserved: "unready", unroutedReason: reasonNoRoutes}, wantReason: reasonRefNotPermitted},
+		{name: "unready credential", publication: homeModelPublication{unserved: "unready", unroutedReason: reasonNoRoutes}, wantReason: reasonProviderNotReady},
+		{name: "unrouted", publication: homeModelPublication{unroutedReason: reasonNoRoutes}, wantReason: reasonNoRoutes},
+		{name: "ready", wantReason: reasonReconciled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, reportErr := range []error{nil, errors.New("status write failed")} {
+				calls := 0
+				publication := tc.publication
+				publication.report = func(ready bool, reason, _ string, _ *envelope.Envelope) error {
+					calls++
+					if reason != tc.wantReason || ready != (reason == reasonReconciled) {
+						t.Errorf("status ready=%v reason=%s; want %s", ready, reason, tc.wantReason)
+					}
+					return reportErr
+				}
+				_, err := (&Reconciler{}).finishHomeModelPublication(context.Background(), publication)
+				if calls != 1 || !errors.Is(err, reportErr) {
+					t.Fatalf("status calls=%d err=%v; want one call and %v", calls, err, reportErr)
+				}
+			}
+		})
 	}
 }

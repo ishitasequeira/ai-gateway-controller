@@ -9,6 +9,17 @@ spec:
     labels:
       gateway.networking.k8s.io/gateway-name: maas-default-gateway
   configPatches:
+    # Pre-auth model extraction buffers the request before translation. Allow
+    # the 10 MiB client-input budget plus 64 KiB of bounded protocol headroom.
+    # This Gateway-wide soft limit also affects response buffering/flow control;
+    # the Anthropic translator's independent 1 MiB JSON response cap is unchanged.
+    - applyTo: LISTENER
+      match:
+        context: GATEWAY
+      patch:
+        operation: MERGE
+        value:
+          per_connection_buffer_limit_bytes: 10551296
     # ExternalModel pre-auth is fail-closed. It is disabled at the virtual-host
     # level and enabled only on controller-owned ExternalModel routes so an
     # unavailable model-extraction processor cannot trust caller headers.

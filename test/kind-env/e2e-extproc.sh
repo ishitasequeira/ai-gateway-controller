@@ -37,6 +37,9 @@ ADMIN_CFG=""
 OVERRIDE_SECRET='provider-model-override-credentials'
 MODEL_OVERRIDE_ACTIVE=false
 DUPLICATE_ACTIVE=false
+PROVIDER_CA_NAME='external-model-e2e-provider-ca'
+PROVIDER_CA_PATH='/etc/external-model-e2e/provider-ca/ca.crt'
+PROVIDER_CA_CREDENTIAL_ACTIVE=false
 RECOMPUTE="$EVIDENCE/recompute-digest"
 go build -o "$RECOMPUTE" "$ROOT/test/kind-env/recompute_digest.go"
 
@@ -97,6 +100,11 @@ finish() {
       -p='[{"op":"remove","path":"/spec/externalProviderRefs/0/auth"}]' >/dev/null 2>&1 || true
   fi
   timeout 20s kubectl --context "kind-$CLUSTER" -n "$NS" delete secret "$OVERRIDE_SECRET" --ignore-not-found >/dev/null 2>&1 || true
+  if [[ "$PROVIDER_CA_CREDENTIAL_ACTIVE" == true ]]; then
+    timeout 20s kubectl --context "kind-$CLUSTER" -n "$NS" patch externalprovider provider-a --type=merge \
+      -p "{\"spec\":{\"config\":{\"tls.credentialName\":null,\"tls.caCertificates\":\"$PROVIDER_CA_PATH\"}}}" >/dev/null 2>&1 || true
+  fi
+  timeout 20s kubectl --context "kind-$CLUSTER" -n "$API_NS" delete secret "$PROVIDER_CA_NAME" --ignore-not-found >/dev/null 2>&1 || true
   [[ -n "$APF" ]] && kill "$APF" 2>/dev/null || true
   [[ -n "$GPF" ]] && kill "$GPF" 2>/dev/null || true
   revoke_key
@@ -357,6 +365,34 @@ write_model_override_secret() {
     kctl apply -f - >/dev/null
 }
 
+wait_provider_phase() {
+  local wanted=$1 phase
+  for _ in $(seq 1 90); do
+    phase=$(kctl -n "$NS" get externalprovider provider-a -o jsonpath='{.status.phase}' 2>/dev/null || true)
+    [[ "$phase" == "$wanted" ]] && return 0
+    sleep 2
+  done
+  return 1
+}
+
+# provider_a_tls prints the TLS policy of provider-a's Gateway DestinationRule.
+provider_a_tls() {
+  kctl -n "$API_NS" get destinationrule provider-provider-a -o json 2>/dev/null |
+    jq -c '.spec.trafficPolicy.tls // {}' 2>/dev/null || echo absent
+}
+
+# wait_gateway_status retries a request until it returns the expected status:
+# Envoy receives DestinationRule and SDS Secret changes asynchronously.
+wait_gateway_status() {
+  local name=$1 expected=$2 got=""
+  for _ in $(seq 1 30); do
+    got=$(gateway "$name" "$AUTH_CFG")
+    [[ "$got" == "$expected" ]] && break
+    sleep 2
+  done
+  printf '%s\n' "$got"
+}
+
 finalize_results() {
   local failed
   failed=$(jq '[.assertions[] | select(.result != "PASS")] | length' "$RESULTS")
@@ -537,6 +573,73 @@ fi
 kctl -n "$NS" patch externalmodel demo-model --type=json -p='[{"op":"remove","path":"/spec/externalProviderRefs/2"}]' >/dev/null
 DUPLICATE_ACTIVE=false
 if wait_model_phase Ready && wait_overlay a; then record 33 duplicate_binding_recovery PASS "restored=true"; else record 33 duplicate_binding_recovery FAIL "convergence=false"; exit 1; fi
+
+# tls.credentialName: the Gateway trusts the private provider CA from a Secret
+# in its own namespace, which Istio delivers over SDS instead of a mounted file.
+kctl -n "$API_NS" delete secret "$PROVIDER_CA_NAME" --ignore-not-found >/dev/null
+kctl -n "$NS" patch externalprovider provider-a --type=merge \
+  -p "{\"spec\":{\"config\":{\"tls.caCertificates\":null,\"tls.credentialName\":\"$PROVIDER_CA_NAME\"}}}" >/dev/null
+PROVIDER_CA_CREDENTIAL_ACTIVE=true
+ca_missing_message=""
+if wait_provider_phase Failed; then
+  ca_missing_message=$(kctl -n "$NS" get externalprovider provider-a -o jsonpath='{.status.conditions[?(@.type=="Ready")].message}' 2>/dev/null || true)
+fi
+printf 'ready_message=%s\n' "$ca_missing_message" >"$EVIDENCE/provider-ca-credential-missing.txt"
+# The tenant-readable message names neither the Secret read nor its namespace.
+if [[ "$ca_missing_message" == *"tls.credentialName must name a Secret in the Gateway namespace"* &&
+  "$ca_missing_message" != *"$API_NS/"* ]]; then
+  record 38 ca_credential_missing_reported PASS "phase=Failed message=generic"
+else
+  record 38 ca_credential_missing_reported FAIL "expected=phase=Failed observed_message=${ca_missing_message:-none}"
+fi
+# Creating the Secret recovers the provider without another provider edit.
+kctl -n "$API_NS" get configmap external-model-e2e-provider-ca -o jsonpath='{.data.ca\.crt}' >"$TMP_DIR/provider-ca.crt"
+kctl -n "$API_NS" create secret generic "$PROVIDER_CA_NAME" --from-file=cacert="$TMP_DIR/provider-ca.crt" \
+  --dry-run=client -o yaml | kctl apply -f - >/dev/null
+ca_ready=false
+if wait_provider_phase Ready && wait_model_phase Ready && wait_overlay a && wait_gateway_route provider-a && wait_gateway_provider provider-a; then
+  ca_ready=true
+fi
+ca_tls=$(provider_a_tls)
+ca_request=$(wait_gateway_status provider_a_ca_credential 200)
+ca_body=$(cat "$EVIDENCE/provider_a_ca_credential-response.json")
+printf 'ready=%s tls=%s http=%s\n' "$ca_ready" "$ca_tls" "$ca_request" >"$EVIDENCE/provider-ca-credential.txt"
+if [[ "$ca_ready" == true && "$(jq -r '.credentialName // empty' <<<"$ca_tls")" == "$PROVIDER_CA_NAME" &&
+  "$(jq -r 'has("caCertificates")' <<<"$ca_tls")" == false && "$ca_request" == 200 && "$ca_body" == *katan-a-* ]]; then
+  record 39 ca_credential_request PASS "http=200 backend=katan-a credential_name=$PROVIDER_CA_NAME"
+else
+  record 39 ca_credential_request FAIL "ready=$ca_ready tls=$ca_tls http=$ca_request"
+fi
+# Without a CA the Gateway verifies against its system roots, which do not
+# include the private CA, so the same request fails TLS verification.
+kctl -n "$NS" patch externalprovider provider-a --type=merge -p '{"spec":{"config":{"tls.credentialName":null}}}' >/dev/null
+no_ca_request="" no_ca_verify_failed=false
+for _ in $(seq 1 30); do
+  no_ca_request=$(gateway provider_a_without_ca "$AUTH_CFG")
+  if [[ "$no_ca_request" == 503 ]] && rg -q CERTIFICATE_VERIFY_FAILED "$TMP_DIR/provider_a_without_ca.raw"; then
+    no_ca_verify_failed=true
+    break
+  fi
+  sleep 2
+done
+no_ca_tls=$(provider_a_tls)
+printf 'tls=%s http=%s certificate_verify_failed=%s\n' "$no_ca_tls" "$no_ca_request" "$no_ca_verify_failed" >"$EVIDENCE/provider-ca-absent.txt"
+if [[ "$no_ca_verify_failed" == true && "$(jq -r 'has("credentialName") or has("caCertificates")' <<<"$no_ca_tls")" == false ]]; then
+  record 40 ca_absent_verification_fails PASS "http=503 certificate_verify_failed=true"
+else
+  record 40 ca_absent_verification_fails FAIL "tls=$no_ca_tls http=$no_ca_request certificate_verify_failed=$no_ca_verify_failed"
+fi
+kctl -n "$NS" patch externalprovider provider-a --type=merge \
+  -p "{\"spec\":{\"config\":{\"tls.caCertificates\":\"$PROVIDER_CA_PATH\"}}}" >/dev/null
+kctl -n "$API_NS" delete secret "$PROVIDER_CA_NAME" --ignore-not-found >/dev/null
+PROVIDER_CA_CREDENTIAL_ACTIVE=false
+ca_restored=$(wait_gateway_status provider_a_ca_restored 200)
+if wait_provider_phase Ready && [[ "$ca_restored" == 200 ]]; then
+  record 41 ca_file_restored PASS "http=200"
+else
+  record 41 ca_file_restored FAIL "expected=http=200 observed=$ca_restored"
+  exit 1
+fi
 
 preauth_before=$(provider_request_count katan-a)
 kctl -n "$API_NS" scale deployment/payload-pre-processing --replicas=0 >/dev/null

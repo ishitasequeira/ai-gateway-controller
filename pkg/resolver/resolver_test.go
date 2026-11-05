@@ -168,7 +168,6 @@ func TestResolveRejectsUnqualifiedActiveProviderBindings(t *testing.T) {
 		apiFormat    string
 	}{
 		{name: "Vertex OpenAI", providerType: "vertex-openai", apiFormat: "openai-chat"},
-		{name: "Bedrock OpenAI", providerType: "bedrock-openai", apiFormat: "openai-chat"},
 		{name: "custom provider", providerType: "custom", apiFormat: "openai-chat"},
 		{name: "custom format", providerType: "openai", apiFormat: "vendor-chat"},
 	}
@@ -190,6 +189,26 @@ func TestResolveRejectsUnqualifiedActiveProviderBindings(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestResolveBedrockMantleOpenAIChat(t *testing.T) {
+	model := model("ns1", "mantle-model", ref("bedrock", "openai.gpt-oss-20b", "/v1/chat/completions"))
+	provider := provider("ns1", "bedrock", PhaseReady, "bedrock-mantle.us-east-2.api.aws", nil)
+	provider.Spec.Provider = "bedrock-openai"
+
+	set, err := ResolveWithAPITranslation([]*v1alpha1.ExternalModel{model}, []*v1alpha1.ExternalProvider{provider}, false)
+	if err != nil {
+		t.Fatalf("ResolveWithAPITranslation(): %v", err)
+	}
+	if len(set.Routes()) != 1 {
+		t.Fatalf("routes = %+v, want one Mantle route", set.Routes())
+	}
+	route := set.Routes()[0]
+	if route.ProviderType != "bedrock-openai" || route.APIFormat != "openai-chat" ||
+		route.Endpoint != "bedrock-mantle.us-east-2.api.aws" ||
+		route.Path != "/v1/chat/completions" || route.TargetModel != "openai.gpt-oss-20b" || route.AuthType != "apikey" {
+		t.Fatalf("resolved Bedrock Mantle route = %+v", route)
 	}
 }
 
@@ -429,6 +448,48 @@ func TestResolve_SkipAggregationKeepsGoodRefs(t *testing.T) {
 	}
 }
 
+func TestResolveExplicitZeroWeightPrecedesProviderAvailabilityAndPermission(t *testing.T) {
+	pending := provider("ns1", "pending", "Pending", "pending.example.com", nil)
+	cases := []struct {
+		name      string
+		ref       v1alpha1.ExternalProviderRef
+		providers []*v1alpha1.ExternalProvider
+	}{
+		{
+			name: "missing provider",
+			ref:  withWeight(ref("missing", "target", "/v1/chat/completions"), 0),
+		},
+		{
+			name:      "unready provider",
+			ref:       withWeight(ref("pending", "target", "/v1/chat/completions"), 0),
+			providers: []*v1alpha1.ExternalProvider{pending},
+		},
+		{
+			name: "unpermitted cross-namespace provider",
+			ref: func() v1alpha1.ExternalProviderRef {
+				r := withWeight(ref("foreign", "target", "/v1/chat/completions"), 0)
+				r.Ref.Namespace = "provider-ns"
+				return r
+			}(),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			set, err := Resolve([]*v1alpha1.ExternalModel{model("ns1", "model", tc.ref)}, tc.providers)
+			if !errors.Is(err, ErrNoRoutes) {
+				t.Fatalf("Resolve() error = %v, want ErrNoRoutes", err)
+			}
+			if got := set.Routes(); len(got) != 0 {
+				t.Fatalf("disabled binding produced routes: %+v", got)
+			}
+			if len(set.Models) != 1 || len(set.Models[0].Skips) != 1 ||
+				set.Models[0].Skips[0].Reason != SkipWeightDisabled {
+				t.Fatalf("disabled binding result = %+v, want only WeightDisabled", set.Models)
+			}
+		})
+	}
+}
+
 func withWeight(r v1alpha1.ExternalProviderRef, w int) v1alpha1.ExternalProviderRef {
 	r.Weight = intptr(w)
 	return r
@@ -608,6 +669,58 @@ func TestResolve_RejectsUnsafeTLSCAPath(t *testing.T) {
 	p := provider("ns1", "p", PhaseReady, "provider.example.com", map[string]string{"tls.caCertificates": "../ca.crt"})
 	if _, err := Resolve([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{p}); err == nil {
 		t.Fatal("unsafe TLS CA path must be rejected")
+	}
+}
+
+func TestResolve_CarriesProviderTLSCredentialName(t *testing.T) {
+	m := model("ns1", "m", ref("p", "target", "/v1"))
+	p := provider("ns1", "p", PhaseReady, "provider.example.com", map[string]string{"tls.credentialName": "provider-ca"})
+	set, err := Resolve([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{p})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if got := set.Routes()[0].TLSCredentialName; got != "provider-ca" {
+		t.Fatalf("TLS credential name = %q", got)
+	}
+}
+
+func TestResolve_RejectsModelSpecificTLSCredentialNameOverride(t *testing.T) {
+	m := model("ns1", "m", ref("p", "target", "/v1"))
+	m.Spec.ExternalProviderRefs[0].Config = map[string]string{"tls.credentialName": "model-ca"}
+	p := provider("ns1", "p", PhaseReady, "provider.example.com", nil)
+
+	_, err := Resolve([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{p})
+	if err == nil || !strings.Contains(err.Error(), "tls.credentialName cannot override ExternalProvider p") {
+		t.Fatalf("Resolve error = %v, want explicit shared-transport credential override error", err)
+	}
+}
+
+func TestValidateProviderTrust(t *testing.T) {
+	cases := []struct {
+		name   string
+		config map[string]string
+		want   string
+	}{
+		{"none", nil, ""},
+		{"CA file", map[string]string{"tls.caCertificates": "/etc/provider-ca/ca.crt"}, ""},
+		{"credential name", map[string]string{"tls.credentialName": " provider-ca "}, ""},
+		{"relative CA file", map[string]string{"tls.caCertificates": "ca.crt"}, "tls.caCertificates must be an absolute mounted file path"},
+		{"invalid Secret name", map[string]string{"tls.credentialName": "provider/ca"}, "tls.credentialName must be a valid Secret name"},
+		{"both", map[string]string{"tls.caCertificates": "/etc/provider-ca/ca.crt", "tls.credentialName": "provider-ca"}, "mutually exclusive"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateProviderTrust(tc.config)
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("ValidateProviderTrust() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("ValidateProviderTrust() = %v, want error containing %q", err, tc.want)
+			}
+		})
 	}
 }
 

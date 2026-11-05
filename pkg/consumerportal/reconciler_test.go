@@ -67,6 +67,7 @@ func testScheme() *runtime.Scheme {
 		{tenant.MaasTenantConfigGVK.Group, tenant.MaasTenantConfigGVK.Version, tenant.MaasTenantConfigGVK.Kind},
 		{tenant.AITenantGVK.Group, tenant.AITenantGVK.Version, tenant.AITenantGVK.Kind},
 		{gvkGateway.Group, gvkGateway.Version, gvkGateway.Kind},
+		{gvkOpenShiftRoute.Group, gvkOpenShiftRoute.Version, gvkOpenShiftRoute.Kind},
 		{gvkHTTPRoute.Group, gvkHTTPRoute.Version, gvkHTTPRoute.Kind},
 		{gvkReferenceGrant.Group, gvkReferenceGrant.Version, gvkReferenceGrant.Kind},
 		{gvkAuthPolicy.Group, gvkAuthPolicy.Version, gvkAuthPolicy.Kind},
@@ -148,6 +149,60 @@ func newGateway(listeners ...map[string]any) *unstructured.Unstructured {
 
 func httpsListener(hostname string) map[string]any {
 	return map[string]any{"name": "https", "protocol": "HTTPS", "port": int64(443), "hostname": hostname}
+}
+
+// newGatewayRoute builds a TLS-secured, path-unrestricted OpenShift Route
+// that fronts the Gateway in the ClusterIP + Route pattern, where the
+// Gateway listener has no hostname.
+func newGatewayRoute(name, host, backendService string) *unstructured.Unstructured {
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(gvkOpenShiftRoute)
+	u.SetName(name)
+	u.SetNamespace(testGatewayNamespace)
+	u.Object["spec"] = map[string]any{
+		"host": host,
+		"to":   map[string]any{"kind": "Service", "name": backendService, "weight": int64(100)},
+		"tls":  map[string]any{"termination": "reencrypt"},
+	}
+	return u
+}
+
+// withStatusAddresses sets Hostname-type status addresses on a Gateway.
+func withStatusAddresses(gateway *unstructured.Unstructured, values ...string) *unstructured.Unstructured {
+	addresses := make([]any, 0, len(values))
+	for _, value := range values {
+		addresses = append(addresses, map[string]any{"type": "Hostname", "value": value})
+	}
+	gateway.Object["status"] = map[string]any{"addresses": addresses}
+	return gateway
+}
+
+// newGatewayDataService builds the Gateway's data-plane Service, identified
+// by the gateway-name label the Route backend check requires.
+func newGatewayDataService(name, gatewayName string) *corev1.Service {
+	return &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+		Name:      name,
+		Namespace: testGatewayNamespace,
+		Labels:    map[string]string{"gateway.networking.k8s.io/gateway-name": gatewayName},
+	}}
+}
+
+// insecureRoute builds a Route without spec.tls, which serves plain HTTP and
+// cannot carry the https:// OIDC callback.
+func insecureRoute(name, host, backendService string) *unstructured.Unstructured {
+	route := newGatewayRoute(name, host, backendService)
+	unstructured.RemoveNestedField(route.Object, "spec", "tls")
+	return route
+}
+
+// subpathRoute builds a Route restricted to /api, which does not forward the
+// portal's /maas-portal and /oauth2 paths.
+func subpathRoute(name, host, backendService string) *unstructured.Unstructured {
+	route := newGatewayRoute(name, host, backendService)
+	if spec, ok := route.Object["spec"].(map[string]any); ok {
+		spec["path"] = "/api"
+	}
+	return route
 }
 
 func adminCredentialsSecret() *corev1.Secret {
@@ -338,6 +393,125 @@ func TestReconcileAppliesAuthProxyForDefaultTenant(t *testing.T) {
 	}
 }
 
+// In the recommended ClusterIP + OpenShift Route gateway pattern the Gateway
+// listener carries no hostname; the concrete external hostname is published
+// on the maas-gateway-route Route, and the portal must use it.
+func TestReconcileUsesGatewayRouteHostWithoutListenerHostname(t *testing.T) {
+	gateway := newGateway(httpsListener(""))
+	// The ClusterIP Gateway publishes its internal service name in status
+	// addresses; it must be skipped so the Route host is used.
+	withStatusAddresses(gateway, testGatewayName+"-openshift-default."+testGatewayNamespace+".svc.cluster.local")
+	r, rec := newReconciler(t,
+		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+		newAITenant(aitenantOpts{issuer: testIssuer}),
+		gateway,
+		newGatewayRoute(GatewayRouteName, testHostname, testGatewayName+"-openshift-default"),
+		newGatewayDataService(testGatewayName+"-openshift-default", testGatewayName),
+		adminCredentialsSecret(),
+		dashboardService(),
+	)
+	assertPortalAppliedWithHostname(t, r, rec, testHostname)
+}
+
+// A LoadBalancer Gateway whose operator left the listener hostname unset
+// publishes its external hostname in status addresses; the portal must use
+// it without requiring the Route.
+func TestReconcileUsesGatewayStatusAddressWithoutListenerHostname(t *testing.T) {
+	r, rec := newReconciler(t,
+		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+		newAITenant(aitenantOpts{issuer: testIssuer}),
+		withStatusAddresses(newGateway(httpsListener("")), testHostname),
+		adminCredentialsSecret(),
+		dashboardService(),
+	)
+	assertPortalAppliedWithHostname(t, r, rec, testHostname)
+}
+
+// Routes are discovered by backend identity, not by name: a Route with any
+// name fronts the Gateway when its backend Service carries the gateway-name
+// label.
+func TestReconcileDiscoversDifferentlyNamedGatewayRoute(t *testing.T) {
+	r, rec := newReconciler(t,
+		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+		newAITenant(aitenantOpts{issuer: testIssuer}),
+		newGateway(httpsListener("")),
+		newGatewayRoute("customer-named-portal-route", testHostname, testGatewayName+"-openshift-default"),
+		newGatewayDataService(testGatewayName+"-openshift-default", testGatewayName),
+		adminCredentialsSecret(),
+		dashboardService(),
+	)
+	assertPortalAppliedWithHostname(t, r, rec, testHostname)
+}
+
+// The listener hostname wins over status addresses and the Route.
+func TestReconcilePrefersListenerHostnameOverFallbacks(t *testing.T) {
+	gateway := withStatusAddresses(newGateway(httpsListener(testHostname)), "other.example.com")
+	r, rec := newReconciler(t,
+		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+		newAITenant(aitenantOpts{issuer: testIssuer}),
+		gateway,
+		newGatewayRoute(GatewayRouteName, "third.example.com", testGatewayName+"-openshift-default"),
+		newGatewayDataService(testGatewayName+"-openshift-default", testGatewayName),
+		adminCredentialsSecret(),
+		dashboardService(),
+	)
+	assertPortalAppliedWithHostname(t, r, rec, testHostname)
+}
+
+// assertPortalAppliedWithHostname reconciles once and asserts the portal was
+// applied using the given external hostname.
+func assertPortalAppliedWithHostname(t *testing.T, r *Reconciler, rec *recorder, hostname string) {
+	t.Helper()
+
+	res := reconcileMTC(t, r)
+	if res.RequeueAfter != r.ResyncInterval {
+		t.Fatalf("RequeueAfter = %v, want resync interval %v (applied=%v)", res.RequeueAfter, r.ResyncInterval, rec.applied)
+	}
+
+	route := rec.objects["HTTPRoute"]
+	if route == nil {
+		t.Fatal("portal HTTPRoute was not applied")
+	}
+	hostnames, _, _ := unstructured.NestedStringSlice(route.Object, "spec", "hostnames")
+	if len(hostnames) != 1 || hostnames[0] != hostname {
+		t.Errorf("portal HTTPRoute hostnames = %v, want [%s]", hostnames, hostname)
+	}
+
+	deployment := rec.objects["Deployment"]
+	if deployment == nil {
+		t.Fatal("auth proxy Deployment was not applied")
+	}
+	containers, found, err := unstructured.NestedSlice(deployment.Object,
+		"spec", "template", "spec", "containers")
+	if !found || err != nil || len(containers) == 0 {
+		t.Fatalf("read proxy containers: found=%t err=%v count=%d", found, err, len(containers))
+	}
+	container, ok := containers[0].(map[string]any)
+	if !ok {
+		t.Fatalf("proxy container has type %T, want map[string]any", containers[0])
+	}
+	args, _ := container["args"].([]any)
+	redirectURL, cookieDomain := "", ""
+	for _, entry := range args {
+		arg, ok := entry.(string)
+		if !ok {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(arg, "--redirect-url="):
+			redirectURL = strings.TrimPrefix(arg, "--redirect-url=")
+		case strings.HasPrefix(arg, "--cookie-domain="):
+			cookieDomain = strings.TrimPrefix(arg, "--cookie-domain=")
+		}
+	}
+	if want := "https://" + hostname + "/oauth2/callback"; redirectURL != want {
+		t.Errorf("redirect-url = %q, want %q", redirectURL, want)
+	}
+	if cookieDomain != hostname {
+		t.Errorf("cookie-domain = %q, want %q", cookieDomain, hostname)
+	}
+}
+
 func TestReconcileWaitsForCredentialsSecret(t *testing.T) {
 	r, rec := newReconciler(t,
 		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
@@ -521,6 +695,67 @@ func TestReconcileRequeuesUntilPrerequisitesExist(t *testing.T) {
 			newMTC(tenant.DefaultAITenantName, testInfraNamespace),
 			newAITenant(aitenantOpts{issuer: testIssuer}),
 			newGateway(httpsListener("*.apps.example.com")),
+			adminCredentialsSecret(),
+			dashboardService(),
+		},
+		"Gateway Route targets another gateway's service": {
+			newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+			newAITenant(aitenantOpts{issuer: testIssuer}),
+			newGateway(httpsListener("")),
+			newGatewayRoute(GatewayRouteName, testHostname, "unrelated-service"),
+			// Exists, but is another Gateway's data-plane Service.
+			newGatewayDataService("unrelated-service", "some-other-gateway"),
+			adminCredentialsSecret(),
+			dashboardService(),
+		},
+		"Gateway Route targets a same-prefix service without the gateway label": {
+			newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+			newAITenant(aitenantOpts{issuer: testIssuer}),
+			newGateway(httpsListener("")),
+			newGatewayRoute(GatewayRouteName, testHostname, testGatewayName+"-canary"),
+			// Exists and shares the Gateway name prefix, but is not this
+			// Gateway's data-plane Service.
+			&corev1.Service{ObjectMeta: metav1.ObjectMeta{
+				Name:      testGatewayName + "-canary",
+				Namespace: testGatewayNamespace,
+			}},
+			adminCredentialsSecret(),
+			dashboardService(),
+		},
+		"Gateway Route host is a wildcard": {
+			newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+			newAITenant(aitenantOpts{issuer: testIssuer}),
+			newGateway(httpsListener("")),
+			newGatewayRoute(GatewayRouteName, "*.apps.example.com", testGatewayName+"-openshift-default"),
+			adminCredentialsSecret(),
+			dashboardService(),
+		},
+		"Gateway Route has no TLS configuration": {
+			newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+			newAITenant(aitenantOpts{issuer: testIssuer}),
+			newGateway(httpsListener("")),
+			insecureRoute(GatewayRouteName, testHostname, testGatewayName+"-openshift-default"),
+			newGatewayDataService(testGatewayName+"-openshift-default", testGatewayName),
+			adminCredentialsSecret(),
+			dashboardService(),
+		},
+		"Gateway Route is scoped to a subpath": {
+			newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+			newAITenant(aitenantOpts{issuer: testIssuer}),
+			newGateway(httpsListener("")),
+			subpathRoute(GatewayRouteName, testHostname, testGatewayName+"-openshift-default"),
+			newGatewayDataService(testGatewayName+"-openshift-default", testGatewayName),
+			adminCredentialsSecret(),
+			dashboardService(),
+		},
+		"Gateway without an HTTPS listener": {
+			newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+			newAITenant(aitenantOpts{issuer: testIssuer}),
+			// HTTP-only Gateway that still publishes an external status
+			// hostname; it can never serve the portal's TLS callback.
+			withStatusAddresses(
+				newGateway(map[string]any{"name": "http", "protocol": "HTTP", "port": int64(80)}),
+				testHostname),
 			adminCredentialsSecret(),
 			dashboardService(),
 		},

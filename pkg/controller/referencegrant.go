@@ -73,13 +73,15 @@ func (r *Reconciler) referencePermitted(ctx context.Context, modelNamespace stri
 // foreignProviders returns the providers in other namespaces that the models
 // reference and a ReferenceGrant permits the model namespace to reference.
 // Like an attachment's providers they are validated here, not through their
-// own namespace's tenant. A missing or deleting provider is omitted like an
-// unpermitted one, so a reference never discloses whether a provider exists.
-// A provider whose own credential is not ready, while a reference inherits
-// it, is still returned: unready maps it to a message, and only the routes
-// that inherit that credential are skipped (see skipUnreadyCredentials). An
-// override's model-namespace Secret is validated with its route.
-func (r *Reconciler) foreignProviders(ctx context.Context, modelNamespace string, models []*v1alpha1.ExternalModel) (
+// own namespace's tenant, with their CA Secret read in gatewayNamespace, where
+// the Gateway serving the models reads it. A missing or deleting provider is
+// omitted like an unpermitted one, so a reference never discloses whether a
+// provider exists. A provider whose own credential is not ready, while a
+// reference inherits it, is still returned: unready maps it to a message, and
+// only the routes that inherit that credential are skipped (see
+// skipUnreadyCredentials). An override's model-namespace Secret is validated
+// with its route.
+func (r *Reconciler) foreignProviders(ctx context.Context, modelNamespace, gatewayNamespace string, models []*v1alpha1.ExternalModel) (
 	providers []*v1alpha1.ExternalProvider, unready map[types.NamespacedName]string, err error) {
 	if r.Namespace != "" {
 		// A single-namespace controller reads no other namespace.
@@ -116,6 +118,10 @@ func (r *Reconciler) foreignProviders(ctx context.Context, modelNamespace string
 		}
 		provider.Status.Phase = resolver.PhaseReady
 		if r.validateProvider(ctx, &provider) != nil {
+			provider.Status.Phase = providerPhaseFailed
+		} else if err := r.validateProviderCACredential(ctx, &provider, gatewayNamespace); transientReadError(err) {
+			return nil, nil, err
+		} else if err != nil {
 			provider.Status.Phase = providerPhaseFailed
 		} else if inherited {
 			if err := r.validateProviderCredential(ctx, &provider); transientReadError(err) {
@@ -274,7 +280,7 @@ func (r *Reconciler) collectProviderTransport(ctx context.Context, namespace str
 		transport = append(transport, list.Items...)
 	}
 	if len(transport) == 0 {
-		return nil
+		return r.releaseUnusedAttachmentProviders(ctx, namespace)
 	}
 	routes := &unstructured.UnstructuredList{}
 	routes.SetGroupVersionKind(httpRouteGVK.GroupVersion().WithKind("HTTPRouteList"))
@@ -300,6 +306,23 @@ func (r *Reconciler) collectProviderTransport(ctx context.Context, namespace str
 		}
 		if err := client.IgnoreNotFound(r.Delete(ctx, &transport[i])); err != nil {
 			return fmt.Errorf("delete provider transport %s/%s: %w", namespace, transport[i].GetName(), err)
+		}
+	}
+	return r.releaseUnusedAttachmentProviders(ctx, namespace)
+}
+
+// releaseUnusedAttachmentProviders drops protection after the last route is gone.
+func (r *Reconciler) releaseUnusedAttachmentProviders(ctx context.Context, namespace string) error {
+	var providers v1alpha1.ExternalProviderList
+	if err := r.List(ctx, &providers, client.InNamespace(namespace)); err != nil {
+		return err
+	}
+	for i := range providers.Items {
+		if !providers.Items[i].DeletionTimestamp.IsZero() {
+			continue
+		}
+		if err := r.releaseUnusedAttachmentProvider(ctx, &providers.Items[i]); err != nil {
+			return err
 		}
 	}
 	return nil

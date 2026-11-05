@@ -313,6 +313,70 @@ else
 fi
 unknown=$(request "$KEY" "https://$HOST/$OPENSHIFT_E2E_TENANT_NAMESPACE/missing-model/v1/chat/completions" '{"model":"missing-model","messages":[{"role":"user","content":"qualification"}]}' 2>/dev/null || true)
 [[ "$unknown" == 404 ]] && record 12 "Unknown model" PASS routing "HTTP 404" || { record 12 "Unknown model" FAIL routing "expected HTTP 404, observed $unknown"; exit 1; }
+
+# Proportional 80/20 selection (#122). Band is intentionally wide: prove A is
+# selected more often than B without requiring an exact ratio over a small N.
+wait_for_proportional_overlay() {
+  local stable=0 previous="" observation config_content mounted_content generation digest recomputed mounted_digest accepted_revision serving_revision revision_line
+  local deadline=$((SECONDS + 180))
+  while (( SECONDS < deadline )); do
+    config_content=$(${OC[@]} get configmap routing-overlay -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -o jsonpath='{.data.routing-overlay\.json}' 2>/dev/null || true)
+    generation=$(${OC[@]} get configmap routing-overlay -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -o jsonpath='{.metadata.annotations.inference\.opendatahub\.io/routing-overlay-source-generation}' 2>/dev/null || true)
+    digest=$(${OC[@]} get configmap routing-overlay -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -o jsonpath='{.metadata.annotations.inference\.opendatahub\.io/routing-overlay-content-digest}' 2>/dev/null || true)
+    mounted_content=$("${OC[@]}" exec deploy/"$POST_AUTH_DEPLOYMENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- cat /etc/praxis/routing/routing-overlay.json 2>/dev/null || true)
+    revision_line=$("${OC[@]}" logs deploy/"$POST_AUTH_DEPLOYMENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -c payload-processing --tail=200 2>/dev/null | sed $'s/\033\\[[0-9;]*m//g' | rg 'intelligent_route: overlay (snapshot initialized|reloaded)' | tail -1 || true)
+    accepted_revision=$(printf '%s\n' "$revision_line" | grep -oE '(^|[[:space:]])accepted_revision="?[0-9a-f]{64}"?' | tail -1 | sed 's/^[[:space:]]*accepted_revision=//; s/"//g' || true)
+    serving_revision=$(printf '%s\n' "$revision_line" | grep -oE '(^|[[:space:]])serving_revision="?[0-9a-f]{64}"?' | tail -1 | sed 's/^[[:space:]]*serving_revision=//; s/"//g' || true)
+    printf '%s' "$config_content" >"$OUT/config-overlay.json"
+    printf '%s' "$mounted_content" >"$OUT/mounted-overlay.json"
+    recomputed=$($RECOMPUTE_BIN "$OUT/config-overlay.json" 2>/dev/null || true)
+    mounted_digest=$($RECOMPUTE_BIN "$OUT/mounted-overlay.json" 2>/dev/null || true)
+    if printf '%s' "$config_content" | jq -e '
+        .overlay.selection_policy.mode == "weightedRandom"
+        and ([.overlay.candidates[] | select(.cluster == "provider-provider-a" and .traffic_weight == 80)] | length == 1)
+        and ([.overlay.candidates[] | select(.cluster == "provider-provider-b" and .traffic_weight == 20)] | length == 1)
+      ' >/dev/null 2>&1 \
+      && printf '%s' "$mounted_content" | jq -e '.overlay.selection_policy.mode == "weightedRandom"' >/dev/null 2>&1 \
+      && [[ "$digest" =~ ^[0-9a-f]{64}$ && "$recomputed" == "$digest" && "$mounted_digest" == "$digest" && "$accepted_revision" == "$digest" && "$serving_revision" == "$digest" ]]; then
+      observation="$generation:$digest:$accepted_revision:$serving_revision"
+      if [[ "$observation" == "$previous" ]]; then stable=$((stable + 1)); else stable=1; previous="$observation"; fi
+      [[ "$stable" -ge 2 ]] && return 0
+    else
+      stable=0
+      previous=""
+    fi
+    sleep 2
+  done
+  printf 'proportional overlay convergence failed: generation=%s digest=%s accepted=%s serving=%s\n' "$generation" "$digest" "$accepted_revision" "$serving_revision" >&2
+  return 1
+}
+${OC[@]} patch externalmodel demo-model -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" --type=json -p='[{"op":"replace","path":"/spec/externalProviderRefs/0/weight","value":80},{"op":"replace","path":"/spec/externalProviderRefs/1/weight","value":20}]' >"$OUT/proportional-80-20.txt"
+wait_json "ExternalModel Ready for 80/20" "${OC[*]} get externalmodel demo-model -n $OPENSHIFT_E2E_TENANT_NAMESPACE -o json | jq -e '.status.phase == \"Ready\"' >/dev/null" 180 || { record 26 "Proportional 80/20 Ready" FAIL routing "ExternalModel did not stay Ready with unequal weights"; exit 1; }
+wait_for_proportional_overlay || { record 26 "Proportional 80/20 overlay" FAIL routing "weightedRandom overlay with traffic_weight 80/20 did not converge"; exit 1; }
+record 26 "Proportional 80/20 overlay" PASS routing "weightedRandom wire metadata with traffic_weight 80/20"
+count_a=0 count_b=0 count_fail=0
+: >"$OUT/proportional-80-20-samples.tsv"
+for _ in $(seq 1 50); do
+  status=$(request "$KEY" "$URL" "$request_body" 2>/dev/null || true)
+  host=$(${OC[@]} exec "$CLIENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- sh -c 'sed -n "s/.*host=\([^,\" ]*\).*/\1/p" /tmp/xmp-request' | head -1 || true)
+  printf '%s\t%s\n' "$status" "$host" >>"$OUT/proportional-80-20-samples.tsv"
+  if [[ "$status" == 200 && "$host" == *provider-a* ]]; then
+    count_a=$((count_a + 1))
+  elif [[ "$status" == 200 && "$host" == *provider-b* ]]; then
+    count_b=$((count_b + 1))
+  else
+    count_fail=$((count_fail + 1))
+  fi
+done
+printf 'requests=50\nprovider_a=%s\nprovider_b=%s\nfailures=%s\n' "$count_a" "$count_b" "$count_fail" >"$OUT/proportional-80-20-summary.txt"
+# Loose bias: A must beat B and land in roughly [55%, 95%] of successful draws.
+if [[ "$count_fail" -eq 0 && "$count_a" -gt "$count_b" && "$count_a" -ge 28 && "$count_a" -le 47 && "$count_b" -ge 3 ]]; then
+  record 27 "Proportional 80/20 attributed traffic" PASS routing "50 requests: A=$count_a B=$count_b (A preferred, not exact ratio)"
+else
+  record 27 "Proportional 80/20 attributed traffic" FAIL routing "expected A>B with loose 80/20 bias over 50 requests; A=$count_a B=$count_b failures=$count_fail"
+  exit 1
+fi
+
 before=$(wait_json "single ready post-auth ExtProc pod" "${OC[*]} get pods -n $OPENSHIFT_E2E_TENANT_NAMESPACE -l app=payload-processing-external-model -o json | jq -e '[.items[] | select([.status.conditions[]? | select(.type==\"Ready\" and .status==\"True\")] | length == 1)] | length == 1' >/dev/null && ${OC[*]} get pods -n $OPENSHIFT_E2E_TENANT_NAMESPACE -l app=payload-processing-external-model -o json | jq -r '[.items[] | select([.status.conditions[]? | select(.type==\"Ready\" and .status==\"True\")] | length == 1)] | .[0] | [.metadata.uid,([.status.containerStatuses[]?.restartCount]|add // 0)] | @tsv'" 180)
 ${OC[@]} patch externalmodel demo-model -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" --type=json -p='[{"op":"replace","path":"/spec/externalProviderRefs/0/weight","value":0},{"op":"replace","path":"/spec/externalProviderRefs/1/weight","value":1}]' >"$OUT/endpoint-switch.txt"
 wait_json "second endpoint overlay" "${OC[*]} get configmap routing-overlay -n $OPENSHIFT_E2E_TENANT_NAMESPACE -o json | jq -e '.data[\"routing-overlay.json\"] | contains(\"provider-provider-b\")' >/dev/null" 180 || { record 13-converge "Endpoint switch convergence" FAIL routing "second endpoint overlay did not converge"; exit 1; }

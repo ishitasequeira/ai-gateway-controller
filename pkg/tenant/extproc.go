@@ -21,9 +21,15 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/envelope"
+	"github.com/opendatahub-io/ai-gateway-controller/pkg/resolver"
 )
 
 const extprocCredentialDir = "/etc/praxis/credentials" //nolint:gosec // fixed non-secret mount path
+const anthropicTranslationRequestMaxBytes = extprocMaxBodyBytes
+
+// Preserve the existing input allowance while bounding model-rewrite overhead separately.
+const anthropicTranslationAccumulationMaxBytes = extprocMaxBodyBytes + (64 << 10)
+const anthropicTranslationResponseMaxBytes = 1 << 20
 
 type extprocCredential struct {
 	name      string
@@ -355,9 +361,65 @@ func configureExternalModelExtProc(resources []unstructured.Unstructured, tenant
 	return nil
 }
 
-// configureExternalModelRequestOrdering removes early body delivery. The routes
-// use BUFFERED request mode, so Envoy supplies a complete body without
-// deferring its header response.
+// ExternalModelRuntimeCandidates converts the resolved home-model routes to
+// the candidate set used by the dedicated ExtProc. API translation metadata
+// is included only when the tenant enabled the corresponding filters, matching
+// the configuration mounted by configureExternalModelExtProc.
+func ExternalModelRuntimeCandidates(routes *resolver.ResolvedRouteSet, apiTranslationEnabled bool) ([]envelope.Candidate, error) {
+	if routes == nil {
+		return nil, errors.New("ExternalModel runtime routes are required")
+	}
+	candidates := make([]envelope.Candidate, 0, len(routes.Routes()))
+	for _, route := range routes.Routes() {
+		strategy, header, err := envelope.StrategyFor(route)
+		if err != nil {
+			return nil, fmt.Errorf("resolve ExtProc runtime credential for model %s provider %s: %w", route.Model, route.Provider, err)
+		}
+		candidate := envelope.Candidate{
+			Cluster: route.Cluster, StableID: envelope.CandidateStableID(route.Model, route.Provider),
+			Kind: "inference_model", Name: route.ClientName, Fresh: true,
+		}
+		if apiTranslationEnabled {
+			candidate.APIFormat = route.APIFormat
+			candidate.Path = route.Path
+			candidate.TargetModel = route.TargetModel
+		}
+		if strategy != "" {
+			candidate.Credential = &envelope.Credential{
+				Strategy: strategy, Header: header,
+				SecretRef: envelope.SecretRef{Name: route.SecretName, Namespace: route.Namespace, Key: route.SecretKey},
+			}
+		}
+		candidates = append(candidates, candidate)
+	}
+	return candidates, nil
+}
+
+// ExternalModelExtProcConfigHash returns the rollout hash for a candidate set
+// using the same translation setting as the rendered ExternalModel config.
+func ExternalModelExtProcConfigHash(namespace string, candidates []envelope.Candidate, apiTranslationEnabled bool) (string, error) {
+	_, configHash, err := ExternalModelExtProcConfig(namespace, candidates, apiTranslationEnabled)
+	if err != nil {
+		return "", err
+	}
+	return configHash, nil
+}
+
+// ExternalModelExtProcConfig returns the exact ExtProc YAML for the supplied
+// candidate set and translation setting.
+func ExternalModelExtProcConfig(namespace string, candidates []envelope.Candidate, apiTranslationEnabled bool) (string, string, error) {
+	credentials, err := extprocCredentials(namespace, candidates)
+	if err != nil {
+		return "", "", err
+	}
+	config := extprocPostAuthConfig(candidates, credentials, apiTranslationEnabled)
+	digest := sha256.Sum256([]byte(config))
+	return config, hex.EncodeToString(digest[:]), nil
+}
+
+// configureExternalModelRequestOrdering removes early body delivery. The route
+// uses BUFFERED mode when translation is enabled, so Envoy supplies a complete
+// body without deferring its header response.
 func configureExternalModelRequestOrdering(resources []unstructured.Unstructured, tenantID string) error {
 	wantFilter := PayloadProcessingExternalModelFilterNameForTenant(tenantID)
 	filterFound := false
@@ -468,7 +530,7 @@ func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extpro
 	// translation disabled, omit the translation and provider-profile filters
 	// and retain main's unbounded-body setting.
 	if apiTranslationEnabled {
-		fmt.Fprintf(&b, "  max_body_bytes: %d\n", extprocMaxBodyBytes)
+		fmt.Fprintf(&b, "  max_body_bytes: %d\n", anthropicTranslationAccumulationMaxBytes)
 	}
 	b.WriteString("  tls:\n    mode: self_signed\n\n")
 	// headers must stay first: it strips caller credentials and internal MaaS
@@ -497,7 +559,8 @@ func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extpro
 		b.WriteString("        max_partial_event_bytes: 1048576\n        max_tool_blocks: 256\n")
 		b.WriteString("      - filter: openai_chat_completions_to_anthropic\n")
 		b.WriteString("        api_translation_enabled: true\n")
-		fmt.Fprintf(&b, "        max_body_bytes: %d\n", extprocMaxBodyBytes)
+		fmt.Fprintf(&b, "        max_request_body_bytes: %d\n", anthropicTranslationRequestMaxBytes)
+		fmt.Fprintf(&b, "        max_response_body_bytes: %d\n", anthropicTranslationResponseMaxBytes)
 	}
 	if len(credentials) > 0 {
 		b.WriteString("      - filter: credential_inject\n        credentials:\n")

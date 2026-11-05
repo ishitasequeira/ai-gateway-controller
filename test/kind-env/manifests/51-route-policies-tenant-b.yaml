@@ -1,49 +1,5 @@
-# Purpose: Attaches Kuadrant/Authorino authentication and token-rate-limit
-# policies to tenant B's generated ExternalModel HTTPRoute.
-#
-# Scope: Kind E2E fixture only. This is not a production deployment manifest.
-#
-# Dependencies: Requires the ai-tenant-tenant-b namespace, the MaaS API and
-# Authorino/Kuadrant controllers, and the tenant-B generated
-# external-model-demo-model HTTPRoute from 21-fixtures-tenant-b.yaml.
-#
-# Qualification role: Proves tenant-B authentication, authorization, and
-# rate-limit policy isolation at its generated HTTPRoute boundary. The API key
-# pattern is test-only; credentials must never be treated as production
-# secrets.
-
-apiVersion: kuadrant.io/v1
-kind: AuthPolicy
-metadata:
-  name: external-model-auth
-  namespace: ai-tenant-tenant-b
-  labels: {app.kubernetes.io/managed-by: local-env}
-spec:
-  rules:
-    authentication:
-      api-key:
-        plain:
-          selector: request.headers.authorization
-    metadata:
-      apiKeyValidation:
-        http:
-          method: POST
-          url: https://maas-api.maas-system.svc.cluster.local:8443/internal/v1/api-keys/validate
-          contentType: application/json
-          body:
-            expression: '{"key": request.headers.authorization.replace("Bearer ", "")}'
-    authorization:
-      valid-api-key:
-        patternMatching:
-          patterns:
-          - operator: eq
-            selector: auth.metadata.apiKeyValidation.valid
-            value: "true"
-  targetRef:
-    group: gateway.networking.k8s.io
-    kind: HTTPRoute
-    name: external-model-demo-model
----
+# Kind-only route rate limiting. Authentication and model authorization are
+# inherited from the MaaS-owned Gateway AuthPolicy, as for tenant A.
 apiVersion: kuadrant.io/v1alpha1
 kind: TokenRateLimitPolicy
 metadata:

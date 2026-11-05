@@ -61,17 +61,26 @@ const (
 	CleanupFinalizer = "ai-gateway-controller.opendatahub.io/consumer-portal-cleanup"
 	// DefaultAuthorinoNamespace is where Kuadrant runs Authorino.
 	DefaultAuthorinoNamespace = "kuadrant-system"
+	// GatewayRouteName is the conventional name of the OpenShift Route that
+	// fronts the Gateway in the ClusterIP + Route gateway pattern (the
+	// ocproute mode of scripts/setup-gateway.sh in the models-as-a-service
+	// repo). Routes are matched by backend identity rather than name; this
+	// name only breaks ties deterministically when several Routes front the
+	// same Gateway.
+	GatewayRouteName = "maas-gateway-route"
 )
 
 var (
-	gvkGateway         = schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "Gateway"}
-	gvkHTTPRoute       = schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"}
-	gvkReferenceGrant  = schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1beta1", Kind: "ReferenceGrant"}
-	gvkAuthPolicy      = schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1", Kind: "AuthPolicy"}
-	gvkDestinationRule = schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1", Kind: "DestinationRule"}
-	gvkEnvoyFilter     = schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1alpha3", Kind: "EnvoyFilter"}
-	gvkDSCI            = schema.GroupVersionKind{Group: "dscinitialization.opendatahub.io", Version: "v2", Kind: "DSCInitialization"}
-	authProxyObjects   = []schema.GroupVersionKind{
+	gvkGateway            = schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "Gateway"}
+	gvkOpenShiftRoute     = schema.GroupVersionKind{Group: "route.openshift.io", Version: "v1", Kind: "Route"}
+	gvkOpenShiftRouteList = schema.GroupVersionKind{Group: "route.openshift.io", Version: "v1", Kind: "RouteList"}
+	gvkHTTPRoute          = schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"}
+	gvkReferenceGrant     = schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1beta1", Kind: "ReferenceGrant"}
+	gvkAuthPolicy         = schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1", Kind: "AuthPolicy"}
+	gvkDestinationRule    = schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1", Kind: "DestinationRule"}
+	gvkEnvoyFilter        = schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1alpha3", Kind: "EnvoyFilter"}
+	gvkDSCI               = schema.GroupVersionKind{Group: "dscinitialization.opendatahub.io", Version: "v2", Kind: "DSCInitialization"}
+	authProxyObjects      = []schema.GroupVersionKind{
 		{Group: "apps", Version: "v1", Kind: "Deployment"},
 		{Version: "v1", Kind: "Service"},
 		{Version: "v1", Kind: "ServiceAccount"},
@@ -646,19 +655,165 @@ func (r *Reconciler) resolveOwnedAITenant(ctx context.Context, mtc *unstructured
 	return aitenant, nil
 }
 
-// gatewayHostname returns the hostname of the Gateway's first HTTPS listener
-// with a concrete hostname. The OIDC callback is served on that hostname.
+// gatewayHostname returns the external hostname the OIDC callback is served
+// on. Sources are tried in order:
+//
+//  1. the Gateway's first HTTPS listener with a concrete hostname (the
+//     LoadBalancer gateway pattern with an explicit listener hostname);
+//  2. an external Hostname-type Gateway status address (a LoadBalancer
+//     gateway whose operator left the listener hostname unset). Internal
+//     cluster DNS names are skipped: they are unreachable from user browsers
+//     and never match the broker-registered OIDC redirect URI, so using one
+//     would deploy a portal whose login can never complete;
+//  3. the OpenShift Route that fronts the Gateway (the ClusterIP + Route
+//     pattern, where the listener intentionally carries no hostname and the
+//     concrete hostname is published on the Route instead).
+//
+// An HTTPS listener is required regardless of source: the portal HTTPRoutes
+// attach to the Gateway's https section and the OIDC callback is served over
+// TLS, so a Gateway without one can never serve the portal and the
+// reconciliation fails closed instead of deploying one that cannot work.
 func (r *Reconciler) gatewayHostname(ctx context.Context, namespace, name string) (string, error) {
 	gw := &unstructured.Unstructured{}
 	gw.SetGroupVersionKind(gvkGateway)
 	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, gw); err != nil {
 		return "", fmt.Errorf("get Gateway %s/%s: %w", namespace, name, err)
 	}
+	if !hasHTTPSListener(gw) {
+		return "", fmt.Errorf("gateway %s/%s has no HTTPS listener; the portal routes and OIDC callback require one", namespace, name)
+	}
 	hostname := ListenerHostname(gw)
 	if hostname == "" {
-		return "", fmt.Errorf("gateway %s/%s has no HTTPS listener with a concrete hostname", namespace, name)
+		hostname = gatewayStatusHostname(gw)
+	}
+	if hostname == "" {
+		routeHost, err := r.gatewayRouteHostname(ctx, namespace, name)
+		if err != nil {
+			return "", fmt.Errorf("gateway %s/%s has no HTTPS listener with a concrete hostname: %w", namespace, name, err)
+		}
+		if routeHost == "" {
+			return "", fmt.Errorf("gateway %s/%s has no HTTPS listener with a concrete hostname, no external status address, and no Route in %s fronts it with a usable host",
+				namespace, name, namespace)
+		}
+		hostname = routeHost
 	}
 	return hostname, nil
+}
+
+// hasHTTPSListener reports whether the Gateway has any HTTPS listener.
+func hasHTTPSListener(gateway *unstructured.Unstructured) bool {
+	listeners, _, _ := unstructured.NestedSlice(gateway.Object, "spec", "listeners")
+	for _, entry := range listeners {
+		listener, ok := entry.(map[string]any)
+		if !ok {
+			continue
+		}
+		protocol, _, _ := unstructured.NestedString(listener, "protocol")
+		if protocol == "HTTPS" {
+			return true
+		}
+	}
+	return false
+}
+
+// internalAddressSuffixes are cluster-internal DNS suffixes. A Gateway whose
+// data-plane Service is ClusterIP publishes its internal service name in
+// status.addresses; that name is not usable as the OIDC callback host.
+// ".svc" catches the short form (x.namespace.svc); ".cluster.local" also
+// subsumes the long form (x.namespace.svc.cluster.local).
+var internalAddressSuffixes = []string{".svc", ".cluster.local"}
+
+// gatewayStatusHostname returns the first external Hostname-type Gateway
+// status address, or "" when there is none. IP-type addresses are skipped:
+// OIDC redirect URIs are broker-registered hostnames in practice, and the
+// presented certificate would not match an IP.
+func gatewayStatusHostname(gateway *unstructured.Unstructured) string {
+	addresses, _, _ := unstructured.NestedSlice(gateway.Object, "status", "addresses")
+	for _, entry := range addresses {
+		address, ok := entry.(map[string]any)
+		if !ok {
+			continue
+		}
+		addressType, _, _ := unstructured.NestedString(address, "type")
+		value, _, _ := unstructured.NestedString(address, "value")
+		if addressType != "Hostname" || value == "" || strings.HasPrefix(value, "*") {
+			continue
+		}
+		internal := false
+		for _, suffix := range internalAddressSuffixes {
+			if strings.HasSuffix(value, suffix) {
+				internal = true
+				break
+			}
+		}
+		if !internal {
+			return value
+		}
+	}
+	return ""
+}
+
+// gatewayRouteHostname returns the host of the OpenShift Route that fronts
+// the Gateway in the ClusterIP + Route gateway pattern. Routes are
+// discovered rather than addressed by name: a Route counts only when it can
+// actually serve the portal — TLS configured (an insecure Route cannot serve
+// the https:// OIDC callback), no path restriction or "/" (a Route scoped to
+// a subpath would not forward /maas-portal or /oauth2), a concrete non-
+// wildcard host, and a backend Service carrying the Gateway data-plane
+// identity label (gateway.networking.k8s.io/gateway-name). When several
+// Routes front the same Gateway, the well-known setup-script name wins and
+// otherwise the lexicographically first Route name does, so the choice is
+// deterministic.
+func (r *Reconciler) gatewayRouteHostname(ctx context.Context, namespace, gatewayName string) (string, error) {
+	routes := &unstructured.UnstructuredList{}
+	routes.SetGroupVersionKind(gvkOpenShiftRouteList)
+	if err := r.APIReader.List(ctx, routes, client.InNamespace(namespace)); err != nil {
+		return "", fmt.Errorf("list Routes in %s: %w", namespace, err)
+	}
+	fallbackHost, fallbackName := "", ""
+	for _, route := range routes.Items {
+		host, _, _ := unstructured.NestedString(route.Object, "spec", "host")
+		if host == "" || strings.HasPrefix(host, "*") {
+			continue
+		}
+		if tls, found, _ := unstructured.NestedFieldNoCopy(route.Object, "spec", "tls"); !found || tls == nil {
+			continue
+		}
+		if path, _, _ := unstructured.NestedString(route.Object, "spec", "path"); path != "" && path != "/" {
+			continue
+		}
+		backend, _, _ := unstructured.NestedString(route.Object, "spec", "to", "name")
+		if backend == "" {
+			continue
+		}
+		fronts, err := r.routeFrontsGateway(ctx, namespace, backend, gatewayName)
+		if err != nil {
+			return "", err
+		}
+		if !fronts {
+			continue
+		}
+		if route.GetName() == GatewayRouteName {
+			return host, nil
+		}
+		if fallbackHost == "" || route.GetName() < fallbackName {
+			fallbackHost, fallbackName = host, route.GetName()
+		}
+	}
+	return fallbackHost, nil
+}
+
+// routeFrontsGateway reports whether the named Service is the Gateway's
+// data-plane Service, identified by the gateway-name label.
+func (r *Reconciler) routeFrontsGateway(ctx context.Context, namespace, serviceName, gatewayName string) (bool, error) {
+	service := &corev1.Service{}
+	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: serviceName}, service); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("get Service %s/%s: %w", namespace, serviceName, err)
+	}
+	return service.Labels["gateway.networking.k8s.io/gateway-name"] == gatewayName, nil
 }
 
 // providerCAKeys returns the odh-trusted-ca-bundle keys that contain

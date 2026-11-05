@@ -24,3 +24,6 @@ The [Kind environment](./test/kind-env/README.md) provides reproducible
 functional integration and routing validation using pinned source revisions
 and locally loaded images. It is isolated from production manifests and
 records evidence for every qualification run.
+
+See [Amazon Bedrock Mantle ExternalModels](./docs/external-model-bedrock-mantle.md)
+for the provider identifier, authentication, endpoint, and API scope.
