@@ -1267,7 +1267,13 @@ func seedSafeExternalModelRuntime(t *testing.T, r *Reconciler, tenantID, namespa
 				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "extproc", Image: "example.invalid/extproc"}}},
 			},
 		},
-		Status: appsv1.DeploymentStatus{ObservedGeneration: 1, Replicas: 1, UpdatedReplicas: 1, ReadyReplicas: 1, AvailableReplicas: 1},
+		Status: appsv1.DeploymentStatus{ObservedGeneration: 1, Replicas: 1, UpdatedReplicas: 1, ReadyReplicas: 1, AvailableReplicas: 1,
+			Conditions: []appsv1.DeploymentCondition{{Type: appsv1.DeploymentAvailable, Status: corev1.ConditionTrue}}},
+	}
+	// The safe runtime replaces the available ExtProc Deployment
+	// controllerTestClient seeds for each tenant.
+	if err := client.IgnoreNotFound(r.Delete(context.Background(), &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: deploymentName, Namespace: namespace}})); err != nil {
+		t.Fatal(err)
 	}
 	rs := &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: deploymentName + "-new", Namespace: namespace, UID: types.UID("rs-" + tenantID), Labels: selector,
 		Annotations: map[string]string{"deployment.kubernetes.io/revision": "1"},

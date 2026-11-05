@@ -17,36 +17,37 @@ limitations under the License.
 package guardrail
 
 import (
-	"strings"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
-// nemoEndpoint is the address TrustyAI publishes for the standard fixture,
-// formatted the way controllers/nemo_guardrails/status.go does.
+// nemoEndpoint is the Service URL of the standard fixture with auth on, the
+// form TrustyAI's controllers/nemo_guardrails/status.go formats.
 const nemoEndpoint = "https://" + nemoName + "." + providerNS + ".svc.cluster.local"
 
-// TestEvaluateNemoReadyGatesOnTheDiscoveredEndpoint covers the contract
-// TrustyAI merged in PR #977: status.endpoint is the sole input, and
-// everything else the CR reports is irrelevant to the verdict.
+// TestEvaluateNemoReadyGatesOnTheDiscoveredEndpoint covers discovery:
+// status.workloadNamespace is the only status input, the auth annotation picks
+// the scheme, and everything else the CR reports is irrelevant to the verdict.
 //
 // The two cases worth reading carefully are the crossed ones. A provider with
-// phase Ready and a True DeploymentReady condition but no endpoint must still
-// be refused, and a provider with an endpoint and no phase at all must still
+// phase Ready and a True DeploymentReady condition but no workload namespace
+// must still be refused, and a provider with one and no phase at all must still
 // be accepted. Those pin the rule that nothing here may consult phase or
 // DeploymentReady: upstream's CheckDeploymentReady always returns true
 // (RHAI-4448 / RHOAIENG-96107), and with spec.exposeRoute unset the phase it
 // feeds is Ready unconditionally, so reading either would make this evaluator
-// fail open against a dead server. PR #977 did not change that.
+// fail open against a dead server.
 func TestEvaluateNemoReadyGatesOnTheDiscoveredEndpoint(t *testing.T) {
-	withStatus := func(status map[string]any) *unstructured.Unstructured {
+	provider := func(annotations map[string]string, status map[string]any) *unstructured.Unstructured {
 		u := NewNemoGuardrails()
 		u.SetName(nemoName)
 		u.SetNamespace(providerNS)
+		u.SetAnnotations(annotations)
 		u.Object["status"] = status
 		return u
 	}
+	auth := map[string]string{nemoAuthAnnotation: "true"}
 
 	cases := []struct {
 		name         string
@@ -57,51 +58,16 @@ func TestEvaluateNemoReadyGatesOnTheDiscoveredEndpoint(t *testing.T) {
 		{name: "no provider object"},
 		{name: "no status", provider: NewNemoGuardrails()},
 		{
-			// What an auth-disabled server looks like: upstream writes the
-			// field only when utils.RequiresAuth holds, and clears it
-			// otherwise.
-			name:     "endpoint present but empty",
-			provider: withStatus(map[string]any{"endpoint": ""}),
+			name:     "workload namespace present but empty",
+			provider: provider(auth, map[string]any{"workloadNamespace": ""}),
 		},
 		{
-			name:     "endpoint is not a URL",
-			provider: withStatus(map[string]any{"endpoint": "nemo.provider-ns.svc.cluster.local"}),
+			name:     "invalid workload namespace",
+			provider: provider(auth, map[string]any{"workloadNamespace": "evil.example.com#"}),
 		},
 		{
-			// Auth off: TrustyAI publishes the same Service URL with http.
-			name:         "endpoint is http",
-			provider:     withStatus(map[string]any{"endpoint": "http://" + nemoName + "." + providerNS + ".svc.cluster.local"}),
-			wantReady:    true,
-			wantEndpoint: "http://" + nemoName + "." + providerNS + ".svc.cluster.local",
-		},
-		{
-			name:     "endpoint has a scheme but no host",
-			provider: withStatus(map[string]any{"endpoint": "https:///v1/checks"}),
-		},
-		{
-			// Callers append their own path to this value, so a query or a
-			// fragment would end up in the middle of the resulting URL.
-			name:     "endpoint carries a query string",
-			provider: withStatus(map[string]any{"endpoint": nemoEndpoint + "/?debug=1"}),
-		},
-		{
-			name:     "endpoint carries an empty forced query",
-			provider: withStatus(map[string]any{"endpoint": nemoEndpoint + "?"}),
-		},
-		{
-			name:     "endpoint carries a fragment",
-			provider: withStatus(map[string]any{"endpoint": nemoEndpoint + "/#section"}),
-		},
-		{
-			// Accepting this would copy the password into
-			// status.providerEndpoint, the binding revision, and the Warning
-			// Event refuse emits.
-			name:     "endpoint embeds userinfo credentials",
-			provider: withStatus(map[string]any{"endpoint": "https://user:pw@" + nemoName + "." + providerNS + ".svc.cluster.local"}),
-		},
-		{
-			name: "phase Ready and DeploymentReady True, but no endpoint",
-			provider: withStatus(map[string]any{
+			name: "phase Ready and DeploymentReady True, but no workload namespace",
+			provider: provider(auth, map[string]any{
 				"phase": "Ready",
 				"conditions": []any{
 					map[string]any{"type": "DeploymentReady", "status": "True"},
@@ -110,39 +76,47 @@ func TestEvaluateNemoReadyGatesOnTheDiscoveredEndpoint(t *testing.T) {
 			}),
 		},
 		{
-			name:         "endpoint published",
-			provider:     withStatus(map[string]any{"endpoint": nemoEndpoint, "phase": "Ready"}),
+			name:         "auth on",
+			provider:     provider(auth, map[string]any{"workloadNamespace": providerNS, "phase": "Ready"}),
 			wantReady:    true,
 			wantEndpoint: nemoEndpoint,
 		},
 		{
-			// The inverse crossed case. TrustyAI writes the endpoint from its
-			// not-ready path too, so discovery succeeding while the server is
-			// still coming up is a state that genuinely occurs.
-			name:         "endpoint published with no phase and a False DeploymentReady",
-			provider:     withStatus(map[string]any{"endpoint": nemoEndpoint, "conditions": []any{map[string]any{"type": "DeploymentReady", "status": "False"}}}),
+			// utils.RequiresAuth lowercases the value.
+			name:         "auth on, mixed case",
+			provider:     provider(map[string]string{nemoAuthAnnotation: "True"}, map[string]any{"workloadNamespace": providerNS}),
 			wantReady:    true,
 			wantEndpoint: nemoEndpoint,
 		},
 		{
-			// No endpoint published: the server is its plain http Service
-			// on port 80 in the published workload namespace. TrustyAI names
-			// that Service <custom-resource namespace>-<custom-resource name>.
-			name:         "workload namespace published, no endpoint",
-			provider:     withStatus(map[string]any{"workloadNamespace": "nemo-workloads"}),
-			wantReady:    true,
-			wantEndpoint: "http://" + providerNS + "-" + nemoName + ".nemo-workloads.svc.cluster.local",
-		},
-		{
-			name:     "invalid workload namespace",
-			provider: withStatus(map[string]any{"workloadNamespace": "evil.example.com#"}),
-		},
-		{
-			// A published https endpoint wins over the derived one.
-			name:         "endpoint and workload namespace published",
-			provider:     withStatus(map[string]any{"endpoint": nemoEndpoint, "workloadNamespace": providerNS}),
+			// The inverse crossed case. TrustyAI publishes the workload
+			// namespace from its not-ready path too, so discovery succeeding
+			// while the server is still coming up is a state that genuinely
+			// occurs.
+			name:         "workload namespace published with no phase and a False DeploymentReady",
+			provider:     provider(auth, map[string]any{"workloadNamespace": providerNS, "conditions": []any{map[string]any{"type": "DeploymentReady", "status": "False"}}}),
 			wantReady:    true,
 			wantEndpoint: nemoEndpoint,
+		},
+		{
+			name:         "auth annotation absent",
+			provider:     provider(nil, map[string]any{"workloadNamespace": providerNS}),
+			wantReady:    true,
+			wantEndpoint: "http://" + nemoName + "." + providerNS + ".svc.cluster.local",
+		},
+		{
+			name:         "auth annotation false",
+			provider:     provider(map[string]string{nemoAuthAnnotation: "false"}, map[string]any{"workloadNamespace": providerNS}),
+			wantReady:    true,
+			wantEndpoint: "http://" + nemoName + "." + providerNS + ".svc.cluster.local",
+		},
+		{
+			// Outside its own namespace TrustyAI names the Service
+			// <custom-resource namespace>-<custom-resource name>.
+			name:         "workload in another namespace",
+			provider:     provider(auth, map[string]any{"workloadNamespace": "nemo-workloads"}),
+			wantReady:    true,
+			wantEndpoint: "https://" + providerNS + "-" + nemoName + ".nemo-workloads.svc.cluster.local",
 		},
 	}
 	for _, c := range cases {
@@ -163,42 +137,6 @@ func TestEvaluateNemoReadyGatesOnTheDiscoveredEndpoint(t *testing.T) {
 			}
 			if got.Message == "" {
 				t.Error("message is empty; status has to say why this verdict was reached")
-			}
-		})
-	}
-}
-
-// TestEvaluateNemoReadyDoesNotEchoTheRejectedEndpoint pins that a refusal
-// never republishes the raw status.endpoint. The field belongs to another
-// controller, so the rejected string is arbitrary input rather than the DNS
-// name the success path assumes, and Reconcile puts this message into both a
-// condition and a Warning Event that any reader of the consumer namespace can
-// see.
-func TestEvaluateNemoReadyDoesNotEchoTheRejectedEndpoint(t *testing.T) {
-	const secret = "sup3rs3cret"
-	host := nemoName + "." + providerNS + ".svc.cluster.local"
-
-	for _, endpoint := range []string{
-		"https://user:" + secret + "@" + host,
-		"http://user:" + secret + "@" + host,
-		"https://" + host + "/?token=" + secret,
-		"https://" + host + "/#" + secret,
-	} {
-		t.Run(endpoint, func(t *testing.T) {
-			provider := NewNemoGuardrails()
-			provider.SetName(nemoName)
-			provider.SetNamespace(providerNS)
-			provider.Object["status"] = map[string]any{"endpoint": endpoint}
-
-			got := evaluateNemoReady(provider)
-			if got.Ready {
-				t.Fatal("accepted an endpoint that is not a plain absolute http or https base URL")
-			}
-			if got.Endpoint != "" {
-				t.Errorf("endpoint = %q, want it withheld on refusal", got.Endpoint)
-			}
-			if strings.Contains(got.Message, secret) {
-				t.Errorf("refusal message republishes the rejected value: %q", got.Message)
 			}
 		})
 	}

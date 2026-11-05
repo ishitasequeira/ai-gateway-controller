@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -70,7 +71,10 @@ const (
 	externalProviderFinalizer     = "inference.opendatahub.io/external-provider-cleanup"
 )
 
-var errCredentialNotReady = errors.New("effective provider credential is not ready")
+var (
+	errCredentialNotReady = errors.New("effective provider credential is not ready")
+	errInvalidModelName   = errors.New("ExternalModel name cannot be rendered")
+)
 
 // errProviderCANotReady reports a tls.credentialName Secret that is missing or
 // has no CA, without saying which (see validateProviderCACredential).
@@ -553,6 +557,11 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 
 	live, err := r.liveTenantResolution(ctx, provider.Namespace)
 	if err != nil {
+		// A provider in a namespace no tenant claims is never claimed for its
+		// tenant (see below), so the resolution is only retried.
+		if tenantNamespace, nsErr := r.tenantNamespace(ctx, provider.Namespace); nsErr == nil && !tenantNamespace {
+			return reconcile.Result{}, err
+		}
 		// Tenant resolution fails on an unreadable or inconsistent AITenant
 		// owner. Claim the provider and report Pending before returning: a bare
 		// error would leave it with neither our finalizer nor a status writer,
@@ -587,8 +596,10 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 	if !live.missingConfig && live.status == "" {
 		// Praxis is selected but the handoff has not started (see
 		// tenant.LegacyServes): IPP still serves this namespace and owns
-		// provider status until maas-controller writes cleanup-complete.
-		return reconcile.Result{}, nil
+		// provider status until maas-controller writes cleanup-complete. A
+		// claim left by a failed tenant lookup is released once nothing uses
+		// the provider's transport, so IPP reports the provider again.
+		return r.releaseProviderClaim(ctx, &provider)
 	}
 	validationErr := r.validateProvider(ctx, &provider)
 	if validationErr == nil {
@@ -597,12 +608,14 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 	if live.missingConfig {
 		// A namespace no tenant claims is served only through Gateway
 		// attachments: its provider has no tenant-local transport, so only its
-		// own configuration is reported. While IPP serves the default tenant,
-		// it serves this namespace's models and reports their providers'
-		// status instead. Every tenant Gateway is in the configured Gateway
-		// namespace, where its CA Secret must be. A tenant namespace whose
-		// MaasTenantConfig maas-controller has not created yet falls through
-		// and is claimed below.
+		// own configuration is reported. Our finalizer on it, which an
+		// attachment or a former tenant of the namespace left, is released once
+		// nothing uses its transport. While IPP serves the default tenant, it
+		// serves this namespace's models and reports their providers' status
+		// instead. Every tenant Gateway is in the configured Gateway namespace,
+		// where its CA Secret must be. A tenant namespace whose MaasTenantConfig
+		// maas-controller has not created yet falls through and is claimed
+		// below.
 		tenantNamespace, err := r.tenantNamespace(ctx, provider.Namespace)
 		if err != nil {
 			return reconcile.Result{}, err
@@ -673,6 +686,31 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 		return reconcile.Result{}, err
 	}
 	return reconcile.Result{}, nil
+}
+
+// releaseProviderClaim removes our claim from a provider we do not serve, such
+// as the claim a failed tenant lookup leaves: its transport, then our
+// finalizer. While a published overlay or an HTTPRoute still uses the
+// transport, such as an attachment of a model in this namespace to a Praxis
+// tenant, the claim is the provider's deletion protection (see
+// ensureAttachmentProviderFinalizers) and stays until that use is withdrawn;
+// the provider is rechecked. A provider without the finalizer has nothing to
+// release.
+func (r *Reconciler) releaseProviderClaim(ctx context.Context, provider *v1alpha1.ExternalProvider) (reconcile.Result, error) {
+	if !controllerutil.ContainsFinalizer(provider, externalProviderFinalizer) {
+		return reconcile.Result{}, nil
+	}
+	inUse, err := r.providerTransportStillInUse(ctx, provider.Namespace, provider.Name)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	if inUse {
+		return reconcile.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+	if err := r.cleanupProviderTransport(ctx, provider.Namespace, provider.Name); err != nil {
+		return reconcile.Result{}, err
+	}
+	return reconcile.Result{}, r.removeExternalProviderFinalizer(ctx, provider)
 }
 
 // reconcileAttachmentOnlyProvider reports the status of a provider in a
@@ -803,6 +841,8 @@ type homeModelPublication struct {
 	weightDisabled    bool
 	unroutedReason    string
 	unroutedMessage   string
+	servingReason     string
+	servingMessage    string
 	attached          []attachedModel
 	state             map[string]attachedModel
 	remaining         time.Duration
@@ -955,12 +995,14 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 	if !unrouted {
 		unroutedReason, unroutedMessage = "", ""
 	}
+	servingReason, servingMessage := r.homeServingState(ctx, model, home)
 	return r.finishHomeModelPublication(ctx, homeModelPublication{
 		result: result, namespace: req.Namespace,
 		gateway: home.gateway, denied: denied[req.String()],
 		unserved:       unserved[req.String()],
 		weightDisabled: explicitlyWeightDisabledModels(set)[req.String()],
 		unroutedReason: unroutedReason, unroutedMessage: unroutedMessage,
+		servingReason: servingReason, servingMessage: servingMessage,
 		attached: attached, state: state,
 		remaining: remaining, withdrawalPending: withdrawalPending, report: report,
 	})
@@ -987,6 +1029,7 @@ func homeModelInputs(models []v1alpha1.ExternalModel, gatewayName, gatewayNamesp
 
 func (r *Reconciler) finishHomeModelPublication(ctx context.Context, publication homeModelPublication) (reconcile.Result, error) {
 	var statusErr error
+	var waiting time.Duration
 	switch {
 	case publication.weightDisabled:
 		statusErr = publication.report(false, reasonNoRoutes, "all ExternalModel provider references are explicitly disabled by weight", nil)
@@ -996,6 +1039,14 @@ func (r *Reconciler) finishHomeModelPublication(ctx context.Context, publication
 		statusErr = publication.report(false, reasonProviderNotReady, publication.unserved, nil)
 	case publication.unroutedReason != "":
 		statusErr = publication.report(false, publication.unroutedReason, publication.unroutedMessage, nil)
+	case publication.servingReason != "":
+		// The overlay is published, but the model serves only once the
+		// Gateway accepts its route and the tenant's ExtProc is available; a
+		// model waiting for them is rechecked.
+		statusErr = publication.report(false, publication.servingReason, publication.servingMessage, nil)
+		if waitingReason(publication.servingReason) {
+			waiting = attachmentRequeueInterval
+		}
 	default:
 		message := fmt.Sprintf("distributed routing overlay digest %s generation %d", publication.result.Envelope.Revision.Value, publication.result.Envelope.Provenance.SourceGeneration)
 		statusErr = publication.report(true, reasonReconciled, message, &publication.result.Envelope)
@@ -1004,6 +1055,9 @@ func (r *Reconciler) finishHomeModelPublication(ctx context.Context, publication
 		if statusErr != nil {
 			return reconcile.Result{}, statusErr
 		}
+		if waiting > 0 {
+			return reconcile.Result{RequeueAfter: min(waiting, publication.remaining)}, nil
+		}
 		return reconcile.Result{RequeueAfter: publication.remaining}, nil
 	}
 	if publication.withdrawalPending {
@@ -1011,7 +1065,10 @@ func (r *Reconciler) finishHomeModelPublication(ctx context.Context, publication
 			return reconcile.Result{}, err
 		}
 	}
-	return reconcile.Result{}, statusErr
+	if statusErr != nil {
+		return reconcile.Result{}, statusErr
+	}
+	return reconcile.Result{RequeueAfter: waiting}, nil
 }
 
 func (r *Reconciler) handleHomeRouteResolutionError(
@@ -2145,6 +2202,11 @@ func excludeUnsupportedModelSelection(set *resolver.ResolvedRouteSet) (*resolver
 	bindings := make(map[string]bool)
 	duplicateProviders := make(map[string]bool)
 	for _, model := range set.Models {
+		if len(model.Routes) > 0 {
+			if err := validateModelName(model.Routes[0].Model); err != nil {
+				rejected[model.ModelRef] = err
+			}
+		}
 		if count := modelHTTPRouteRuleCount(model.Routes); count > maxHTTPRouteRules {
 			rejected[model.ModelRef] = fmt.Errorf("%d HTTPRoute rules exceed the Gateway API limit of %d", count, maxHTTPRouteRules)
 		}
@@ -2168,6 +2230,27 @@ func excludeUnsupportedModelSelection(set *resolver.ResolvedRouteSet) (*resolver
 		}
 	}
 	return valid, rejected
+}
+
+// validateModelName rejects an ExternalModel name that cannot be the value of
+// the label on the objects rendered for the model, so at most 63 characters
+// (RHOAIENG-100314). The model's HTTPRoute name and overlay stable_id then fit
+// their limits too, and a selection sink name that is not a valid Service name
+// is hashed (see providerSelectionSinkName).
+func validateModelName(name string) error {
+	if problems := validation.IsValidLabelValue(name); len(problems) > 0 {
+		return fmt.Errorf("%w: %q is not a valid label value (%s); use a shorter metadata.name and set spec.modelName to the client-facing name",
+			errInvalidModelName, name, strings.Join(problems, "; "))
+	}
+	return nil
+}
+
+// rejectionReason is the status reason for a model excludeUnsupportedModelSelection rejects.
+func rejectionReason(err error) string {
+	if errors.Is(err, errInvalidModelName) {
+		return reasonInvalidName
+	}
+	return reasonReconcileFailed
 }
 
 func allRoutesExplicitlyWeightDisabled(set *resolver.ResolvedRouteSet) bool {
@@ -2206,13 +2289,13 @@ func (r *Reconciler) validateModelRouteSet(ctx context.Context, set *resolver.Re
 			if owner.Namespace == current.Namespace && owner.Name == current.Name {
 				continue
 			}
-			if err := r.updateModelStatus(ctx, owner, false, reasonReconcileFailed, rejection.Error(), nil); err != nil {
+			if err := r.updateModelStatus(ctx, owner, false, rejectionReason(rejection), rejection.Error(), nil); err != nil {
 				return nil, err
 			}
 		}
 	}
 	if err := rejected[current.Namespace+"/"+current.Name]; err != nil {
-		if statusErr := report(false, reasonReconcileFailed, err.Error(), nil); statusErr != nil {
+		if statusErr := report(false, rejectionReason(err), err.Error(), nil); statusErr != nil {
 			return nil, statusErr
 		}
 		return nil, err
@@ -2639,7 +2722,10 @@ func (r *Reconciler) updateModelStatus(ctx context.Context, m *v1alpha1.External
 			setCondition(&m.Status.Conditions, conditionOverlayDistributed, metav1.ConditionTrue, reasonReconciled, message)
 		}
 	} else {
-		m.Status.Phase = "Failed"
+		m.Status.Phase = modelPhaseFailed
+		if waitingReason(reason) {
+			m.Status.Phase = modelPhasePending
+		}
 		setCondition(&m.Status.Conditions, conditionOverlayDistributed, metav1.ConditionFalse, reason, message)
 		if r.staleRouteName(ctx, m) {
 			m.Status.HTTPRouteName = ""
@@ -2984,8 +3070,23 @@ func removeInternalRoutingHeaders() map[string]any {
 	}}
 }
 
+// providerSelectionSinkName names the model's selection sink Service. A model
+// name that makes it an invalid Service name (a DNS-1035 label: no dots, at
+// most 63 characters), such as gpt-4.1, gets
+// provider-selection-required--<model prefix>-<hash12> instead
+// (RHOAIENG-100314). Model names start with an alphanumeric, so the double
+// dash never matches a valid name, and every valid name keeps its form.
 func providerSelectionSinkName(model string) string {
-	return providerSelectionSinkPrefix + strings.ToLower(strings.ReplaceAll(model, "/", "-"))
+	name := providerSelectionSinkPrefix + strings.ToLower(strings.ReplaceAll(model, "/", "-"))
+	if len(validation.IsDNS1035Label(name)) == 0 {
+		return name
+	}
+	hash := shortHash(model)
+	base := strings.ReplaceAll(strings.TrimPrefix(name, providerSelectionSinkPrefix), ".", "-")
+	if limit := 63 - len(providerSelectionSinkPrefix) - len(hash) - 2; len(base) > limit {
+		base = strings.TrimRight(base[:limit], "-")
+	}
+	return providerSelectionSinkPrefix + "-" + base + "-" + hash
 }
 
 func providerSelectionSink(route resolver.Route, namespace string) unstructured.Unstructured {

@@ -182,7 +182,8 @@ func (r *Reconciler) maasTenantConfigForSecret(ctx context.Context, obj client.O
 			return nil
 		}
 		name, _, refOK := ClientSecretRef(aitenant)
-		if obj.GetName() == CredentialsSecretName || (refOK && obj.GetNamespace() == namespace && obj.GetName() == name) {
+		if obj.GetName() == CredentialsSecretName || obj.GetName() == RedisSecretName ||
+			(refOK && obj.GetNamespace() == namespace && obj.GetName() == name) {
 			return []reconcile.Request{{NamespacedName: types.NamespacedName{
 				Namespace: namespace,
 				Name:      tenant.MaasTenantConfigInstanceName,
@@ -259,6 +260,35 @@ func (r *Reconciler) maasTenantConfigForPortalRoute(ctx context.Context, obj cli
 	return requests
 }
 
+// redisConfig reads the optional customer-provided Redis Secret. A missing
+// Secret keeps cookie sessions; a present one enables server-side sessions
+// and its hash rolls the proxy when the connection details change.
+func (r *Reconciler) redisConfig(ctx context.Context, namespace string) (url, hash string, err error) {
+	secret := &corev1.Secret{}
+	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: RedisSecretName}, secret); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", "", nil
+		}
+		return "", "", fmt.Errorf("get Secret %s/%s: %w", namespace, RedisSecretName, err)
+	}
+	url = string(secret.Data["connection-url"])
+	if url == "" {
+		// Present but incomplete: treat as not configured rather than
+		// starting a proxy that points at nothing.
+		return "", "", nil
+	}
+	// The hash only needs to change when the Secret changes. Derive it from
+	// the Secret's metadata (UID + ResourceVersion), never from the
+	// connection details: the hash is stamped on the pod template, which
+	// any principal with Deployment read can inspect, and a hash of a
+	// guessable URL plus a low-entropy password admits an offline
+	// dictionary attack. Metadata changes on every Secret update, so the
+	// proxy also restarts on unrelated Secret edits — acceptable.
+	meta := string(secret.UID) + "/" + secret.ResourceVersion
+	sum := sha256.Sum256([]byte(meta))
+	return url, hex.EncodeToString(sum[:])[:16], nil
+}
+
 func (r *Reconciler) allMaasTenantConfigs(ctx context.Context) []reconcile.Request {
 	list := &unstructured.UnstructuredList{}
 	list.SetGroupVersionKind(tenant.MaasTenantConfigGVK.GroupVersion().WithKind(tenant.MaasTenantConfigGVK.Kind + "List"))
@@ -314,6 +344,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		// OpenShift OAuth mode is not implemented yet; only OIDC mode is.
 		log.Info("default AITenant has no OIDC issuer; OpenShift OAuth mode is not supported yet, removing the auth proxy")
 		return ctrl.Result{}, r.disable(ctx, mtc, infraNamespace)
+	}
+	// The direct-JWT path binds tokens to spec.oidc.clientId (azp); without
+	// it the client-bound rule would compare against an empty string and
+	// reject every token.
+	if OIDCClientID(aitenant) == "" {
+		log.Info("default AITenant has no OIDC clientId; will retry")
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 	}
 	if infraNamespace == "" {
 		log.Info("MaasTenantConfig status.infraNamespace is not populated yet; will retry")
@@ -371,6 +408,15 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 	}
 
+	// Server-side sessions are optional: the customer points the portal at
+	// their own Redis (typically the Kuadrant/Limitador one) by creating the
+	// well-known Secret in the infrastructure namespace. Without it the proxy
+	// keeps cookie sessions.
+	redisURL, redisHash, err := r.redisConfig(ctx, infraNamespace)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 	caKeys, caBundleHash, err := r.providerCAKeys(ctx, infraNamespace)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -386,6 +432,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		Instance:           mtc.GetNamespace(),
 		Image:              r.Image,
 		OIDCIssuerURL:      issuerURL,
+		OIDCClientID:       OIDCClientID(aitenant),
+		RedisConnectionURL: redisURL,
+		RedisHash:          redisHash,
 		Hostname:           hostname,
 		GatewayName:        gatewayName,
 		GatewayNamespace:   gatewayNamespace,
