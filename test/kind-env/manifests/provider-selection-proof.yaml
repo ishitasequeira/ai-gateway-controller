@@ -14,14 +14,27 @@ spec:
     metadata:
       labels: {app: provider-selection-proof-a}
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
       - name: recorder
         image: provider-recorder:issue28-kind
         imagePullPolicy: Never
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
         env:
         - {name: PROVIDER_NAME, value: proof-a}
         - {name: EXPECTED_HOST, value: provider-proof-a-ext.maas-system.svc.cluster.local}
         - {name: CREDENTIAL_FILE, value: /etc/provider-credentials/api-key}
+        - {name: ENABLE_TEST_OBSERVATIONS, value: "true"}
         ports: [{name: https, containerPort: 8443}]
         readinessProbe:
           httpGet: {scheme: HTTPS, path: /healthz, port: https}
@@ -29,6 +42,7 @@ spec:
         volumeMounts:
         - {name: tls, mountPath: /etc/provider/tls, readOnly: true}
         - {name: credential, mountPath: /etc/provider-credentials, readOnly: true}
+        - {name: observations, mountPath: /var/run/provider-observations}
       volumes:
       - name: tls
         secret: {secretName: provider-proof-a-tls}
@@ -36,6 +50,8 @@ spec:
         secret:
           secretName: provider-proof-a-backend-credential
           items: [{key: api-key, path: api-key}]
+      - name: observations
+        emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
@@ -63,14 +79,27 @@ spec:
     metadata:
       labels: {app: provider-selection-proof-b}
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
       - name: recorder
         image: provider-recorder:issue28-kind
         imagePullPolicy: Never
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
         env:
         - {name: PROVIDER_NAME, value: proof-b}
         - {name: EXPECTED_HOST, value: provider-proof-b-ext.maas-system.svc.cluster.local}
         - {name: CREDENTIAL_FILE, value: /etc/provider-credentials/api-key}
+        - {name: ENABLE_TEST_OBSERVATIONS, value: "true"}
         ports: [{name: https, containerPort: 8443}]
         readinessProbe:
           httpGet: {scheme: HTTPS, path: /healthz, port: https}
@@ -78,6 +107,7 @@ spec:
         volumeMounts:
         - {name: tls, mountPath: /etc/provider/tls, readOnly: true}
         - {name: credential, mountPath: /etc/provider-credentials, readOnly: true}
+        - {name: observations, mountPath: /var/run/provider-observations}
       volumes:
       - name: tls
         secret: {secretName: provider-proof-b-tls}
@@ -85,6 +115,73 @@ spec:
         secret:
           secretName: provider-proof-b-backend-credential
           items: [{key: api-key, path: api-key}]
+      - name: observations
+        emptyDir: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: provider-selection-proof-c
+  namespace: maas-system
+  labels:
+    app.kubernetes.io/managed-by: external-model-e2e
+    external-model-e2e/purpose: provider-selection-proof
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: provider-selection-proof-c}
+  template:
+    metadata:
+      labels: {app: provider-selection-proof-c}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: recorder
+        image: provider-recorder:issue28-kind
+        imagePullPolicy: Never
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        env:
+        - {name: PROVIDER_NAME, value: proof-c}
+        - {name: EXPECTED_HOST, value: provider-proof-c-ext.maas-system.svc.cluster.local}
+        - {name: CREDENTIAL_FILE, value: /etc/provider-credentials/api-key}
+        - {name: ENABLE_TEST_OBSERVATIONS, value: "true"}
+        ports: [{name: https, containerPort: 8443}]
+        readinessProbe:
+          httpGet: {scheme: HTTPS, path: /healthz, port: https}
+          periodSeconds: 2
+        volumeMounts:
+        - {name: tls, mountPath: /etc/provider/tls, readOnly: true}
+        - {name: credential, mountPath: /etc/provider-credentials, readOnly: true}
+        - {name: observations, mountPath: /var/run/provider-observations}
+      volumes:
+      - name: tls
+        secret: {secretName: provider-proof-c-tls}
+      - name: credential
+        secret:
+          secretName: provider-proof-c-backend-credential
+          items: [{key: api-key, path: api-key}]
+      - name: observations
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: provider-proof-c-ext
+  namespace: maas-system
+  labels: {app.kubernetes.io/managed-by: external-model-e2e}
+spec:
+  selector: {app: provider-selection-proof-c}
+  ports: [{name: https, port: 443, targetPort: https}]
 ---
 apiVersion: v1
 kind: Service

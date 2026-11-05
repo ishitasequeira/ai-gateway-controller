@@ -40,7 +40,8 @@ type ExternalProvider struct {
 // ExternalProviderSpec defines the desired state of ExternalProvider.
 type ExternalProviderSpec struct {
 	// Provider identifies the API type for this provider.
-	// e.g. "openai", "anthropic", "azure", "aws-bedrock", "vertex".
+	// e.g. "openai", "anthropic", "azure", "aws-bedrock", "vertex", "bedrock-openai".
+	// Use "bedrock-openai" for Bedrock Mantle's OpenAI-compatible API; it does not mean Bedrock Runtime.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=63
@@ -61,6 +62,10 @@ type ExternalProviderSpec struct {
 
 	// Config holds provider-specific configuration as key-value pairs.
 	// e.g., Vertex AI: {"project": "my-project", "location": "us-central1"}.
+	// To trust a provider certificate signed by a private CA, set one of:
+	// tls.credentialName, the name of a Secret in the Gateway namespace whose
+	// cacert key holds the PEM CA chain; or tls.caCertificates, the absolute
+	// path of a CA file already mounted in the Gateway.
 	// +optional
 	Config map[string]string `json:"config,omitempty"`
 }

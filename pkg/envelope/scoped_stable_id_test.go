@@ -85,7 +85,6 @@ func TestValidateModelMatchesRenderRejections(t *testing.T) {
 	unqualified := route("model", "openai", 1)
 	unqualified.APIFormat = "messages"
 	for name, m := range map[string]resolver.ModelRoutes{
-		"weights":    {ModelRef: "team/model", Routes: []resolver.Route{route("model", "a", 1), route("model", "b", 2)}},
 		"credential": {ModelRef: "team/model", Routes: []resolver.Route{unqualified}},
 		"duplicate":  {ModelRef: "team/model", Routes: []resolver.Route{route("model", "a", 1), route("model", "a", 1)}},
 	} {
@@ -96,7 +95,43 @@ func TestValidateModelMatchesRenderRejections(t *testing.T) {
 			t.Fatalf("%s: Render accepted the model", name)
 		}
 	}
+	unequal := resolver.ModelRoutes{ModelRef: "team/model", Routes: []resolver.Route{route("model", "a", 1), route("model", "b", 2)}}
+	if err := ValidateModel(unequal, Options{}); err != nil {
+		t.Fatalf("unequal weights must be accepted: %v", err)
+	}
+	if _, err := Render(routeSet(unequal), scope(), Revision{}, Options{}); err != nil {
+		t.Fatalf("unequal weights must render: %v", err)
+	}
 	if err := ValidateModel(resolver.ModelRoutes{Routes: []resolver.Route{route("model", "a", 1)}}, Options{KnownClusters: []string{"provider-b"}}); err == nil {
 		t.Fatal("ValidateModel accepted an unknown cluster")
+	}
+}
+
+func TestPreservedCandidatesNormalizeUnderWeightedRandom(t *testing.T) {
+	group := uint32(0)
+	preserved := []Candidate{
+		{Cluster: "provider-a", StableID: "own/provider-a", Kind: "inference_model", Name: "own", Site: "site-a", Fresh: true, SelectionGroup: &group},
+		{Cluster: "provider-b", StableID: "own/provider-b", Kind: "inference_model", Name: "own", Site: "site-a", Fresh: true, SelectionGroup: &group},
+	}
+	attached := route("model", "openai", 80)
+	attached.StableID = ScopedStableID("team", "model", "team", "openai")
+	second := route("model", "azure", 20)
+	second.StableID = ScopedStableID("team", "model", "team", "azure")
+	env, err := Render(routeSet(resolver.ModelRoutes{ModelRef: "team/model", Routes: []resolver.Route{attached, second}}), scope(), Revision{},
+		Options{PreservedCandidates: preserved})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(env.Overlay.SelectionPolicy) != `{"mode":"weightedRandom"}` {
+		t.Fatalf("selection_policy = %s, want weightedRandom", env.Overlay.SelectionPolicy)
+	}
+	for i, candidate := range env.Overlay.Candidates {
+		if candidate.SelectionGroup == nil || candidate.TrafficWeight == nil {
+			t.Fatalf("candidate %d missing weightedRandom fields: %+v", i, candidate)
+		}
+	}
+	if *env.Overlay.Candidates[0].TrafficWeight != 1 || *env.Overlay.Candidates[1].TrafficWeight != 1 {
+		t.Fatalf("preserved equal-weight candidates default traffic_weight = %v/%v, want 1/1",
+			env.Overlay.Candidates[0].TrafficWeight, env.Overlay.Candidates[1].TrafficWeight)
 	}
 }

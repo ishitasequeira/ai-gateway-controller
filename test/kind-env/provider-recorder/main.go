@@ -3,12 +3,14 @@ package main
 import (
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -46,6 +48,12 @@ type recordedRequest struct {
 	AuthorizationPresent bool     `json:"authorization_present"`
 	AuthorizationScheme  string   `json:"authorization_scheme,omitempty"`
 	CredentialOK         bool     `json:"credential_ok"`
+	RequestBodyBytes     int      `json:"request_body_bytes"`
+	AnthropicRequestOK   bool     `json:"anthropic_request_ok,omitempty"`
+	AnthropicMaxTokens   int      `json:"anthropic_max_tokens,omitempty"`
+	AnthropicBlockTypes  []string `json:"anthropic_block_types,omitempty"`
+	AnthropicImageSource []string `json:"anthropic_image_source_types,omitempty"`
+	LegacyOptionsAbsent  bool     `json:"legacy_options_absent,omitempty"`
 }
 
 type openAIResponse struct {
@@ -94,6 +102,7 @@ type openAIStreamItem struct {
 
 const observationPath = "/var/run/provider-observations/requests.jsonl"
 const externalModelResponseLimitBytes = 1 << 20
+const openAILargeResponseTerminal = "::OPENAI_RESPONSE_COMPLETE::"
 
 var (
 	diagnosticValuePattern  = regexp.MustCompile(`^[A-Za-z0-9._-]{1,80}$`)
@@ -112,6 +121,7 @@ type recorderConfig struct {
 	expectedCredential  string
 	openAICredential    string
 	anthropicCredential string
+	bedrockCredential   string
 	requestIDPattern    *regexp.Regexp
 	streamEventDelay    time.Duration
 	overlayReloadDelay  time.Duration
@@ -164,11 +174,12 @@ func loadRecorderConfig() recorderConfig {
 	providerLabel, ok := map[string]string{
 		"proof-a":        "proof-a",
 		"proof-b":        "proof-b",
+		"proof-c":        "proof-c",
 		"translation":    "translation",
 		"provider-aware": "provider-aware",
 	}[provider]
 	if !ok {
-		log.Fatal("PROVIDER_NAME must be proof-a, proof-b, translation, or provider-aware")
+		log.Fatal("PROVIDER_NAME must be proof-a, proof-b, proof-c, translation, or provider-aware")
 	}
 	responseMode := os.Getenv("RESPONSE_MODE")
 	if responseMode == "" {
@@ -197,6 +208,7 @@ func loadRecorderConfig() recorderConfig {
 		if config.responseMode == "provider-aware" {
 			config.openAICredential = readCredential("OPENAI_CREDENTIAL_FILE")
 			config.anthropicCredential = readCredential("ANTHROPIC_CREDENTIAL_FILE")
+			config.bedrockCredential = readCredential("BEDROCK_CREDENTIAL_FILE")
 		} else {
 			config.expectedCredential = readCredential("CREDENTIAL_FILE")
 		}
@@ -219,9 +231,13 @@ func handleObservations(w http.ResponseWriter, r *http.Request) {
 }
 
 func (config recorderConfig) handleInference(w http.ResponseWriter, r *http.Request) {
-	requestBytes, readErr := io.ReadAll(io.LimitReader(r.Body, 2<<20))
+	requestBytes, readErr := io.ReadAll(io.LimitReader(r.Body, (12<<20)+1))
 	if readErr != nil {
 		http.Error(w, "could not read request body", http.StatusBadRequest)
+		return
+	}
+	if len(requestBytes) > 12<<20 {
+		http.Error(w, "request body exceeds recorder limit", http.StatusRequestEntityTooLarge)
 		return
 	}
 	requestBody := map[string]any{}
@@ -232,12 +248,19 @@ func (config recorderConfig) handleInference(w http.ResponseWriter, r *http.Requ
 	expectedHost := expectedHostFor(r.Host, config.expectedHosts)
 	sniOK := !config.tlsRequired || (expectedHost != "" && r.TLS != nil && r.TLS.ServerName == expectedHost)
 	authorityOK := len(config.expectedHosts) == 0 || expectedHost != "" && r.Host == expectedHost
-	credentialOK := config.validCredential(r)
+	credentialOK := config.validCredential(r, requestBody)
 	status := http.StatusOK
 	if !sniOK || !authorityOK {
 		status = http.StatusMisdirectedRequest
 	} else if !credentialOK {
 		status = http.StatusUnauthorized
+	}
+	var anthropicRequest anthropicRequestInspection
+	if config.responseMode == "provider-aware" && r.URL.Path == "/v1/messages" {
+		anthropicRequest = inspectAnthropicRequest(requestBody)
+		if status == http.StatusOK && !anthropicRequest.Valid {
+			status = http.StatusBadRequest
+		}
 	}
 	requestID := r.Header.Get("X-Translation-Request-Id")
 	if requestID == "" {
@@ -258,6 +281,14 @@ func (config recorderConfig) handleInference(w http.ResponseWriter, r *http.Requ
 	)
 	if config.recordObservations {
 		observation := observe(r, config.providerLabel, requestBody, requestID, credentialOK, sniOK, authorityOK)
+		observation.RequestBodyBytes = len(requestBytes)
+		if config.responseMode == "provider-aware" && r.URL.Path == "/v1/messages" {
+			observation.AnthropicRequestOK = anthropicRequest.Valid
+			observation.AnthropicMaxTokens = anthropicRequest.MaxTokens
+			observation.AnthropicBlockTypes = anthropicRequest.BlockTypes
+			observation.AnthropicImageSource = anthropicRequest.ImageSources
+			observation.LegacyOptionsAbsent = anthropicRequest.LegacyOptionsAbsent
+		}
 		if err := appendObservation(observation); err != nil {
 			log.Printf("failed to save sanitized request observation: %v", err)
 		}
@@ -281,7 +312,7 @@ func (config recorderConfig) handleInference(w http.ResponseWriter, r *http.Requ
 	writeProofResponse(w, response{Provider: config.provider, TLS: r.TLS != nil, SNI: sniOK, Authority: authorityOK, Credential: credentialOK})
 }
 
-func (config recorderConfig) validCredential(r *http.Request) bool {
+func (config recorderConfig) validCredential(r *http.Request, requestBody map[string]any) bool {
 	if !config.credentialRequired {
 		return true
 	}
@@ -293,6 +324,9 @@ func (config recorderConfig) validCredential(r *http.Request) bool {
 	expected := config.expectedCredential
 	if config.responseMode == "provider-aware" {
 		expected = config.openAICredential
+		if model, _ := requestBody["model"].(string); model == "openai.gpt-oss-20b" || model == "openai.gpt-oss-20b-reloaded" {
+			expected = config.bedrockCredential
+		}
 	}
 	credential := strings.TrimPrefix(authorization, bearerPrefix)
 	return strings.HasPrefix(authorization, bearerPrefix) && constantTimeEqual(credential, expected)
@@ -330,6 +364,17 @@ func durationFromEnv(name string) time.Duration {
 	return duration
 }
 
+func bedrockOverlayReloadDelay(requestBody map[string]any) time.Duration {
+	if !hasMessageMarker(requestBody, "externalmodel-overlay-reload-active-bedrock-stream") {
+		return 0
+	}
+	delay, err := time.ParseDuration(os.Getenv("BEDROCK_OVERLAY_RELOAD_STREAM_EVENT_DELAY"))
+	if err != nil || delay <= 0 {
+		return 0
+	}
+	return delay
+}
+
 func readCredential(envName string) string {
 	credentialFile := required(envName)
 	credential, err := os.ReadFile(credentialFile)
@@ -356,12 +401,15 @@ func constantTimeEqual(actual, expected string) bool {
 	return len(actual) == len(expected) && subtle.ConstantTimeCompare([]byte(actual), []byte(expected)) == 1
 }
 
-func hasMessageMarker(body map[string]any, marker string) bool {
+func hasMessageMarker(body map[string]any, markers ...string) bool {
 	messages, _ := body["messages"].([]any)
 	for _, value := range messages {
 		message, _ := value.(map[string]any)
-		if strings.Contains(fmt.Sprint(message["content"]), marker) {
-			return true
+		content := fmt.Sprint(message["content"])
+		for _, marker := range markers {
+			if strings.Contains(content, marker) {
+				return true
+			}
 		}
 	}
 	return false
@@ -591,11 +639,13 @@ func observe(r *http.Request, provider string, body map[string]any, requestID st
 		}
 		switch content := message["content"].(type) {
 		case string:
-			observation.MessageText = append(observation.MessageText, content)
+			if len(content) <= 256 {
+				observation.MessageText = append(observation.MessageText, content)
+			}
 		case []any:
 			for _, part := range content {
 				block, _ := part.(map[string]any)
-				if text, ok := block["text"].(string); ok {
+				if text, ok := block["text"].(string); ok && len(text) <= 256 {
 					observation.MessageText = append(observation.MessageText, text)
 				}
 			}
@@ -611,6 +661,144 @@ func observe(r *http.Request, provider string, body map[string]any, requestID st
 	return observation
 }
 
+// inspectAnthropicRequest validates the translated subset expected by the
+// recorder and returns only non-sensitive structural metadata. It never stores
+// prompt text or image bytes in observations.
+type anthropicRequestInspection struct {
+	Valid               bool
+	MaxTokens           int
+	BlockTypes          []string
+	ImageSources        []string
+	LegacyOptionsAbsent bool
+}
+
+func inspectAnthropicRequest(body map[string]any) anthropicRequestInspection {
+	legacyOptionsAbsent := anthropicLegacyOptionsAbsent(body)
+	if !anthropicTopLevelFieldsAreValid(body) {
+		return anthropicRequestInspection{LegacyOptionsAbsent: legacyOptionsAbsent}
+	}
+	model, modelOK := body["model"].(string)
+	tokens, tokenOK := body["max_tokens"].(float64)
+	messages, messagesOK := body["messages"].([]any)
+	if !modelOK || strings.TrimSpace(model) == "" || !tokenOK || tokens < 1 || tokens != float64(int(tokens)) || !messagesOK || len(messages) == 0 {
+		return anthropicRequestInspection{LegacyOptionsAbsent: legacyOptionsAbsent}
+	}
+	blockTypes := []string{}
+	imageSources := []string{}
+	for _, rawMessage := range messages {
+		if !inspectAnthropicMessage(rawMessage, &blockTypes, &imageSources) {
+			return anthropicRequestInspection{MaxTokens: int(tokens), BlockTypes: blockTypes, ImageSources: imageSources, LegacyOptionsAbsent: legacyOptionsAbsent}
+		}
+	}
+	return anthropicRequestInspection{
+		Valid:               true,
+		MaxTokens:           int(tokens),
+		BlockTypes:          blockTypes,
+		ImageSources:        imageSources,
+		LegacyOptionsAbsent: legacyOptionsAbsent,
+	}
+}
+
+func anthropicLegacyOptionsAbsent(body map[string]any) bool {
+	for _, field := range []string{"user", "n", "seed", "parallel_tool_calls"} {
+		if _, exists := body[field]; exists {
+			return false
+		}
+	}
+	return true
+}
+
+func anthropicTopLevelFieldsAreValid(body map[string]any) bool {
+	if stream, present := body["stream"]; present {
+		if _, ok := stream.(bool); !ok {
+			return false
+		}
+	}
+	allowed := map[string]bool{
+		"model": true, "max_tokens": true, "messages": true, "system": true,
+		"stream": true, "temperature": true, "top_p": true, "stop_sequences": true,
+		"tools": true, "tool_choice": true,
+	}
+	for key := range body {
+		if !allowed[key] {
+			return false
+		}
+	}
+	return true
+}
+
+func inspectAnthropicMessage(raw any, blockTypes, imageSources *[]string) bool {
+	message, ok := raw.(map[string]any)
+	if !ok {
+		return false
+	}
+	role, roleOK := message["role"].(string)
+	content, contentOK := message["content"].([]any)
+	if !roleOK || (role != "user" && role != "assistant") || !contentOK || len(content) == 0 {
+		return false
+	}
+	for _, rawBlock := range content {
+		if !inspectAnthropicBlock(rawBlock, blockTypes, imageSources) {
+			return false
+		}
+	}
+	return true
+}
+
+func inspectAnthropicBlock(raw any, blockTypes, imageSources *[]string) bool {
+	block, ok := raw.(map[string]any)
+	if !ok {
+		return false
+	}
+	kind, ok := block["type"].(string)
+	if !ok {
+		return false
+	}
+	*blockTypes = append(*blockTypes, kind)
+	switch kind {
+	case "text":
+		_, ok := block["text"].(string)
+		return ok
+	case "image":
+		source, ok := block["source"].(map[string]any)
+		if !ok {
+			return false
+		}
+		sourceType, ok := source["type"].(string)
+		if !ok {
+			return false
+		}
+		*imageSources = append(*imageSources, sourceType)
+		return inspectAnthropicImageSource(sourceType, source)
+	case "tool_use":
+		_, idOK := block["id"].(string)
+		_, nameOK := block["name"].(string)
+		_, inputOK := block["input"].(map[string]any)
+		return idOK && nameOK && inputOK
+	case "tool_result":
+		_, ok := block["tool_use_id"].(string)
+		return ok
+	default:
+		return false
+	}
+}
+
+func inspectAnthropicImageSource(sourceType string, source map[string]any) bool {
+	switch sourceType {
+	case "base64":
+		mediaType, mediaOK := source["media_type"].(string)
+		encoded, dataOK := source["data"].(string)
+		decoded, decodeErr := base64.StdEncoding.DecodeString(encoded)
+		return mediaOK && strings.HasPrefix(mediaType, "image/") && dataOK && decodeErr == nil && len(decoded) > 0
+	case "url":
+		value, urlOK := source["url"].(string)
+		parsed, parseErr := url.Parse(value)
+		return urlOK && parseErr == nil && parsed.Scheme == "https" && parsed.Host != "" && parsed.User == nil
+	default:
+		return false
+	}
+}
+
 // Keep only the bounded diagnostic forms created by the local E2E harness.
 // These headers are not credentials, but the recorder must never persist
 // arbitrary client-provided values as diagnostic evidence.
@@ -623,7 +811,8 @@ func safeRoutingDiagnostic(value string) string {
 
 func safeRoutingCandidate(value string) string {
 	switch value {
-	case "demo-model/provider-api-translation-openai", "demo-model/provider-api-translation-anthropic":
+	case "demo-model/provider-api-translation-openai", "demo-model/provider-api-translation-anthropic",
+		"demo-model/provider-api-translation-bedrock-mantle":
 		return value
 	default:
 		return ""
@@ -676,6 +865,9 @@ func writeOpenAIResponse(w http.ResponseWriter, requestBody map[string]any) {
 		w.Header().Set("Cache-Control", "no-cache")
 		flusher, _ := w.(http.Flusher)
 		streamEventDelay, _ := time.ParseDuration(os.Getenv("STREAM_EVENT_DELAY"))
+		if overlayDelay := bedrockOverlayReloadDelay(requestBody); overlayDelay > 0 {
+			streamEventDelay = overlayDelay
+		}
 		stop := "stop"
 		events := []openAIStreamEvent{
 			{ID: "chatcmpl-kind", Object: "chat.completion.chunk", Model: model,
@@ -711,7 +903,8 @@ func writeOpenAIResponse(w http.ResponseWriter, requestBody map[string]any) {
 		Usage: openAIResponseUsage{PromptTokens: 1, CompletionTokens: 2, TotalTokens: 3},
 	}
 	if hasMessageMarker(requestBody, "externalmodel-openai-large-json-response") {
-		value.Choices[0].Message.Content = "openai large response:" + strings.Repeat("x", externalModelResponseLimitBytes+128)
+		value.Choices[0].Message.Content = "openai large response:" +
+			strings.Repeat("x", externalModelResponseLimitBytes+128) + openAILargeResponseTerminal
 	}
 	if hasMessageMarker(requestBody, "externalmodel-openai-under-limit-json-response") {
 		value.Choices[0].Message.Content = "openai large response:" + strings.Repeat("x", externalModelResponseLimitBytes*3/4)

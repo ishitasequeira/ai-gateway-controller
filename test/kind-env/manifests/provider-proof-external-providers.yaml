@@ -31,3 +31,20 @@ spec:
     secretRef: {name: provider-proof-b-credentials}
   config:
     tls.caCertificates: /etc/external-model-e2e/provider-ca/ca.crt
+---
+apiVersion: inference.opendatahub.io/v1alpha1
+kind: ExternalProvider
+metadata:
+  name: provider-proof-c
+  namespace: models-as-a-service
+  labels:
+    app.kubernetes.io/managed-by: external-model-e2e
+    external-model-e2e/purpose: provider-selection-proof
+spec:
+  provider: openai
+  endpoint: provider-proof-c-ext.maas-system.svc.cluster.local
+  auth:
+    type: apikey
+    secretRef: {name: provider-proof-c-credentials}
+  config:
+    tls.caCertificates: /etc/external-model-e2e/provider-ca/ca.crt

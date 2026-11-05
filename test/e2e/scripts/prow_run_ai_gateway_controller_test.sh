@@ -292,6 +292,8 @@ run_e2e_tests() {
     export ARTIFACTS_DIR
     export E2E_PARALLEL_WORKERS="${E2E_PARALLEL_WORKERS:-7}"
     export E2E_RECONCILE_WAIT="${E2E_RECONCILE_WAIT:-4}"
+    # E2E_SMOKE_ONLY defaults false in run_e2e_tests.sh (full allowlist). Group-test
+    # Tekton sets true via .tekton/ai-gateway-controller-group-test.yaml podTemplate.env.
     "${SCRIPT_DIR}/run_e2e_tests.sh"
 }
 

@@ -54,16 +54,44 @@ normal handoff/finalizer path.
 For one client-visible model, equal positive ExternalProvider weights are
 eligible together and use Praxis' uniform `random` selection policy. An
 omitted weight means one, weight zero disables that reference, and unequal
-positive weights fail with `WeightUnsupported`. A single eligible provider
-remains deterministic. Repeating the same provider across `ExternalModel`
-objects with the same client-visible model name is rejected; otherwise that
-provider would receive extra random-selection entries. This change adds overlay
-selection metadata and checks compatibility before transport changes. It does
-not add controller/ExtProc rollout coordination, proportional weighting,
-health-aware selection, or retries. Final-provider withdrawal and empty-overlay
-behavior remain outside this change in issue #106. Partial provider withdrawal
-ordering remains a separate issue tracked in
-[#108](https://github.com/opendatahub-io/ai-gateway-controller/issues/108).
+positive weights use Praxis `weightedRandom` with per-candidate
+`traffic_weight` (CRD weight 1–100 pass-through; Praxis accepts 1–1000). A
+single eligible provider remains deterministic. Repeating the same provider
+across `ExternalModel` objects with the same client-visible model name is
+rejected; otherwise that provider would receive extra selection entries. This
+does not add controller/ExtProc rollout coordination, health-aware selection,
+or retries. An explicit all-zero weight update withdraws the model's route and
+overlay candidates and reports `Ready=False/NoRoutes`, even when a referenced
+provider is missing or unready. Unrelated models retain their serving state.
+Readiness-driven final-provider withdrawal remains tracked in issue #106.
+
+The controller stages provider withdrawal for tenant-local and Gateway-attached
+models: the reduced overlay must be observed by the serving ExtProc revision,
+then the request-drain interval must elapse before old routes, credentials, and
+transports are removed. Deleting an `ExternalProvider` whose transport is used
+by published candidates or applied routes is blocked with `Pending` /
+`ProviderInUse`; a spec-only reference from an unserved model does not block
+deletion. Update or delete the serving model to begin safe withdrawal. This
+prevents provider deletion alone from silently discarding a last-known-good
+route or leaving the operator without an actionable status.
+
+Home HTTPRoutes also retain reference-only runtime profiles (including Secret
+references, never credential values). The tenant's ExtProc configuration and
+the withdrawal safety check both include these profiles until their applied
+provider rules are pruned. Deleting a model/provider or reconciling a sibling
+therefore cannot remove credentials or provider hops ahead of the drain.
+Retaining a runtime profile does not put its candidate back into the overlay;
+new selection follows the reduced overlay. Quoted startup and unquoted reload
+revision logs are both accepted as serving-revision evidence. When a provider
+has already disappeared, an applied profile can still supply its drain contract;
+a stale candidate with no applied path is skipped. Missing credential semantics
+on a legacy applied route remain an error rather than being guessed.
+
+Retained-profile field validation rejects malformed credential references and
+routing targets; it does not authenticate the HTTPRoute writer. Labels and
+owner references are not an authorization boundary. Namespace RBAC must protect
+controller-managed home routes as configuration inputs that can influence
+credential references within that namespace.
 
 ### ExternalProvider status ownership
 
@@ -98,6 +126,17 @@ inconsistent with the tenant configuration) claims the provider and reports
 `Pending`/`TenantNotReady` before returning the error. Returning a bare error
 would leave the provider with neither the finalizer nor a status writer while
 IPP remains free to write status; the requeue retries the resolution.
+
+Deleting a provider whose published overlay candidates or applied routes still
+use its transport keeps its cleanup finalizer and reports
+`Pending`/`ProviderInUse`, including referencing model names when present. A
+spec-only reference from an unserved model does not itself block deletion. To
+withdraw active routes, the operator must update or delete their models. Their
+reconciles first publish a reduced overlay; the old route, credential
+projection, and transport remain until the new ExtProc revision is serving and
+the in-flight request drain has elapsed. The provider finalizer then removes
+the unused transport. This is an explicit blocking state, not automatic
+provider failover.
 
 An explicit IPP selection is the existing handoff, unchanged in direction:
 remove the Praxis transport except the backends the namespace's attachment
@@ -442,8 +481,11 @@ compatibility one-pager; this records how it is implemented.
   tenant's own models win, then the oldest; same-namespace models share the
   name and are validated together as one selection group, as on the
   tenant-local path), a resolution or credential failure or more than 7
-  providers (`TooManyProviders`) excludes the model: it loses its route,
-  overlay entry, DestinationRules and copies. Over the 1024-candidate overlay
+  providers (`TooManyProviders`) excludes the model. A model that has never
+  been served is not published; for an already accepted route, withdrawal first
+  removes its candidate from the tenant overlay while retaining the old route,
+  DestinationRules, and credential copies until the reduced ExtProc revision
+  serves and the request drain completes. Over the 1024-candidate overlay
   limit (`OverlayCapacityExceeded`) a model keeps its accepted route but nothing
   else. Capacity is decided, and the handoff re-checked live, before anything is
   written into the tenant; a failed API read is retried, never treated as the
@@ -526,6 +568,42 @@ omitted or equal namespace stays local and needs no grant.
   the tenant's own. Model-namespace transport is collected after the reconcile,
   once no HTTPRoute in the namespace uses it.
 
+### Provider TLS trust
+
+The Gateway reaches every provider with `tls.mode: SIMPLE` and the endpoint
+host as SNI, and verifies the provider certificate against its system roots.
+A provider whose certificate is signed by a private CA
+([RHOAIENG-102015](https://redhat.atlassian.net/browse/RHOAIENG-102015)) sets
+one of two `ExternalProvider` `spec.config` keys, which the Gateway-namespace
+DestinationRule carries for the provider's own tenant and for attachments:
+
+- **`tls.credentialName`** (preferred) names a Secret in the Gateway
+  namespace (`--gateway-namespace`, `openshift-ingress` by default), where
+  maas-controller places every tenant Gateway. Its `cacert` key holds the PEM
+  CA; Istio also reads `ca.crt`. Istio first reads a separate Secret named
+  `<credentialName>-cacert` and falls back to `<credentialName>` only when
+  that Secret does not exist. Istio delivers it to the Gateway over SDS, so
+  nothing is mounted and an updated Secret applies without a restart.
+- **`tls.caCertificates`** is the absolute path of a CA file already mounted
+  in the Gateway pod. The controller mounts nothing.
+
+Either CA must contain the full chain up to the root that issued the provider
+certificate. Istio accepts only one of the two keys, so setting both is
+rejected, as is an invalid Secret name. An `ExternalModel` reference cannot
+override either key, because the provider transport is shared. The controller
+reads the `tls.credentialName` Secret the way Istio does, in the namespace of
+the Gateway whose DestinationRule names it: the provider reconciler in its
+tenant's Gateway namespace, or in the configured Gateway namespace for a
+provider only attachments serve, and each attachment or cross-namespace
+reference in its own Gateway's namespace. A missing Secret, or one without a
+PEM CA, fails the provider's `Ready` condition, or excludes the provider from
+that attachment or reference, instead of a TLS failure at request time.
+Tenants cannot read the Gateway namespace, so both cases report the same
+message, which names neither the Secret read nor its namespace. A failed read
+is retried and does not withdraw what is served. Events for either Secret name
+in any namespace re-reconcile the providers naming it and the models that
+reference them.
+
 ### Consumer portal auth proxy
 
 `pkg/consumerportal` reconciles the MaaS consumer portal OIDC auth proxy
@@ -544,7 +622,21 @@ Service, and NetworkPolicy named `maas-consumer-portal-auth-proxy`. The proxy se
 TLS on port 4180 with a service-ca certificate, trusts
 `odh-trusted-ca-bundle` for the OIDC issuer, and accepts traffic only from the
 tenant Gateway and Authorino. Its OIDC callback is
-`https://<Gateway HTTPS listener hostname>/oauth2/callback`.
+`https://<external gateway hostname>/oauth2/callback`. The hostname is
+resolved in order: the Gateway's first HTTPS listener with a concrete
+(non-wildcard) hostname; an external Hostname-type Gateway status address
+(internal `.svc`/`.cluster.local` names are skipped — they are unreachable
+from user browsers and would break the broker-registered redirect URI); and
+the OpenShift Route that fronts the Gateway in the ClusterIP + Route gateway
+pattern, where the listener carries no hostname. An HTTPS listener is
+required regardless of source — the portal routes attach to the Gateway's
+https section and the callback is served over TLS, so a Gateway without one
+fails closed. Routes are discovered by listing the Gateway namespace and
+matching the backend Service's `gateway.networking.k8s.io/gateway-name`
+label rather than by name, and only Routes that can serve the portal count:
+TLS configured, no subpath restriction, and a concrete host. The
+conventional `maas-gateway-route` name only breaks ties when several Routes
+front the same Gateway.
 
 The same reconciliation creates the `maas-consumer-portal` and
 `maas-consumer-portal-oauth2` HTTPRoutes on the default Gateway, a
@@ -712,7 +804,7 @@ ai-gateway-controller/
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--image` | `quay.io/opendatahub/odh-praxis-extproc:odh-stable` | Replaces the `praxis-extproc:dev` placeholder image |
+| `--image` | `quay.io/opendatahub/odh-praxis-extproc@sha256:a67be44e530961ca7e6dc453220ebe11a6641a2003577f3c4ddb1f426555b874` | Replaces the `praxis-extproc:dev` placeholder image |
 | `--manifest-path` | `/config/manifests/external-model/overlays/odh` | controller-owned kustomize entrypoint composing pinned upstream manifests and ExternalModel patches |
 | `--maas-api-route-name` | `maas-api-route` | Base name; suffixed per tenant like every other resource. Best-effort — exact fidelity depends on maas-api's real HTTPRoute name and Istio's route-naming scheme |
 | `--resync-interval` | `5m` | `RequeueAfter` once a tenant's resources are applied, so drift gets corrected periodically even without a new `AITenant` watch event |
@@ -758,3 +850,22 @@ alone:
 - This repo has no git remote yet, so none of `.github/workflows/*` have
   actually executed — they're believed correct against the Makefile targets
   but unverified in GitHub Actions.
+
+### Withdrawal evidence and attachment-only providers
+
+Before reducing a tenant overlay, every shared route-filter writer persists
+removed attachment candidates on their owned HTTPRoute. Failed persistence
+leaves the previous overlay available for retry; later writers can reconstruct
+the old route contract without republishing withdrawn candidates.
+
+A missing or unreadable serving-revision log line is unknown evidence. It
+blocks cleanup and preserves any existing drain timestamp. A confirmed
+revision mismatch invalidates the drain; cleanup still requires fresh rollout,
+endpoint, and revision proof after the interval. Bounded log tails can therefore
+delay cleanup when no fresh revision evidence is available, but cannot authorize
+cleanup or repeatedly erase a previously proven interval merely by losing a line.
+
+An attachment may protect an unclaimed-namespace provider with the cleanup
+finalizer without changing its standalone validation/status ownership. Once no
+controller-owned serving route uses that provider, transport collection releases
+that protection. A namespace claimed by an AITenant retains its tenant lifecycle.
