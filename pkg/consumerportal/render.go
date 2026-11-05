@@ -31,6 +31,19 @@ const (
 	TrustedCABundleConfigMap = "odh-trusted-ca-bundle"
 	trustedCAMountPath       = "/etc/pki/odh-trusted-ca"
 	CABundleHashAnnotation   = "ai-gateway-controller.opendatahub.io/ca-bundle-hash"
+	// AuthProxyContainerName is the kube-auth-proxy container in the
+	// deployment manifest (the resource names use AuthProxyName).
+	AuthProxyContainerName = "kube-auth-proxy"
+
+	// RedisSecretName is the customer-provided Redis the portal uses for
+	// server-side sessions (bring-your-own; RHAI-10610). Keys:
+	// connection-url (required when the secret exists), password (optional).
+	RedisSecretName = AuthProxyName + "-redis"
+
+	// RedisHashAnnotation on the proxy pod template restarts the proxy when
+	// the Redis connection changes.
+	RedisHashAnnotation = "ai-gateway-controller.opendatahub.io/redis-hash"
+
 	// LabelPortalInstance identifies which MaasTenantConfig instance a
 	// rendered portal object belongs to. Cross-namespace children (the
 	// ReferenceGrant lives in the dashboard namespace, DestinationRules in the
@@ -58,9 +71,19 @@ type Params struct {
 	DashboardNamespace string
 	// Instance is the MaasTenantConfig namespace; it labels every rendered
 	// object so cleanup and grant pruning only touch this instance's objects.
-	Instance           string
-	Image              string
-	OIDCIssuerURL      string
+	Instance      string
+	Image         string
+	OIDCIssuerURL string
+	// OIDCClientID binds the direct-JWT path: tokens must carry azp equal
+	// to the tenant's configured client.
+	OIDCClientID string
+	// RedisConnectionURL enables server-side sessions: when set, the auth
+	// proxy stores sessions in the customer-provided Redis instead of the
+	// browser cookie (RHAI-10610). Empty keeps cookie sessions.
+	RedisConnectionURL string
+	// RedisHash is stamped on the pod template so Redis connection changes
+	// restart the proxy.
+	RedisHash          string
 	Hostname           string
 	GatewayName        string
 	GatewayNamespace   string
@@ -88,6 +111,7 @@ func Render(resources []unstructured.Unstructured, p Params) []unstructured.Unst
 	replacer := strings.NewReplacer(
 		"CONSUMER_PORTAL_AUTH_PROXY_IMAGE", p.Image,
 		"CONSUMER_PORTAL_OIDC_ISSUER_URL", p.OIDCIssuerURL,
+		"CONSUMER_PORTAL_CLIENT_ID", p.OIDCClientID,
 		"CONSUMER_PORTAL_REDIRECT_URL", "https://"+p.Hostname+"/oauth2/callback",
 		"CONSUMER_PORTAL_COOKIE_DOMAIN", p.Hostname,
 		"CONSUMER_PORTAL_HOSTNAME", p.Hostname,
@@ -125,6 +149,9 @@ func Render(resources []unstructured.Unstructured, p Params) []unstructured.Unst
 		u.SetLabels(labels)
 		if u.GetKind() == "Deployment" {
 			addProviderCAFiles(u, p.ProviderCAKeys)
+			if p.RedisConnectionURL != "" {
+				addRedisSessionEnv(u)
+			}
 			if p.CABundleHash != "" {
 				_ = unstructured.SetNestedField(u.Object, p.CABundleHash,
 					"spec", "template", "metadata", "annotations", CABundleHashAnnotation)
@@ -133,10 +160,58 @@ func Render(resources []unstructured.Unstructured, p Params) []unstructured.Unst
 				_ = unstructured.SetNestedField(u.Object, p.CredentialsHash,
 					"spec", "template", "metadata", "annotations", CredentialsHashAnnotation)
 			}
+			if p.RedisHash != "" {
+				_ = unstructured.SetNestedField(u.Object, p.RedisHash,
+					"spec", "template", "metadata", "annotations", RedisHashAnnotation)
+			}
 		}
 		out = append(out, *u)
 	}
 	return out
+}
+
+// addRedisSessionEnv points the auth proxy at the customer-provided Redis
+// for server-side session storage. The cookie then holds only a session id,
+// so token refreshes no longer depend on a Set-Cookie reaching the browser.
+// The settings are passed as OAUTH2_PROXY_* environment variables — the same
+// mechanism the deployment already uses for the client credentials — rather
+// than container arguments: command-line expansion of $(VAR) leaves a
+// literal reference when the optional password key is absent, and expanded
+// argument values are visible in the process command line.
+func addRedisSessionEnv(deployment *unstructured.Unstructured) {
+	containers, _, _ := unstructured.NestedSlice(deployment.Object,
+		"spec", "template", "spec", "containers")
+	for i := range containers {
+		container, _ := containers[i].(map[string]any)
+		if container["name"] != AuthProxyContainerName {
+			continue
+		}
+		env, _, _ := unstructured.NestedSlice(container, "env")
+		env = append(env,
+			map[string]any{
+				"name":  "OAUTH2_PROXY_SESSION_STORE_TYPE",
+				"value": "redis",
+			},
+			map[string]any{
+				"name": "OAUTH2_PROXY_REDIS_CONNECTION_URL",
+				"valueFrom": map[string]any{"secretKeyRef": map[string]any{
+					"name": RedisSecretName, "key": "connection-url",
+				}},
+			},
+			map[string]any{
+				// Optional: an absent password leaves the variable unset,
+				// which oauth2-proxy treats as no authentication.
+				"name": "OAUTH2_PROXY_REDIS_PASSWORD",
+				"valueFrom": map[string]any{"secretKeyRef": map[string]any{
+					"name": RedisSecretName, "key": "password", "optional": true,
+				}},
+			},
+		)
+		_ = unstructured.SetNestedField(container, env, "env")
+		containers[i] = container
+	}
+	_ = unstructured.SetNestedSlice(deployment.Object, containers,
+		"spec", "template", "spec", "containers")
 }
 
 // addProviderCAFiles appends a --provider-ca-file argument per CA bundle key to
