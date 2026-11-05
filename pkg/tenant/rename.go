@@ -38,17 +38,39 @@ import (
 // role, only the binding (and its subject) is per-tenant, mirroring
 // maas-controller's own IPP ClusterRole/ClusterRoleBinding split.
 //
+// Next to the shared ServiceAccount it adds the post-auth ExtProc's own
+// ServiceAccount, which nothing binds.
+//
 // It does not mutate the input slice.
 func Rename(resources []unstructured.Unstructured, tenantID, namespace string) ([]unstructured.Unstructured, error) {
-	out := make([]unstructured.Unstructured, len(resources))
+	out := make([]unstructured.Unstructured, 0, len(resources)+1)
 	for i := range resources {
 		u := resources[i].DeepCopy()
 		if err := renameOne(u, tenantID, namespace); err != nil {
 			return nil, fmt.Errorf("rename %s %q for tenant %q: %w", u.GetKind(), u.GetName(), tenantID, err)
 		}
-		out[i] = *u
+		out = append(out, *u)
+		if u.GetKind() == "ServiceAccount" && u.GetName() == PayloadProcessingServiceAccountName(tenantID) {
+			out = append(out, newPostAuthServiceAccount(tenantID, u.GetNamespace()))
+		}
 	}
 	return out, nil
+}
+
+// newPostAuthServiceAccount is built rather than copied from the shared
+// ServiceAccount so it carries nothing MaaS sets on that one. Praxis does not
+// call the Kubernetes API, so the pod gets no API token; the NeMo caller token
+// is projected separately when a provider needs it.
+func newPostAuthServiceAccount(tenantID, namespace string) unstructured.Unstructured {
+	return unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1",
+		"kind":       "ServiceAccount",
+		"metadata": map[string]any{
+			"name":      PayloadProcessingPostServiceAccountName(tenantID),
+			"namespace": namespace,
+		},
+		"automountServiceAccountToken": false,
+	}}
 }
 
 func renameOne(u *unstructured.Unstructured, tenantID, namespace string) error {
@@ -123,7 +145,7 @@ func renamePayloadProcessingDeployment(u *unstructured.Unstructured, tenantID st
 			return fmt.Errorf("selector: %w", err)
 		}
 	}
-	if err := setServiceAccountName(u, PayloadProcessingServiceAccountName(tenantID)); err != nil {
+	if err := setServiceAccountName(u, PayloadProcessingPostServiceAccountName(tenantID)); err != nil {
 		return fmt.Errorf("serviceAccountName: %w", err)
 	}
 	if err := setConfigMapVolumeName(u, "plugins-config-volume", PayloadProcessingPluginsConfigMapForTenant(tenantID)); err != nil {
@@ -151,8 +173,9 @@ func renamePayloadPreProcessingDeployment(u *unstructured.Unstructured, tenantID
 			return fmt.Errorf("selector: %w", err)
 		}
 	}
-	// pre-processing shares the post-processing ServiceAccount (see
-	// overlays/odh/pre-processing/deployment-patch.yaml).
+	// pre-processing keeps the shared ServiceAccount the vendored overlay
+	// assigns (see overlays/odh/pre-processing/deployment-patch.yaml); only
+	// post-processing moves to its own.
 	if err := setServiceAccountName(u, PayloadProcessingServiceAccountName(tenantID)); err != nil {
 		return fmt.Errorf("serviceAccountName: %w", err)
 	}

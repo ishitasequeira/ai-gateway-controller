@@ -17,6 +17,7 @@ limitations under the License.
 package tenant
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -108,8 +109,8 @@ func TestRenameNonDefaultTenantPayloadProcessingDeployment(t *testing.T) {
 	}
 
 	sa, _, _ := unstructured.NestedString(out[0].Object, "spec", "template", "spec", "serviceAccountName")
-	if sa != wantName {
-		t.Fatalf("serviceAccountName = %q, want %q", sa, wantName)
+	if want := "payload-processing-post-redteam"; sa != want {
+		t.Fatalf("serviceAccountName = %q, want the dedicated post-auth %q", sa, want)
 	}
 
 	volumes, _, _ := unstructured.NestedSlice(out[0].Object, "spec", "template", "spec", "volumes")
@@ -194,15 +195,31 @@ func TestRenameServiceAccount(t *testing.T) {
 	in := []unstructured.Unstructured{{Object: map[string]any{
 		"apiVersion": "v1",
 		"kind":       "ServiceAccount",
-		"metadata":   map[string]any{"name": PayloadProcessingName},
+		"metadata":   map[string]any{"name": PayloadProcessingName, "namespace": "istio-system"},
+		// Anything MaaS sets on the shared account must not reach the
+		// post-auth one.
+		"secrets": []any{map[string]any{"name": "shared-token"}},
 	}}}
 
 	out, err := Rename(in, "redteam", "istio-system")
 	if err != nil {
 		t.Fatalf("Rename: %v", err)
 	}
+	if len(out) != 2 {
+		t.Fatalf("Rename returned %d resources, want the shared and the post-auth ServiceAccount", len(out))
+	}
 	if got := out[0].GetName(); got != "payload-processing-redteam" {
 		t.Fatalf("name = %q, want %q", got, "payload-processing-redteam")
+	}
+	post := out[1]
+	want := map[string]any{
+		"apiVersion":                   "v1",
+		"kind":                         "ServiceAccount",
+		"metadata":                     map[string]any{"name": "payload-processing-post-redteam", "namespace": "istio-system"},
+		"automountServiceAccountToken": false,
+	}
+	if !reflect.DeepEqual(post.Object, want) {
+		t.Fatalf("post-auth ServiceAccount = %v, want %v", post.Object, want)
 	}
 }
 

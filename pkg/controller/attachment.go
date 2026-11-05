@@ -52,9 +52,11 @@ const (
 	reasonTenantNotSteady         = "TenantNotSteady"
 	reasonModelNameConflict       = "ModelNameConflict"
 	reasonTooManyProviders        = "TooManyProviders"
+	reasonInvalidName             = "InvalidName"
 	reasonTranslationDisabled     = "APITranslationDisabled"
 	reasonOverlayCapacityExceeded = "OverlayCapacityExceeded"
 	reasonAttachmentPending       = "AttachmentPending"
+	reasonExtProcNotReady         = "ExtProcNotReady"
 
 	modelPhasePending = "Pending"
 	modelPhaseFailed  = "Failed"
@@ -80,9 +82,16 @@ const (
 	annotationAttachmentIdentity    = "inference.opendatahub.io/attachment-identity"
 	annotationWithdrawalCandidates  = "inference.opendatahub.io/provider-withdrawal-candidates"
 	annotationCredentialSource      = "inference.opendatahub.io/credential-source"
+
+	// ippRouteManager marks the HTTPRoutes IPP's ExternalModel controller
+	// creates. IPP names them after the model.
+	ippRouteManager = "ipp-external-model-reconciler"
 )
 
-var httpRouteGVK = schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"}
+var (
+	httpRouteGVK  = schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"}
+	deploymentGVK = schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}
+)
 
 // attachmentTenant is the Praxis tenant that owns an attached Gateway.
 type attachmentTenant struct {
@@ -341,6 +350,26 @@ func (r *Reconciler) gatewayAttachedModels(ctx context.Context, ait *unstructure
 // attachmentRouteModels maps an attachment HTTPRoute to its model.
 func (r *Reconciler) attachmentRouteModels(_ context.Context, route *unstructured.Unstructured) []reconcile.Request {
 	if _, ok := route.GetLabels()[tenant.LabelAttachmentTenant]; !ok {
+		if !r.namespaceAllowed(route.GetNamespace()) {
+			return nil
+		}
+		switch route.GetLabels()[tenant.LabelManagedBy] {
+		case "ai-gateway-controller":
+			// A home route's Gateway acceptance is part of its model's status.
+			if model := route.GetLabels()["inference.opendatahub.io/external-model"]; model != "" {
+				return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: route.GetNamespace(), Name: model}}}
+			}
+		case ippRouteManager:
+			// IPP's own route decides who reports the model's status (see
+			// ippServesModel), so its creation and removal recheck the model.
+			var requests []reconcile.Request
+			for _, owner := range route.GetOwnerReferences() {
+				if owner.Kind == "ExternalModel" {
+					requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: route.GetNamespace(), Name: owner.Name}})
+				}
+			}
+			return requests
+		}
 		return nil
 	}
 	model := route.GetAnnotations()[annotationAttachmentModel]
@@ -456,6 +485,7 @@ func (r *Reconciler) reconcileAttachedModel(ctx context.Context, model *v1alpha1
 		result          attachmentResult
 	}
 	targets := make([]target, 0, len(gateways))
+	tenantNamespaces := make([]string, 0, len(gateways))
 	home := -1
 	for _, gateway := range gateways {
 		ait, tenantNamespace, result, err := r.resolveGatewayTenant(ctx, gateway)
@@ -466,6 +496,11 @@ func (r *Reconciler) reconcileAttachedModel(ctx context.Context, model *v1alpha1
 			home = len(targets)
 		}
 		targets = append(targets, target{ait: ait, tenantNamespace: tenantNamespace, result: result})
+		tenantNamespaces = append(tenantNamespaces, tenantNamespace)
+	}
+	ippServes, err := r.ippServesModel(ctx, model, tenantNamespaces)
+	if err != nil {
+		return reconcile.Result{}, err
 	}
 	extra := home < 0 || len(targets) > 1
 	if extra {
@@ -482,7 +517,8 @@ func (r *Reconciler) reconcileAttachedModel(ctx context.Context, model *v1alpha1
 	if home >= 0 {
 		result, homeErr = r.reconcileHomeModel(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}, model, func(ready bool, reason, message string, env *envelope.Envelope) error {
 			homeReported = true
-			results[home] = attachmentResult{gateway: targets[home].result.gateway, ready: ready, reason: reason, message: message, routeName: modelRouteName(model.Name), env: env}
+			results[home] = attachmentResult{gateway: targets[home].result.gateway, ready: ready, pending: waitingReason(reason), reason: reason, message: message,
+				routeName: modelRouteName(model.Name), env: env}
 			return nil
 		})
 		if homeErr != nil {
@@ -543,7 +579,16 @@ func (r *Reconciler) reconcileAttachedModel(ctx context.Context, model *v1alpha1
 			results[home].message = "the model's own tenant is not steady"
 		}
 	}
-	if len(results) > 0 {
+	switch {
+	case ippServes:
+		// While a legacy IPP serves the model, it owns the model's status: a
+		// result from us would flip it against IPP's Ready (see
+		// ippServesModel). Results written earlier are removed, so MaaS reads
+		// IPP's route again.
+		if err := r.clearGatewayStatus(ctx, model); err != nil {
+			errs = append(errs, err)
+		}
+	case len(results) > 0:
 		if err := r.writeAttachedStatus(ctx, model, results); err != nil {
 			errs = append(errs, err)
 		}
@@ -890,9 +935,115 @@ func (r *Reconciler) reconcileEligibleAttachment(ctx context.Context, model *v1a
 		// The model's permitted references are served; the others are reported.
 		result.reason, result.message = reasonRefNotPermitted, self.denied
 	default:
+		if available, message := r.extProcAvailable(ctx, t.namespace, t.tenantID); !available {
+			result.pending, result.reason, result.message = true, reasonExtProcNotReady, message
+			break
+		}
 		result.ready, result.reason, result.message = true, reasonReconciled, "attached and distributed to the tenant overlay"
 	}
 	return result, nil
+}
+
+// waitingReason reports a reason that is waited for, not a failure: the model
+// is Pending and rechecked.
+func waitingReason(reason string) bool {
+	return reason == reasonExtProcNotReady || reason == reasonAttachmentPending
+}
+
+// extProcAvailable reports whether the tenant's ExternalModel ExtProc
+// Deployment is available. Requests to the tenant's models fail until it is,
+// for example while the tenant's first model starts it. It is read live, as
+// Deployments are not cached; a failed read is waited for and rechecked, never
+// reported as the model's failure.
+func (r *Reconciler) extProcAvailable(ctx context.Context, namespace, tenantID string) (bool, string) {
+	name := tenant.PayloadProcessingExternalModelDeploymentName(tenantID)
+	var reader client.Reader = r.Client
+	if r.APIReader != nil {
+		reader = r.APIReader
+	}
+	deployment := &unstructured.Unstructured{}
+	deployment.SetGroupVersionKind(deploymentGVK)
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, deployment); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, fmt.Sprintf("waiting for the tenant ExtProc Deployment %s/%s", namespace, name)
+		}
+		r.Log.Error(err, "read tenant ExtProc Deployment", "namespace", namespace, "name", name)
+		return false, fmt.Sprintf("cannot read the tenant ExtProc Deployment %s/%s yet: %v", namespace, name, err)
+	}
+	conditions, _, _ := unstructured.NestedSlice(deployment.Object, "status", "conditions")
+	for _, raw := range conditions {
+		if condition, ok := raw.(map[string]any); ok && condition["type"] == "Available" && condition["status"] == string(corev1.ConditionTrue) {
+			return true, ""
+		}
+	}
+	return false, fmt.Sprintf("waiting for the tenant ExtProc Deployment %s/%s to become available", namespace, name)
+}
+
+// homeServingState explains why a model whose overlay its own tenant
+// published does not serve: the Gateway has not accepted the current
+// generation of its HTTPRoute yet or rejected it, or the tenant's ExtProc is
+// not available yet. An empty reason means it serves. The route is read live,
+// as after an update the cache can still hold the earlier generation and the
+// Gateway's acceptance of it. A route the Gateway has not decided on is waited
+// for; the route's events reconcile the model again.
+func (r *Reconciler) homeServingState(ctx context.Context, model *v1alpha1.ExternalModel, home attachmentTenant) (string, string) {
+	routeName := modelRouteName(model.Name)
+	pending := fmt.Sprintf("waiting for Gateway %s to accept HTTPRoute %s", gatewayKey(home.gateway), routeName)
+	var reader client.Reader = r.Client
+	if r.APIReader != nil {
+		reader = r.APIReader
+	}
+	route := newHTTPRoute()
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: model.Namespace, Name: routeName}, route); err != nil {
+		if !apierrors.IsNotFound(err) {
+			r.Log.Error(err, "read model HTTPRoute", "namespace", model.Namespace, "name", routeName)
+		}
+		return reasonAttachmentPending, pending
+	}
+	if accepted, reason, message := routeAcceptedSince(route, home.gateway, route.GetGeneration()); !accepted {
+		if reason == reasonAttachmentPending {
+			return reason, pending
+		}
+		return reason, fmt.Sprintf("Gateway %s did not accept HTTPRoute %s: %s", gatewayKey(home.gateway), routeName, message)
+	}
+	if available, message := r.extProcAvailable(ctx, home.namespace, home.tenantID); !available {
+		return reasonExtProcNotReady, message
+	}
+	return "", ""
+}
+
+// ippServesModel reports whether a legacy IPP serves the model in our place
+// and writes its status: IPP's own HTTPRoute for the model exists, and the
+// tenant of every Gateway the model attaches to is one IPP still serves
+// (tenant.LegacyServes), so none of its attachments is ours to serve. The 3.5
+// IPP a blocked migration keeps ignores gatewayRefs and claims every model. A
+// model that also attaches to a Praxis tenant keeps our status, which MaaS
+// reads per Gateway, even though that IPP still writes its own.
+func (r *Reconciler) ippServesModel(ctx context.Context, model *v1alpha1.ExternalModel, tenantNamespaces []string) (bool, error) {
+	if len(tenantNamespaces) == 0 {
+		return false, nil
+	}
+	route := newHTTPRoute()
+	if err := r.Get(ctx, client.ObjectKey{Namespace: model.Namespace, Name: model.Name}, route); err != nil {
+		return false, client.IgnoreNotFound(err)
+	}
+	if route.GetLabels()[tenant.LabelManagedBy] != ippRouteManager ||
+		!slices.ContainsFunc(route.GetOwnerReferences(), func(owner metav1.OwnerReference) bool { return owner.UID == model.UID }) {
+		return false, nil
+	}
+	for _, tenantNamespace := range tenantNamespaces {
+		if tenantNamespace == "" {
+			return false, nil
+		}
+		mtc := tenant.NewMaasTenantConfig()
+		if err := r.Get(ctx, client.ObjectKey{Namespace: tenantNamespace, Name: tenant.MaasTenantConfigInstanceName}, mtc); err != nil {
+			return false, client.IgnoreNotFound(err)
+		}
+		if !tenant.LegacyServes(mtc) {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // excludeAttachment removes an excluded model from the tenant: its HTTPRoute,
@@ -1233,6 +1384,10 @@ func (r *Reconciler) resolveAttachedModel(ctx context.Context, t attachmentTenan
 		return nil
 	}
 	routes := set.Routes()
+	if err := validateModelName(m.Name); err != nil {
+		candidate.reason, candidate.message = reasonInvalidName, err.Error()
+		return nil //nolint:nilerr // excludes only this model
+	}
 	if count := modelHTTPRouteRuleCount(routes); count > maxHTTPRouteRules {
 		candidate.reason = reasonTooManyProviders
 		candidate.message = fmt.Sprintf("%d HTTPRoute rules exceed the Gateway API limit of %d for an attached model", count, maxHTTPRouteRules)
@@ -1954,8 +2109,17 @@ func isAttachmentRoute(route *unstructured.Unstructured, model *v1alpha1.Externa
 
 // routeAccepted reads the route's parent status for the Gateway. The Gateway
 // enforces listener allowedRoutes; its Accepted=False reason is reported
-// unchanged.
+// unchanged. An acceptance of any generation counts: while the Gateway
+// processes an update it keeps serving the generation it accepted, so the
+// attachment's overlay entry, copies and DestinationRules stay.
 func routeAccepted(route *unstructured.Unstructured, gateway v1alpha1.NamespacedObjectReference) (bool, string, string) {
+	return routeAcceptedSince(route, gateway, 0)
+}
+
+// routeAcceptedSince is routeAccepted counting only an acceptance the Gateway
+// observed for generation or a later one. A condition without
+// observedGeneration is taken as current.
+func routeAcceptedSince(route *unstructured.Unstructured, gateway v1alpha1.NamespacedObjectReference, generation int64) (bool, string, string) {
 	if route == nil {
 		return false, reasonAttachmentPending, "waiting for the attachment HTTPRoute"
 	}
@@ -1982,7 +2146,10 @@ func routeAccepted(route *unstructured.Unstructured, gateway v1alpha1.Namespaced
 				continue
 			}
 			if condition["status"] == string(metav1.ConditionTrue) {
-				return true, "", ""
+				if observed, ok := condition["observedGeneration"].(int64); !ok || observed >= generation {
+					return true, "", ""
+				}
+				continue
 			}
 			if gatewayReason, _ := condition["reason"].(string); gatewayReason != "" {
 				reason = gatewayReason
