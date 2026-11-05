@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -136,8 +137,9 @@ func controllerTestClient(t *testing.T, objects ...client.Object) *Reconciler {
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&v1alpha1.ExternalModel{}, &v1alpha1.ExternalProvider{}).
 		WithIndex(&v1alpha1.ExternalProvider{}, providerCredentialNameIndex, indexProviderByCredentialName).
-		WithObjects(objects...).Build()
-	r := &Reconciler{Client: fakeClient, APIReader: fakeClient}
+		WithObjects(withTenantExtProcs(objects)...).Build()
+	accepting := interceptor.NewClient(fakeClient, interceptor.Funcs{Get: acceptHomeRoute})
+	r := &Reconciler{Client: accepting, APIReader: accepting}
 	r.readPodLogs = func(ctx context.Context, namespace, _, container string) (string, error) {
 		if container != externalModelExtProcContainer {
 			return "", fmt.Errorf("unexpected ExtProc container %q", container)
@@ -150,6 +152,75 @@ func controllerTestClient(t *testing.T, objects ...client.Object) *Reconciler {
 		return `accepted_revision="` + revision + `" serving_revision="` + revision + `"`, nil
 	}
 	return r
+}
+
+// acceptHomeRoute reads a home HTTPRoute that has no parent status as
+// Accepted by each of its parents, as the tenant's Gateway reports it. A test
+// writes the status itself to have the Gateway reject or not decide on it.
+func acceptHomeRoute(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if err := c.Get(ctx, key, obj, opts...); err != nil {
+		return err
+	}
+	route, ok := obj.(*unstructured.Unstructured)
+	if !ok || route.GroupVersionKind() != httpRouteGVK || route.GetLabels()[tenant.LabelManagedBy] != "ai-gateway-controller" {
+		return nil
+	}
+	if _, attachment := route.GetLabels()[tenant.LabelAttachmentTenant]; attachment {
+		return nil
+	}
+	if parents, _, _ := unstructured.NestedSlice(route.Object, "status", "parents"); len(parents) > 0 {
+		return nil
+	}
+	refs, _, _ := unstructured.NestedSlice(route.Object, "spec", "parentRefs")
+	parents := make([]any, 0, len(refs))
+	for _, ref := range refs {
+		parents = append(parents, map[string]any{
+			"parentRef":  ref,
+			"conditions": []any{map[string]any{"type": "Accepted", "status": string(metav1.ConditionTrue), "reason": "Accepted"}},
+		})
+	}
+	return unstructured.SetNestedSlice(route.Object, parents, "status", "parents")
+}
+
+// withTenantExtProcs adds an available ExternalModel ExtProc Deployment for
+// each AITenant, as the tenant reconciler starts one, unless the test passes
+// its own.
+func withTenantExtProcs(objects []client.Object) []client.Object {
+	present := map[client.ObjectKey]bool{}
+	for _, object := range objects {
+		if u, ok := object.(*unstructured.Unstructured); ok && u.GroupVersionKind() == deploymentGVK {
+			present[client.ObjectKeyFromObject(u)] = true
+		}
+	}
+	out := slices.Clone(objects)
+	for _, object := range objects {
+		u, ok := object.(*unstructured.Unstructured)
+		if !ok || u.GroupVersionKind() != tenant.AITenantGVK {
+			continue
+		}
+		tenantNamespace, _, _ := unstructured.NestedString(u.Object, "status", "tenantNamespace")
+		if tenantNamespace == "" {
+			continue
+		}
+		extProc := tenantExtProc(tenantNamespace, tenant.ID(u.GetName()), true)
+		if !present[client.ObjectKeyFromObject(extProc)] {
+			present[client.ObjectKeyFromObject(extProc)] = true
+			out = append(out, extProc)
+		}
+	}
+	return out
+}
+
+// tenantExtProc returns the tenant's ExternalModel ExtProc Deployment.
+func tenantExtProc(namespace, tenantID string, available bool) *unstructured.Unstructured {
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(deploymentGVK)
+	u.SetNamespace(namespace)
+	u.SetName(tenant.PayloadProcessingExternalModelDeploymentName(tenantID))
+	u.Object["status"] = map[string]any{"conditions": []any{map[string]any{
+		"type": "Available", "status": string(boolStatus(available)),
+	}}}
+	return u
 }
 
 func legacyExternalModelRouteFilter(name, namespace, managedBy string) *unstructured.Unstructured {
@@ -791,6 +862,61 @@ func TestExternalModelHTTPRouteRuleLimitByFormat(t *testing.T) {
 				t.Fatalf("rejected = %v, want %t", rejected["tenant-a/model"], tc.wantRejected)
 			}
 		})
+	}
+}
+
+// A model name that is not a valid Service name, such as gpt-4.1, still gets a
+// valid selection sink, and every valid name keeps its form (RHOAIENG-100314).
+func TestProviderSelectionSinkNameIsAValidServiceName(t *testing.T) {
+	for _, model := range []string{"model", "gpt-4-1", strings.Repeat("m", 35)} {
+		if got, want := providerSelectionSinkName(model), providerSelectionSinkPrefix+model; got != want {
+			t.Errorf("sink for %q = %q, want the unchanged %q", model, got, want)
+		}
+	}
+	// A valid name that spells out a hashed form keeps its own sink.
+	lookalike := "gpt-4-1-" + shortHash("gpt-4.1")
+	sinks := map[string]string{}
+	for _, model := range []string{"gpt-4.1", "gpt-4-1", lookalike, strings.Repeat("m", 36), strings.Repeat("m", 63), "meta-llama-3.1-70b-instruct-external"} {
+		sink := providerSelectionSinkName(model)
+		if problems := validation.IsDNS1035Label(sink); len(problems) > 0 {
+			t.Errorf("sink for %q = %q: %v", model, sink, problems)
+		}
+		if other, seen := sinks[sink]; seen {
+			t.Errorf("models %q and %q share the sink %q", other, model, sink)
+		}
+		sinks[sink] = model
+	}
+	if got, want := providerSelectionSinkName("gpt-4.1"), providerSelectionSinkPrefix+"-gpt-4-1-"+shortHash("gpt-4.1"); got != want {
+		t.Errorf("sink for gpt-4.1 = %q, want %q", got, want)
+	}
+}
+
+// A model whose name cannot label its objects is reported alone; the other
+// models of its namespace are still published (RHOAIENG-100314).
+func TestInvalidModelNameExcludesOnlyThatModel(t *testing.T) {
+	r, model := reconcilerFixture(t)
+	ctx := context.Background()
+	long := model.DeepCopy()
+	long.Name, long.UID, long.ResourceVersion = strings.Repeat("m", 64), "long-uid", ""
+	if err := r.Create(ctx, long); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(long)}); !errors.Is(err, errInvalidModelName) {
+		t.Fatalf("reconcile of the long-named model = %v, want %v", err, errInvalidModelName)
+	}
+	if got := getModel(t, r, long); got.Status.Phase != modelPhaseFailed || readyReason(got) != reasonInvalidName {
+		t.Fatalf("long-named model status = %#v", got.Status)
+	}
+
+	reconcileModel(t, r, model)
+	if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("sibling of the long-named model = %#v", got.Status)
+	}
+	if got := getModel(t, r, long); readyReason(got) != reasonInvalidName {
+		t.Fatalf("long-named model after its sibling's reconcile = %#v", got.Status)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, "tenant-a", modelRouteName(long.Name)); !apierrors.IsNotFound(err) {
+		t.Fatalf("long-named model received a route: %v", err)
 	}
 }
 
@@ -4811,7 +4937,8 @@ func TestHomeModelPublicationReportsOneStatus(t *testing.T) {
 		{name: "weight disabled takes precedence", publication: homeModelPublication{weightDisabled: true, denied: "denied", unserved: "unready", unroutedReason: reasonNoRoutes}, wantReason: reasonNoRoutes},
 		{name: "denied reference", publication: homeModelPublication{denied: "denied", unserved: "unready", unroutedReason: reasonNoRoutes}, wantReason: reasonRefNotPermitted},
 		{name: "unready credential", publication: homeModelPublication{unserved: "unready", unroutedReason: reasonNoRoutes}, wantReason: reasonProviderNotReady},
-		{name: "unrouted", publication: homeModelPublication{unroutedReason: reasonNoRoutes}, wantReason: reasonNoRoutes},
+		{name: "unrouted", publication: homeModelPublication{unroutedReason: reasonNoRoutes, servingReason: reasonExtProcNotReady}, wantReason: reasonNoRoutes},
+		{name: "not serving yet", publication: homeModelPublication{servingReason: reasonExtProcNotReady}, wantReason: reasonExtProcNotReady},
 		{name: "ready", wantReason: reasonReconciled},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

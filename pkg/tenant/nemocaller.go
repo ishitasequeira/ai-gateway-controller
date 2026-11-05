@@ -28,6 +28,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -67,6 +68,18 @@ var errMalformedAttachment = errors.New("guardrail attachment is malformed")
 // not caught up. Publishing now would remove checks that are still selected.
 var errStaleBinding = errors.New("accepted guardrail status is behind the spec")
 
+// errProviderOutsideInfra means an accepted policy's NeMo Service is not in
+// the tenant's infrastructure namespace, so its checks fail closed.
+var errProviderOutsideInfra = errors.New("guardrail provider is outside the infrastructure namespace")
+
+const (
+	// reasonProviderOutsideInfra is the reason of the Warning Event
+	// reportNemoOutsideInfra publishes on the AIGuardrail.
+	reasonProviderOutsideInfra = "ProviderOutsideInfraNamespace"
+	// compileGuardrailAction is that Event's action. The events API requires one.
+	compileGuardrailAction = "CompileGuardrail"
+)
+
 // nemoCallout is one accepted AIGuardrail. Each of its checks is compiled
 // as its own ai_guardrails filter on the shared post-auth ExtProc.
 type nemoCallout struct {
@@ -75,13 +88,15 @@ type nemoCallout struct {
 	// serviceNamespace is where the NeMo Service runs; egress is opened to it.
 	serviceNamespace string
 	// serviceName is the NeMo Service. Egress uses its pod selector when the
-	// Service can be read; NetworkPolicy cannot name a Service directly.
+	// Service can be read; NetworkPolicy cannot name a Service directly. It is
+	// also the Service kube-rbac-proxy authorizes callers against.
 	serviceName string
 	// podLabels come from that Service's selector. Empty means the egress
 	// rule covers the whole namespace on the NeMo port.
 	podLabels map[string]string
-	// authenticated is set when the published endpoint is https, so egress
-	// opens kube-rbac-proxy's port instead of the plaintext server port.
+	// authenticated means the Service is behind kube-rbac-proxy: egress opens
+	// its port, and the call carries the pod's ServiceAccount token and trusts
+	// the service CA.
 	authenticated bool
 	// closed rejects a request that selects this policy instead of calling NeMo.
 	// The policy is accepted, but this controller cannot compile a callout for it.
@@ -107,13 +122,14 @@ type nemoCheck struct {
 // nemoFilter is one compiled ai_guardrails entry. Exactly one of request
 // or response is set.
 type nemoFilter struct {
-	endpoint string
-	configID string
-	header   string
-	timeout  time.Duration
-	request  bool
-	response bool
-	closed   bool
+	endpoint      string
+	configID      string
+	header        string
+	authenticated bool
+	timeout       time.Duration
+	request       bool
+	response      bool
+	closed        bool
 }
 
 // acceptedNemoCallouts returns the checks this tenant's attachments select, in
@@ -295,17 +311,80 @@ func closedCallout(policy *aigatewayv1alpha1.AIGuardrail) (nemoCallout, bool) {
 		if check.Name == "" {
 			continue
 		}
-		callout.checks = append(callout.checks, nemoCheck{
-			name:    check.Name,
-			header:  guardrail.CheckHeaderName(policy.Namespace, policy.Name, check.Name),
-			request: true,
-			closed:  true,
-		})
+		callout.checks = append(callout.checks, closedCheck(check.Name, guardrail.CheckHeaderName(policy.Namespace, policy.Name, check.Name)))
 	}
 	if len(callout.checks) == 0 {
 		return nemoCallout{}, false
 	}
 	return callout, true
+}
+
+// closedCheck rejects the request when its selection header is "true". It
+// runs on the request only: a rejected request has no response to check.
+func closedCheck(name, header string) nemoCheck {
+	return nemoCheck{name: name, header: header, request: true, closed: true}
+}
+
+// pinNemoCalloutsToInfra closes, in place, every callout whose NeMo Service is
+// not in infraNamespace, the MaasTenantConfig's status.infraNamespace. ODH and
+// RHOAI run the NeMo workload only there, and egress and the caller grant
+// follow the Service's namespace, so a policy pointing anywhere else is
+// rejected rather than opened. It returns those callouts as they were before
+// closing. While infraNamespace is unpublished every callout is closed and
+// none is returned: the reconcile already reports and requeues that state.
+func pinNemoCalloutsToInfra(callouts []nemoCallout, infraNamespace string) []nemoCallout {
+	var outside []nemoCallout
+	for i := range callouts {
+		callout := &callouts[i]
+		if callout.closed || (infraNamespace != "" && callout.serviceNamespace == infraNamespace) {
+			continue
+		}
+		if infraNamespace != "" {
+			outside = append(outside, *callout)
+		}
+		closed := nemoCallout{name: callout.name, closed: true}
+		for _, check := range callout.checks {
+			closed.checks = append(closed.checks, closedCheck(check.name, check.header))
+		}
+		*callout = closed
+	}
+	return outside
+}
+
+// reportNemoOutsideInfra logs the callouts pinNemoCalloutsToInfra closed and
+// publishes a Warning Event on each one's AIGuardrail. The guardrail
+// reconciler accepts such a policy, so without this its owner, who can read
+// the AIGuardrail but not this controller's logs, sees no reason requests are
+// rejected. Both fire only when the set changes: a tenant is reconciled every
+// resync, and reporting each time would flood the namespace with Events.
+func (r *Reconciler) reportNemoOutsideInfra(ctx context.Context, log logr.Logger, tenantNamespace, infraNamespace string, outside []nemoCallout) {
+	messages := make([]string, 0, len(outside))
+	for _, callout := range outside {
+		messages = append(messages, fmt.Sprintf(
+			"NeMo Service %s/%s is not in the infrastructure namespace %q, so this tenant rejects requests that select the checks of AIGuardrail %s",
+			callout.serviceNamespace, callout.serviceName, infraNamespace, callout.name))
+	}
+	key := strings.Join(messages, "\n")
+	if previous, _ := r.nemoOutsideInfra.Load(tenantNamespace); previous == key || (previous == nil && key == "") {
+		return
+	}
+	if key == "" {
+		r.nemoOutsideInfra.Delete(tenantNamespace)
+		return
+	}
+	r.nemoOutsideInfra.Store(tenantNamespace, key)
+	log.Error(errProviderOutsideInfra, "guardrail checks fail closed", "infraNamespace", infraNamespace, "details", messages)
+	if r.Recorder == nil {
+		return
+	}
+	for i, callout := range outside {
+		policy := &aigatewayv1alpha1.AIGuardrail{}
+		if err := r.Client.Get(ctx, client.ObjectKey{Namespace: tenantNamespace, Name: callout.name}, policy); err != nil {
+			log.Error(err, "read AIGuardrail to report its provider namespace", "name", callout.name)
+			continue
+		}
+		r.Recorder.Eventf(policy, nil, corev1.EventTypeWarning, reasonProviderOutsideInfra, compileGuardrailAction, "%s", messages[i])
+	}
 }
 
 // bindNemoPodSelectors copies each NeMo Service's pod selector onto the callout
@@ -351,45 +430,55 @@ func checksEndpoint(endpoint string) (string, error) {
 }
 
 // configureNemoCallouts compiles the callouts into the post-auth extproc.yaml
-// and opens egress to each NeMo namespace. With no callouts the rendered
-// resources are left as they are.
-func configureNemoCallouts(resources []unstructured.Unstructured, tenantID, gatewayNamespace string, callouts []nemoCallout) error {
+// and opens egress to each NeMo namespace. For an authenticated provider it
+// also mounts the caller token and service CA on the post-auth pod and
+// appends the Role and RoleBinding that let that pod call the provider,
+// labeled for tenantNamespace. With no callouts the rendered resources are
+// returned as they are.
+func configureNemoCallouts(resources []unstructured.Unstructured, tenantID, gatewayNamespace, tenantNamespace string, callouts []nemoCallout) ([]unstructured.Unstructured, error) {
 	if len(callouts) == 0 {
-		return nil
+		return resources, nil
 	}
 	deploymentName := PayloadProcessingDeploymentName(tenantID)
 	deployment := findResource(resources, "Deployment", deploymentName, gatewayNamespace)
 	if deployment == nil {
-		return fmt.Errorf("payload-processing Deployment %s is missing", deploymentName)
+		return nil, fmt.Errorf("payload-processing Deployment %s is missing", deploymentName)
 	}
 	configMapName := PayloadProcessingPluginsConfigMapForTenant(tenantID)
 	configMap := findResource(resources, "ConfigMap", configMapName, gatewayNamespace)
 	if configMap == nil {
-		return fmt.Errorf("payload-processing ConfigMap %s is missing", configMapName)
+		return nil, fmt.Errorf("payload-processing ConfigMap %s is missing", configMapName)
 	}
 	data, found, err := unstructured.NestedStringMap(configMap.Object, "data")
 	if err != nil || !found {
 		if err == nil {
 			err = errors.New("data is missing")
 		}
-		return fmt.Errorf("read payload-processing ConfigMap: %w", err)
+		return nil, fmt.Errorf("read payload-processing ConfigMap: %w", err)
 	}
 	compiled, err := compileNemoExtproc(data["extproc.yaml"], callouts)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	data["extproc.yaml"] = compiled
 	if err := unstructured.SetNestedStringMap(configMap.Object, data, "data"); err != nil {
-		return fmt.Errorf("write payload-processing ConfigMap: %w", err)
+		return nil, fmt.Errorf("write payload-processing ConfigMap: %w", err)
 	}
 	if err := ensureNemoEgress(resources, tenantID, gatewayNamespace, callouts); err != nil {
-		return err
+		return nil, err
 	}
 	sum := sha256.Sum256([]byte(compiled))
 	if err := unstructured.SetNestedField(deployment.Object, hex.EncodeToString(sum[:]), "spec", "template", "metadata", "annotations", nemoCalloutConfigAnnotation); err != nil {
-		return fmt.Errorf("write NeMo callout config hash: %w", err)
+		return nil, fmt.Errorf("write NeMo callout config hash: %w", err)
 	}
-	return nil
+	if !slices.ContainsFunc(callouts, func(c nemoCallout) bool { return c.authenticated }) {
+		return resources, nil
+	}
+	if err := mountNemoAuth(deployment); err != nil {
+		return nil, err
+	}
+	rbac := nemoCallerRBAC(callouts, tenantNamespace, gatewayNamespace, PayloadProcessingPostServiceAccountName(tenantID))
+	return append(resources, rbac...), nil
 }
 
 // compileNemoExtproc inserts the checks right after the post-auth chain's
@@ -462,8 +551,11 @@ func insertAfterRequestID(doc map[string]any, entries []any) bool {
 // nemoFilterEntry runs one check when its selection header is "true". A
 // request that skips the check also skips its response hook. The model is
 // omitted so NeMo calls the model named in the selected configuration
-// rather than a name this controller invents. A closed check rejects that
-// request instead of calling NeMo.
+// rather than a name this controller invents. Praxis refuses token_file and
+// tls on a plaintext endpoint, so only an authenticated provider gets them.
+// token_file needs praxis-proxy/ai with #1507; v0.9.0 rejects it as an
+// unknown field and the post-auth ExtProc would not start.
+// A closed check rejects that request instead of calling NeMo.
 func nemoFilterEntry(filter nemoFilter) map[string]any {
 	if filter.closed {
 		return map[string]any{
@@ -479,6 +571,10 @@ func nemoFilterEntry(filter nemoFilter) map[string]any {
 		"type":       "nemo",
 		"endpoint":   filter.endpoint,
 		"guardrails": map[string]any{"config_ids": []any{filter.configID}},
+	}
+	if filter.authenticated {
+		provider["token_file"] = nemoTokenFile
+		provider["tls"] = map[string]any{"ca_file": nemoServiceCAFile}
 	}
 	// A positive duration below 1ms truncates to 0, which Praxis rejects.
 	// nemoCalloutFrom already excludes that policy; this keeps a missed
@@ -516,7 +612,7 @@ func expandNemoChecks(callouts []nemoCallout) ([]nemoFilter, error) {
 			return nil, fmt.Errorf("AIGuardrail %s: %w", callout.name, err)
 		}
 		for _, check := range callout.checks {
-			filter := nemoFilter{endpoint: endpoint, configID: check.configID, header: check.header, timeout: callout.timeout}
+			filter := nemoFilter{endpoint: endpoint, configID: check.configID, header: check.header, authenticated: callout.authenticated, timeout: callout.timeout}
 			if check.request {
 				input := filter
 				input.request = true

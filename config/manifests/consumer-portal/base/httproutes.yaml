@@ -34,6 +34,29 @@ spec:
             path:
               type: ReplacePrefixMatch
               replacePrefixMatch: /
+        # Outer defense for headers the portal AuthPolicy does not inject:
+        # the route filter runs after the auth mutation, so it must not
+        # remove any header the AuthPolicy sets (the four x-maas-*
+        # identity headers, x-auth-request-user/-email, and
+        # x-forwarded-id-token) — those are overwritten by the policy
+        # on success instead.
+        - type: RequestHeaderModifier
+          requestHeaderModifier:
+            remove:
+              - x-auth-request-preferred-username
+              - x-auth-request-groups
+              - x-auth-request-access-token
+              - x-forwarded-user
+              - x-forwarded-email
+              - x-forwarded-groups
+              - x-forwarded-preferred-username
+              - x-maas-keyname
+              - x-maas-subscription-rate-limit-id
+        - type: ResponseHeaderModifier
+          responseHeaderModifier:
+            set:
+              - name: Cache-Control
+                value: no-store
       backendRefs:
         - name: maas-portal
           namespace: CONSUMER_PORTAL_DASHBOARD_NAMESPACE

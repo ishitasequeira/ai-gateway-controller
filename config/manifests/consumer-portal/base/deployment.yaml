@@ -46,6 +46,10 @@ spec:
             - --upstream=static://200
             - --reverse-proxy=true
             - --skip-provider-button
+            # TODO(MS-0007): the session path forwards the access token under
+            # x-forwarded-id-token because this kube-auth-proxy build has no
+            # ID-token pass-through (no --pass-id-token* flag); switch to the
+            # ID token when the proxy supports it.
             - --pass-access-token=true
             - --set-xauthrequest=true
             # --provider-ca-file is added per non-empty odh-trusted-ca-bundle key

@@ -29,10 +29,23 @@ spec:
     name: maas-consumer-portal
   rules:
     authentication:
+      # A BFF may present the user access token directly; a browser presents
+      # the proxy session cookie (no Authorization header).
+      direct-jwt:
+        priority: 0
+        jwt:
+          issuerUrl: CONSUMER_PORTAL_OIDC_ISSUER_URL
+          ttl: 300
+        credentials:
+          authorizationHeader:
+            prefix: Bearer
       browser:
+        priority: 1
+        when:
+          - predicate: '!has(request.headers.authorization)'
         anonymous: {}
     authorization:
-      session:
+      session-and-identity:
         priority: 0
         opa:
           allValues: true
@@ -41,7 +54,73 @@ spec:
 
             login_location := sprintf("/oauth2/start?rd=%s", [urlquery.encode(input.context.request.http.path)])
 
+            # Only application cookies reach the BFF; the proxy session
+            # cookie(s) are stripped from the forwarded request.
+            application_cookies := concat("; ", [entry |
+              raw := split(object.get(input.context.request.http.headers, "cookie", ""), ";")[_]
+              entry := trim_space(raw)
+              entry != ""
+              name := trim_space(split(entry, "=")[0])
+              not startswith(name, "_maas_consumer_proxy")
+            ])
+
+            # MS-0007 flattened contract: the organization identity is carried
+            # as flat scalar/array claims (org_id, org_name, roles), not the
+            # superseded https://redhat.com/maas/orgs array-of-objects.
+            organization = result {
+              org_id := object.get(organization_claims, "org_id", "")
+              is_string(org_id)
+              org_id != ""
+              roles := object.get(organization_claims, "roles", [])
+              is_array(roles)
+              result := {
+                "org_id": org_id,
+                "roles_header": json.marshal(roles)
+              }
+            } else = {"org_id": "", "roles_header": "[]"}
+
+            # The claims object is passed through whole, so the flat
+            # org_id/org_name/roles claims are read the same way on both the
+            # Authorino-validated path and the decoded-token path.
+            organization_claims = claims {
+              not input.auth.identity.anonymous
+              claims := input.auth.identity
+            } else = claims {
+              identity.authenticated
+              [_, claims, _] := io.jwt.decode(identity.id_token)
+            } else = {}
+
             identity = result {
+              not input.auth.identity.anonymous
+              claims := input.auth.identity
+              usernames := [user |
+                user := [object.get(claims, "preferred_username", ""), object.get(claims, "sub", "")][_]
+                user != ""
+              ]
+              username := usernames[0]
+              authorization := input.context.request.http.headers.authorization
+              # MS-0007: groups are plain, unqualified names; they are
+              # forwarded as-is (trim/sort, system:authenticated prepended).
+              # TODO(MS-0007): the ADR is silent on the system:authenticated
+              # prepend and the sort/trim normalization — confirm whether the
+              # header should carry the literal groups claim instead.
+              groups := {trim_space(group) |
+                group := object.get(claims, "groups", [])[_]
+                trim_space(group) != ""
+                trim_space(group) != "system:authenticated"
+              }
+              result := {
+                "authenticated": true,
+                "authorization": authorization,
+                # The presented token, forwarded as-is under
+                # x-forwarded-id-token (MS-0007).
+                "id_token": trim_prefix(authorization, "Bearer "),
+                "username": username,
+                "email": object.get(claims, "email", ""),
+                "groups_header": json.marshal(array.concat(["system:authenticated"], sort(groups)))
+              }
+            } else = result {
+              input.auth.identity.anonymous
               cookie := object.get(input.context.request.http.headers, "cookie", "")
               cookie != ""
               response := http.send({
@@ -55,27 +134,92 @@ spec:
                 "raise_error": false
               })
               {200, 202}[response.status_code]
+              # TODO(MS-0007): x-forwarded-id-token should carry the ID
+              # token, but this kube-auth-proxy build has no ID-token
+              # pass-through (no --pass-id-token* flag, no
+              # x-auth-request-id-token response header), so the session path
+              # forwards the access token under the new header name. Switch
+              # to x-auth-request-id-token when the proxy supports it.
               token := object.get(response.headers, "x-auth-request-access-token", [""])[0]
+              usernames := [user |
+                user := [object.get(response.headers, "x-auth-request-preferred-username", [""])[0], object.get(response.headers, "x-auth-request-user", [""])[0]][_]
+                user != ""
+              ]
+              username := usernames[0]
               token != ""
-              result := {"access_token": token}
-            } else = {"access_token": ""}
-      require-session:
+              groups := {trim_space(group) |
+                group := split(object.get(response.headers, "x-auth-request-groups", [""])[0], ",")[_]
+                trim_space(group) != ""
+                trim_space(group) != "system:authenticated"
+              }
+              result := {
+                "authenticated": true,
+                # The verified token replaces any client-supplied value on
+                # the session path (MS-0007 SSO flow).
+                "authorization": concat("", ["Bearer ", token]),
+                "id_token": token,
+                "username": username,
+                "email": object.get(response.headers, "x-auth-request-email", [""])[0],
+                "groups_header": json.marshal(array.concat(["system:authenticated"], sort(groups)))
+              }
+            } else = {"authenticated": false}
+      require-auth:
         priority: 1
         patternMatching:
           patterns:
-            - predicate: auth.authorization.session.identity.access_token != ""
+            - predicate: auth.authorization['session-and-identity'].identity.authenticated
+      client-bound:
+        priority: 1
+        when:
+          # Check the claim's value, not its presence: the direct-jwt rule
+          # authenticates any signed token, and a token carrying
+          # "anonymous": false would otherwise skip the iss/azp binding.
+          - predicate: '!has(auth.identity.anonymous) || auth.identity.anonymous == false'
+        patternMatching:
+          patterns:
+            - predicate: has(auth.identity.iss) && auth.identity.iss == 'CONSUMER_PORTAL_OIDC_ISSUER_URL'
+            - predicate: has(auth.identity.azp) && auth.identity.azp == 'CONSUMER_PORTAL_CLIENT_ID'
     response:
       success:
         headers:
-          x-forwarded-access-token:
+          authorization:
             plain:
-              expression: auth.authorization.session.identity.access_token
+              expression: auth.authorization['session-and-identity'].identity.authorization
+          x-maas-username:
+            plain:
+              expression: auth.authorization['session-and-identity'].identity.username
+          x-maas-group:
+            plain:
+              expression: auth.authorization['session-and-identity'].identity.groups_header
+          x-maas-orgid:
+            plain:
+              expression: auth.authorization['session-and-identity'].organization.org_id
+          x-maas-roles:
+            plain:
+              expression: auth.authorization['session-and-identity'].organization.roles_header
+          x-auth-request-user:
+            plain:
+              expression: auth.authorization['session-and-identity'].identity.username
+          x-auth-request-email:
+            plain:
+              expression: auth.authorization['session-and-identity'].identity.email
+          x-forwarded-id-token:
+            plain:
+              expression: auth.authorization['session-and-identity'].identity.id_token
+          cookie:
+            plain:
+              expression: auth.authorization['session-and-identity'].application_cookies
+      unauthenticated:
+        code: 401
+        message:
+          value: Invalid bearer token
       unauthorized:
         code: 302
         message:
           value: Redirecting to login
         headers:
           Location:
-            expression: auth.authorization.session.login_location
+            expression: |
+              has(auth.authorization) && 'session-and-identity' in auth.authorization ? auth.authorization['session-and-identity'].login_location : '/oauth2/start?rd=%2Fmaas-portal%2F'
           Cache-Control:
             value: no-store

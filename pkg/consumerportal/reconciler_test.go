@@ -100,6 +100,7 @@ func newMTC(tenantName, infraNamespace string) *unstructured.Unstructured {
 }
 
 type aitenantOpts struct {
+	noClientID     bool
 	notReady       bool
 	issuer         string
 	portalDisabled bool
@@ -115,7 +116,11 @@ func newAITenant(opts aitenantOpts) *unstructured.Unstructured {
 	}
 	spec := map[string]any{}
 	if opts.issuer != "" {
-		spec["oidc"] = map[string]any{"issuerUrl": opts.issuer, "clientId": "test-client"}
+		oidc := map[string]any{"issuerUrl": opts.issuer}
+		if !opts.noClientID {
+			oidc["clientId"] = "test-client"
+		}
+		spec["oidc"] = oidc
 	}
 	if opts.portalDisabled {
 		spec["consumerPortal"] = map[string]any{"enabled": false}
@@ -989,6 +994,74 @@ func TestPruneStaleGrantsRemovesOnlyOldNamespace(t *testing.T) {
 	check(stale, true)
 	check(current, false)
 	check(theirs, false)
+}
+
+func TestReconcileRedisSessionStore(t *testing.T) {
+	base := func() []client.Object {
+		return []client.Object{
+			newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+			newAITenant(aitenantOpts{issuer: testIssuer}),
+			newGateway(httpsListener(testHostname)),
+			adminCredentialsSecret(),
+			dashboardService(),
+		}
+	}
+
+	// Without the customer's Redis Secret the proxy keeps cookie sessions.
+	r, _ := newReconciler(t, base()...)
+	reconcileMTC(t, r)
+	deployment := &appsv1.Deployment{}
+	if err := r.Client.Get(context.Background(), client.ObjectKey{
+		Namespace: testInfraNamespace, Name: AuthProxyName,
+	}, deployment); err != nil {
+		t.Fatalf("get proxy deployment: %v", err)
+	}
+	for _, arg := range deployment.Spec.Template.Spec.Containers[0].Args {
+		if strings.HasPrefix(arg, "--session-store-type") {
+			t.Errorf("cookie-mode deployment has %q", arg)
+		}
+	}
+
+	// With it, the proxy points at the customer's Redis.
+	redis := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Name: RedisSecretName, Namespace: testInfraNamespace,
+	}, Data: map[string][]byte{"connection-url": []byte("redis://redis.example.svc:6379")}}
+	r, _ = newReconciler(t, append(base(), redis)...)
+	reconcileMTC(t, r)
+	if err := r.Client.Get(context.Background(), client.ObjectKey{
+		Namespace: testInfraNamespace, Name: AuthProxyName,
+	}, deployment); err != nil {
+		t.Fatalf("get proxy deployment: %v", err)
+	}
+	env := deployment.Spec.Template.Spec.Containers[0].Env
+	var hasStoreType, hasURL bool
+	for _, e := range env {
+		hasStoreType = hasStoreType || (e.Name == "OAUTH2_PROXY_SESSION_STORE_TYPE" && e.Value == "redis")
+		hasURL = hasURL || e.Name == "OAUTH2_PROXY_REDIS_CONNECTION_URL"
+	}
+	if !hasStoreType || !hasURL {
+		t.Errorf("redis-mode env = %v", env)
+	}
+}
+
+func TestReconcileWaitsForClientID(t *testing.T) {
+	// The direct-JWT azp binding needs spec.oidc.clientId; without it the
+	// portal must requeue rather than render a policy that rejects every
+	// token.
+	r, rec := newReconciler(t,
+		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+		newAITenant(aitenantOpts{issuer: testIssuer, noClientID: true}),
+		newGateway(httpsListener(testHostname)),
+		adminCredentialsSecret(),
+		dashboardService(),
+	)
+	res := reconcileMTC(t, r)
+	if res.RequeueAfter != constants.NotReadyRequeueInterval {
+		t.Errorf("RequeueAfter = %v, want not-ready requeue", res.RequeueAfter)
+	}
+	if len(rec.applied) != 0 {
+		t.Errorf("applied %v without a client id", rec.applied)
+	}
 }
 
 func TestCleanupDeletesManagedConsumerPortalObjects(t *testing.T) {

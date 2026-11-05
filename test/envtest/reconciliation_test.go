@@ -3,6 +3,7 @@
 package envtest_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -59,4 +60,40 @@ func TestControlPlane(t *testing.T) {
 		attachment := awaitGuardrailEnforced(t, c, namespace)
 		awaitGuardrailDetached(t, c, namespace, attachment)
 	})
+}
+
+// The API server, not a fake client, validates the names rendered for each
+// model (RHOAIENG-100314).
+func TestModelNamesAreRenderedPerModel(t *testing.T) {
+	c := startControlPlane(t)
+
+	// Given an existing Praxis tenant with a configured provider.
+	const namespace = "model-names"
+	maas := maasFixture{client: c}
+	maas.existingPraxisTenant(t, namespace)
+	awaitPraxisInstalled(t, c, namespace)
+	provider := createProvider(t, c, namespace)
+
+	// When a user adds a model whose name is longer than a label value, and
+	// one whose name has a dot, so it is not a valid Service name.
+	long := externalModel(strings.Repeat("m", 64), namespace,
+		withModelName("long"),
+		withProviderModel(provider.Name, "provider-model"),
+	)
+	require.NoError(t, c.Create(t.Context(), long))
+	model := externalModel("gpt-4.1", namespace,
+		withModelName("gpt-4.1"),
+		withProviderModel(provider.Name, "gpt-4.1"),
+	)
+	require.NoError(t, c.Create(t.Context(), model))
+
+	// Then the dotted model is published, and only the long one fails.
+	routeName := awaitModelPublished(t, c, model, provider)
+	awaitModelFailed(t, c, long, "InvalidName")
+
+	// When the user deletes both, their routing and workload are removed.
+	require.NoError(t, c.Delete(t.Context(), long))
+	require.NoError(t, c.Delete(t.Context(), model))
+	awaitModelRemoved(t, c, long, "external-model-"+long.Name)
+	awaitModelRemoved(t, c, model, routeName)
 }
