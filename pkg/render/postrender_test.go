@@ -207,12 +207,12 @@ func TestPostRenderRewritesRoutePlaceholderPrefix(t *testing.T) {
 		},
 	}}}
 
-	out := PostRender(in, Params{Namespace: "ns", GatewayName: "gw", Image: "img", MaaSAPIRouteName: "custom-route"})
+	out := PostRender(in, Params{Namespace: "gw-ns", GatewayName: "gw", Image: "img", MaaSAPIRouteName: "custom-route", MaaSAPIRouteNamespace: "ns"})
 
 	patch0 := nestedSliceElem(t, out[0].Object, 0, "spec", "configPatches")
 	got := mustNestedString(t, patch0, "match", "routeConfiguration", "vhost", "route", "name")
-	if got != "custom-route.0" {
-		t.Fatalf("route name = %q, want %q", got, "custom-route.0")
+	if got != "ns.custom-route.0" {
+		t.Fatalf("route name = %q, want %q", got, "ns.custom-route.0")
 	}
 }
 
