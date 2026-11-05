@@ -194,9 +194,11 @@ func awaitGuardrailEnforced(t *testing.T, c client.Client, namespace string) *un
 	policy := aiGuardrail("safety", namespace)
 	require.NoError(t, c.Create(t.Context(), policy))
 	require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(policy), policy))
+	// The tenant compiler calls NeMo only in the MaasTenantConfig's
+	// status.infraNamespace, which these fixtures set to namespace.
 	policy.Status = aigatewayv1alpha1.AIGuardrailStatus{
 		BindingRevision:  "rev",
-		ProviderEndpoint: "http://guardrails.infra.svc",
+		ProviderEndpoint: "http://guardrails." + namespace + ".svc",
 		Conditions: []metav1.Condition{{
 			Type:               guardrail.ConditionAccepted,
 			Status:             metav1.ConditionTrue,

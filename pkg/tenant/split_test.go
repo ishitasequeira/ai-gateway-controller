@@ -62,8 +62,12 @@ func TestSplitPostAuthResourcesUsesResolvedTenantNamespace(t *testing.T) {
 	}
 	find("Deployment", PayloadPreProcessingDeploymentName("tenant-a"), "gateway-system")
 	postDeployment := find("Deployment", PayloadProcessingDeploymentName("tenant-a"), "gateway-system")
-	if serviceAccount, _, _ := unstructured.NestedString(postDeployment.Object, "spec", "template", "spec", "serviceAccountName"); serviceAccount != PayloadProcessingServiceAccountName("tenant-a") {
-		t.Fatalf("shared post-auth Deployment ServiceAccount = %q, want %q", serviceAccount, PayloadProcessingServiceAccountName("tenant-a"))
+	if serviceAccount, _, _ := unstructured.NestedString(postDeployment.Object, "spec", "template", "spec", "serviceAccountName"); serviceAccount != PayloadProcessingPostServiceAccountName("tenant-a") {
+		t.Fatalf("shared post-auth Deployment ServiceAccount = %q, want %q", serviceAccount, PayloadProcessingPostServiceAccountName("tenant-a"))
+	}
+	preDeployment := find("Deployment", PayloadPreProcessingDeploymentName("tenant-a"), "gateway-system")
+	if serviceAccount, _, _ := unstructured.NestedString(preDeployment.Object, "spec", "template", "spec", "serviceAccountName"); serviceAccount != PayloadProcessingServiceAccountName("tenant-a") {
+		t.Fatalf("pre-auth Deployment ServiceAccount = %q, want the shared %q", serviceAccount, PayloadProcessingServiceAccountName("tenant-a"))
 	}
 	externalDeployment := find("Deployment", PayloadProcessingExternalModelDeploymentName("tenant-a"), "tenant-a")
 	if serviceAccount, _, _ := unstructured.NestedString(externalDeployment.Object, "spec", "template", "spec", "serviceAccountName"); serviceAccount != PayloadProcessingExternalModelServiceAccountName("tenant-a") {
@@ -85,9 +89,19 @@ func TestSplitPostAuthResourcesUsesResolvedTenantNamespace(t *testing.T) {
 		t.Fatalf("ExternalModel DestinationRule SNI = %q, want %q", sni, externalFQDN)
 	}
 	find("ServiceAccount", PayloadProcessingServiceAccountName("tenant-a"), "gateway-system")
+	find("ServiceAccount", PayloadProcessingPostServiceAccountName("tenant-a"), "gateway-system")
 	for _, resource := range resources {
-		if resource.GetKind() == "ServiceAccount" && resource.GetName() == PayloadProcessingPostServiceAccountName("tenant-a") {
+		if resource.GetKind() == "ServiceAccount" && resource.GetName() == PayloadProcessingPostServiceAccountName("tenant-a") && resource.GetNamespace() != "gateway-system" {
 			t.Fatal("shared post-auth ServiceAccount must not be moved or duplicated into the tenant namespace")
+		}
+		if resource.GetKind() != "ClusterRoleBinding" {
+			continue
+		}
+		subjects, _, _ := unstructured.NestedSlice(resource.Object, "subjects")
+		for _, raw := range subjects {
+			if subject, _ := raw.(map[string]any); subject["name"] == PayloadProcessingPostServiceAccountName("tenant-a") {
+				t.Fatalf("ClusterRoleBinding %s binds the post-auth ServiceAccount, which must hold no permissions", resource.GetName())
+			}
 		}
 	}
 	find("Service", PayloadPreProcessingServiceName("tenant-a"), "gateway-system")

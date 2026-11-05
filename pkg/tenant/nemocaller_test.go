@@ -22,16 +22,19 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -56,8 +59,12 @@ insecure_options:
 
 func TestConfigureNemoCalloutsWithoutAcceptance(t *testing.T) {
 	resources := nemoCalloutFixtures("red", "gw")
-	if err := configureNemoCallouts(resources, "red", "gw", nil); err != nil {
+	resources, err := configureNemoCallouts(resources, "red", "gw", "red", nil)
+	if err != nil {
 		t.Fatalf("configureNemoCallouts: %v", err)
+	}
+	if len(resources) != 4 {
+		t.Fatalf("resources = %d, want the four fixtures and no NeMo RBAC", len(resources))
 	}
 	if data, _, _ := unstructured.NestedStringMap(resources[3].Object, "data"); data["extproc.yaml"] != postAuthExtproc {
 		t.Fatalf("extproc.yaml changed without accepted callouts:\n%s", data["extproc.yaml"])
@@ -82,8 +89,15 @@ func TestConfigureNemoCalloutsCompilesAcceptedEndpoint(t *testing.T) {
 			{configID: "toxicity-v1", header: "h-toxicity", request: true, response: true},
 		}},
 	}
-	if err := configureNemoCallouts(resources, "red", "gw", callouts); err != nil {
+	resources, err := configureNemoCallouts(resources, "red", "gw", "red", callouts)
+	if err != nil {
 		t.Fatalf("configureNemoCallouts: %v", err)
+	}
+	if len(resources) != 4 {
+		t.Fatalf("resources = %d, want no NeMo RBAC for auth-off providers", len(resources))
+	}
+	if volumes, _, _ := unstructured.NestedSlice(resources[0].Object, "spec", "template", "spec", "volumes"); len(volumes) != 1 {
+		t.Fatalf("volumes = %v, want no NeMo auth volume for auth-off providers", volumes)
 	}
 	data, _, _ := unstructured.NestedStringMap(findResource(resources, "ConfigMap", PayloadProcessingPluginsConfigMapForTenant("red"), "gw").Object, "data")
 	config := data["extproc.yaml"]
@@ -199,7 +213,7 @@ func TestConfigureNemoCalloutsWithoutNetworkPolicy(t *testing.T) {
 	resources := nemoCalloutFixtures("red", "gw")
 	resources = append(resources[:2], resources[3])
 	callouts := []nemoCallout{{name: "safety", endpoint: "http://nemo.infra.svc", serviceNamespace: "infra", checks: []nemoCheck{{configID: "pii-v1", request: true}}}}
-	if err := configureNemoCallouts(resources, "red", "gw", callouts); err != nil {
+	if _, err := configureNemoCallouts(resources, "red", "gw", "red", callouts); err != nil {
 		t.Fatalf("configureNemoCallouts without a NetworkPolicy: %v", err)
 	}
 }
@@ -230,7 +244,8 @@ func TestNemoEgressUsesServicePodSelector(t *testing.T) {
 		podLabels: map[string]string{"app": "nemo"},
 		checks:    []nemoCheck{{configID: "pii-v1", header: "h", request: true}},
 	}}
-	if err := configureNemoCallouts(resources, "red", "gw", callouts); err != nil {
+	resources, err := configureNemoCallouts(resources, "red", "gw", "red", callouts)
+	if err != nil {
 		t.Fatalf("configureNemoCallouts: %v", err)
 	}
 	egress, _, err := unstructured.NestedSlice(findResource(resources, "NetworkPolicy", PayloadProcessingNetworkPolicyName("red"), "gw").Object, "spec", "egress")
@@ -290,26 +305,87 @@ func TestAcceptedNemoCalloutsAcceptsHTTPSEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("acceptedNemoCallouts: %v", err)
 	}
-	if len(callouts) != 1 || !callouts[0].authenticated || callouts[0].serviceNamespace != "infra" || callouts[0].endpoint != policy.Status.ProviderEndpoint {
-		t.Fatalf("callouts = %#v, want the https Service in infra", callouts)
+	if len(callouts) != 1 || !callouts[0].authenticated || callouts[0].serviceNamespace != "infra" || callouts[0].serviceName != "nemo" || callouts[0].endpoint != policy.Status.ProviderEndpoint {
+		t.Fatalf("callouts = %#v, want the authenticated nemo Service in infra", callouts)
 	}
-	resources := nemoCalloutFixtures("red", "gw")
-	if err := configureNemoCallouts(resources, "red", "gw", callouts); err != nil {
-		t.Fatalf("configureNemoCallouts: %v", err)
+}
+
+// TestPinNemoCalloutsToInfra pins that only a provider Service in the
+// infrastructure namespace gets egress and a grant. Any other namespace, or an
+// unpublished infrastructure namespace, closes the policy's checks, and only
+// the first is reported: the reconcile reports the second itself.
+func TestPinNemoCalloutsToInfra(t *testing.T) {
+	callout := func(namespace string) nemoCallout {
+		return nemoCallout{
+			name: "safety", endpoint: "https://tenant-a-nemo." + namespace + ".svc.cluster.local",
+			serviceName: "tenant-a-nemo", serviceNamespace: namespace, authenticated: true,
+			checks: []nemoCheck{{name: "pii", configID: "pii-v1", header: "x-pii", request: true, response: true}},
+		}
 	}
-	egress, _, err := unstructured.NestedSlice(findResource(resources, "NetworkPolicy", PayloadProcessingNetworkPolicyName("red"), "gw").Object, "spec", "egress")
-	if err != nil || len(egress) != 2 {
-		t.Fatalf("egress = %v, err = %v, want the rendered rule plus the proxy port", egress, err)
+	closed := nemoCallout{name: "safety", closed: true, checks: []nemoCheck{{name: "pii", header: "x-pii", request: true, closed: true}}}
+	for _, c := range []struct {
+		name, serviceNamespace, infraNamespace string
+		wantClosed, wantReported               bool
+	}{
+		{"in the infrastructure namespace", "odh-ai-gateway-infra", "odh-ai-gateway-infra", false, false},
+		{"in another namespace", "kube-system", "odh-ai-gateway-infra", true, true},
+		{"infrastructure namespace unpublished", "odh-ai-gateway-infra", "", true, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got := []nemoCallout{callout(c.serviceNamespace)}
+			outside := pinNemoCalloutsToInfra(got, c.infraNamespace)
+			want := callout(c.serviceNamespace)
+			if c.wantClosed {
+				want = closed
+			}
+			if !reflect.DeepEqual(got, []nemoCallout{want}) {
+				t.Fatalf("callouts = %+v, want %+v", got, want)
+			}
+			var wantOutside []nemoCallout
+			if c.wantReported {
+				wantOutside = []nemoCallout{callout(c.serviceNamespace)}
+			}
+			if !reflect.DeepEqual(outside, wantOutside) {
+				t.Fatalf("outside = %+v, want %+v", outside, wantOutside)
+			}
+			if rbac := nemoCallerRBAC(got, "tenant-a", "gw", "sa"); c.wantClosed && len(rbac) != 0 {
+				t.Fatalf("closed callout still granted: %v", rbac)
+			}
+		})
 	}
-	rule, ok := egress[1].(map[string]any)
-	if !ok {
-		t.Fatalf("NeMo egress rule = %v, want a map", egress[1])
+}
+
+// TestReportNemoOutsideInfraEventsOnlyOnChange pins that the owner of an
+// AIGuardrail the tenant fails closed gets one Warning Event per change, not
+// one per resync, and a new one if the problem clears and comes back.
+func TestReportNemoOutsideInfraEventsOnlyOnChange(t *testing.T) {
+	policy := acceptedPolicy("safety", 3, 3, "https://tenant-a-nemo.kube-system.svc.cluster.local")
+	recorder := events.NewFakeRecorder(10)
+	r := &Reconciler{Client: fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(policy).Build(), Recorder: recorder}
+	outside := []nemoCallout{{name: "safety", serviceName: "tenant-a-nemo", serviceNamespace: "kube-system"}}
+	report := func(outside []nemoCallout) {
+		r.reportNemoOutsideInfra(context.Background(), logr.Discard(), "tenant-a", "odh-ai-gateway-infra", outside)
 	}
-	ports, _ := rule["ports"].([]any)
-	port, _ := ports[0].(map[string]any)
-	if len(ports) != 1 || port["port"] != nemoProxyPort || port["protocol"] != "TCP" {
-		t.Fatalf("NeMo egress ports = %v, want TCP %d", ports, nemoProxyPort)
+	expectEvents := func(want int) {
+		t.Helper()
+		if got := len(recorder.Events); got != want {
+			t.Fatalf("events = %d, want %d", got, want)
+		}
+		for range want {
+			if event := <-recorder.Events; !strings.Contains(event, reasonProviderOutsideInfra) || !strings.Contains(event, "kube-system/tenant-a-nemo") {
+				t.Fatalf("event = %q", event)
+			}
+		}
 	}
+
+	report(outside)
+	expectEvents(1)
+	report(outside)
+	expectEvents(0)
+	report(nil)
+	expectEvents(0)
+	report(outside)
+	expectEvents(1)
 }
 
 func TestCompileNemoExtprocRequiresRequestIDFilter(t *testing.T) {
@@ -350,7 +426,8 @@ func TestNemoCalloutChangedIgnoresConditionChurn(t *testing.T) {
 // compiles. Praxis builds a pipeline from the same file in its register
 // tests (filters/testdata/ai-gateway-controller-extproc.yaml), so a field
 // Praxis does not accept fails there. Regenerate with -update and copy the
-// file to the Praxis repo in the same change.
+// file to praxis-proxy/ai in the same change. It covers both provider shapes:
+// plaintext, and kube-rbac-proxy with token_file and tls.ca_file.
 func TestNemoCalloutContract(t *testing.T) {
 	compiled, err := compileNemoExtproc(postAuthExtproc, []nemoCallout{{
 		name:             "safety",
@@ -360,6 +437,19 @@ func TestNemoCalloutContract(t *testing.T) {
 		checks: []nemoCheck{{
 			configID: "pii-v1",
 			header:   guardrail.CheckHeaderName("tenant-a", "safety", "pii"),
+			request:  true,
+			response: true,
+		}},
+	}, {
+		name:             "secure",
+		endpoint:         "https://tenant-a-nemo.odh-ai-gateway-infra.svc.cluster.local",
+		serviceName:      "tenant-a-nemo",
+		serviceNamespace: "odh-ai-gateway-infra",
+		authenticated:    true,
+		timeout:          5 * time.Second,
+		checks: []nemoCheck{{
+			configID: "jailbreak-v1",
+			header:   guardrail.CheckHeaderName("tenant-a", "secure", "jailbreak"),
 			request:  true,
 			response: true,
 		}},
@@ -397,8 +487,8 @@ func TestAcceptedNemoCalloutsSkipsStalePolicy(t *testing.T) {
 	if len(callouts) != 3 || callouts[0].name != "current" || callouts[0].closed || len(callouts[0].checks) != 1 || !callouts[0].checks[0].request || callouts[0].checks[0].response {
 		t.Fatalf("callouts = %#v, want the current policy first", callouts)
 	}
-	if callouts[0].serviceNamespace != "infra" || callouts[0].serviceName != "nemo" {
-		t.Fatalf("service = %s/%s, want nemo/infra from the Service host", callouts[0].serviceName, callouts[0].serviceNamespace)
+	if callouts[0].serviceNamespace != "infra" || callouts[0].serviceName != "nemo" || callouts[0].authenticated {
+		t.Fatalf("callout = %#v, want the auth-off nemo Service in infra", callouts[0])
 	}
 	if callouts[1].name != "deleting" || !callouts[1].closed || callouts[2].name != "refused" || !callouts[2].closed {
 		t.Fatalf("callouts = %#v, want deleting and refused to reject their selection", callouts)
@@ -452,6 +542,7 @@ func TestAcceptedNemoCalloutsIsolatesBrokenPolicy(t *testing.T) {
 		"query":          "http://nemo.infra.svc/?x=1",
 		"other-scheme":   "ftp://nemo.infra.svc",
 		"https-port":     "https://nemo.infra.svc:8443",
+		"https-other":    "https://other.infra.svc",
 		"not-a-svc-name": "http://nemo.infra.pod",
 	}
 	broken["userinfo"] = "http://user:pw@nemo.infra.svc"

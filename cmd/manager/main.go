@@ -194,6 +194,7 @@ func main() {
 		ResyncInterval:       resyncInterval,
 		DeletionTimeout:      deletionTimeout,
 		Log:                  ctrl.Log.WithName("tenant"),
+		Recorder:             mgr.GetEventRecorder("tenant"),
 	}
 	if err := reconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to set up AITenant reconciler")

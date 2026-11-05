@@ -17,9 +17,8 @@ limitations under the License.
 package guardrail
 
 import (
+	"strings"
 	"testing"
-
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
 func TestParseNemoEndpoint(t *testing.T) {
@@ -62,20 +61,28 @@ func TestParseNemoEndpoint(t *testing.T) {
 // TestNemoReadyEndpointsParse pins that every endpoint evaluateNemoReady
 // accepts is one the tenant compiler can parse back to the same Service.
 func TestNemoReadyEndpointsParse(t *testing.T) {
-	for _, status := range []map[string]any{
-		{"endpoint": nemoEndpoint},
-		{"endpoint": "http://" + nemoName + "." + providerNS + ".svc.cluster.local"},
-		{"workloadNamespace": "nemo-workloads"},
+	for _, c := range []struct {
+		namespace, name string
+		auth            bool
+		workloadNS      string
+	}{
+		{providerNS, nemoName, true, providerNS},
+		{providerNS, nemoName, false, providerNS},
+		{providerNS, nemoName, true, "nemo-workloads"},
+		{providerNS, nemoName, false, "nemo-workloads"},
 	} {
 		provider := NewNemoGuardrails()
-		provider.SetName(nemoName)
-		provider.SetNamespace(providerNS)
-		provider.Object["status"] = status
+		provider.SetName(c.name)
+		provider.SetNamespace(c.namespace)
+		if c.auth {
+			provider.SetAnnotations(map[string]string{nemoAuthAnnotation: "true"})
+		}
+		provider.Object["status"] = map[string]any{"workloadNamespace": c.workloadNS}
 		readiness := evaluateNemoReady(provider)
 		if !readiness.Ready {
-			t.Fatalf("evaluateNemoReady(%v) refused: %s", status, readiness.Message)
+			t.Fatalf("evaluateNemoReady(%+v) refused: %s", c, readiness.Message)
 		}
-		service, err := ParseNemoEndpoint(readiness.Endpoint, providerNS, nemoName)
+		service, err := ParseNemoEndpoint(readiness.Endpoint, c.namespace, c.name)
 		if err != nil {
 			t.Fatalf("accepted endpoint %q does not parse: %v", readiness.Endpoint, err)
 		}
@@ -85,21 +92,31 @@ func TestNemoReadyEndpointsParse(t *testing.T) {
 	}
 }
 
-func TestEvaluateNemoReadyRefusesEndpointsTheCompilerCannotCall(t *testing.T) {
-	host := nemoName + "." + providerNS + ".svc.cluster.local"
+// TestEvaluateNemoReadyIgnoresStatusEndpoint pins that status.endpoint never
+// reaches the published endpoint or the message: the Service always comes
+// from status.workloadNamespace, so another controller's URL cannot steer the
+// tenant compiler's egress and RBAC.
+func TestEvaluateNemoReadyIgnoresStatusEndpoint(t *testing.T) {
+	const secret = "sup3rs3cret"
 	for _, endpoint := range []string{
-		"https://" + host + ":8443",
-		"http://" + host + ":8000",
-		"https://" + host + "/v2/other",
+		"https://" + nemoName + ".kube-system.svc.cluster.local",
 		"https://nemo.example.com",
+		"https://user:" + secret + "@" + nemoName + "." + providerNS + ".svc.cluster.local",
+		"http://" + nemoName + "." + providerNS + ".svc.cluster.local:8000",
 	} {
-		provider := &unstructured.Unstructured{}
-		provider.SetGroupVersionKind(NemoGuardrailsGVK)
-		provider.SetName(nemoName)
-		provider.SetNamespace(providerNS)
-		provider.Object["status"] = map[string]any{"endpoint": endpoint}
-		if got := evaluateNemoReady(provider); got.Ready {
-			t.Errorf("evaluateNemoReady accepted %q", endpoint)
-		}
+		t.Run(endpoint, func(t *testing.T) {
+			provider := NewNemoGuardrails()
+			provider.SetName(nemoName)
+			provider.SetNamespace(providerNS)
+			provider.SetAnnotations(map[string]string{nemoAuthAnnotation: "true"})
+			provider.Object["status"] = map[string]any{"endpoint": endpoint, "workloadNamespace": providerNS}
+			got := evaluateNemoReady(provider)
+			if !got.Ready || got.Endpoint != nemoEndpoint {
+				t.Fatalf("evaluateNemoReady = %+v, want %q from the workload namespace", got, nemoEndpoint)
+			}
+			if strings.Contains(got.Message, secret) {
+				t.Errorf("message republishes status.endpoint: %q", got.Message)
+			}
+		})
 	}
 }
