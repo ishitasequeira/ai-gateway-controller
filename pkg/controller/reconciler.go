@@ -3,6 +3,8 @@ package controller
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -10,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
@@ -21,10 +24,14 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -64,7 +71,14 @@ const (
 	externalProviderFinalizer     = "inference.opendatahub.io/external-provider-cleanup"
 )
 
-var errCredentialNotReady = errors.New("effective provider credential is not ready")
+var (
+	errCredentialNotReady = errors.New("effective provider credential is not ready")
+	errInvalidModelName   = errors.New("ExternalModel name cannot be rendered")
+)
+
+// errProviderCANotReady reports a tls.credentialName Secret that is missing or
+// has no CA, without saying which (see validateProviderCACredential).
+var errProviderCANotReady = errors.New("tls.credentialName must name a Secret in the Gateway namespace with a PEM CA certificate in key cacert or ca.crt")
 
 // Reconciler coordinates Praxis ExternalModel routes and ExternalProvider
 // transport. The model loop resolves one namespace-scoped route set and
@@ -87,6 +101,10 @@ type Reconciler struct {
 	// content-addressed overlay provenance.
 	ProducerVersion string
 	Log             logr.Logger
+	// readPodLogs verifies that each current ExternalModel ExtProc process has
+	// accepted and is serving the published overlay revision before withdrawal
+	// cleanup begins. Tests inject deterministic process-reported revisions.
+	readPodLogs func(context.Context, string, string, string) (string, error)
 	// ApplyResource and PublishOverlay are test seams. Production leaves them
 	// nil, selecting the real SSA renderer and publisher below. Applying one
 	// object at a time preserves the production order and lets tests inject a
@@ -101,17 +119,38 @@ type Reconciler struct {
 // ReferenceGrant changes to models referencing a provider in their namespace;
 // Secret and tenant changes also reconcile providers independently of any model.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.readPodLogs == nil {
+		kubeClient, err := kubernetes.NewForConfig(mgr.GetConfig())
+		if err != nil {
+			return fmt.Errorf("create Kubernetes client for ExternalModel serving-state checks: %w", err)
+		}
+		r.readPodLogs = func(ctx context.Context, namespace, podName, container string) (string, error) {
+			ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			tailLines := int64(300)
+			limitBytes := int64(1 << 20)
+			body, err := kubeClient.CoreV1().Pods(namespace).GetLogs(podName, &corev1.PodLogOptions{
+				Container:  container,
+				TailLines:  &tailLines,
+				LimitBytes: &limitBytes,
+			}).Do(ctx).Raw()
+			return string(body), err
+		}
+	}
 	inScope := predicate.NewPredicateFuncs(func(obj client.Object) bool { return r.namespaceAllowed(obj.GetNamespace()) })
-	if err := builder.ControllerManagedBy(mgr).
+	models := builder.ControllerManagedBy(mgr).
 		For(&v1alpha1.ExternalModel{}, builder.WithPredicates(inScope)).
 		Watches(&v1alpha1.ExternalProvider{}, handler.EnqueueRequestsFromMapFunc(r.providerModels), builder.WithPredicates(inScope)).
 		WatchesMetadata(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.secretModels), builder.WithPredicates(inScope)).
-		// The tenant reconciler creates the tenant-local Praxis Service. A
-		// model may otherwise publish an HTTPRoute before that Service exists;
-		// Istio can retain ResolvedRefs=False until the route is reconciled
-		// again. Service events are namespace-scoped and therefore only fan out
-		// to models in the affected tenant.
-		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(r.serviceModels), builder.WithPredicates(inScope)).
+		// The tenant reconciler creates the tenant-local Praxis Service. Service events are namespace-scoped and therefore only affect
+		// models in the affected tenant.
+		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(r.serviceModels), builder.WithPredicates(inScope))
+	// Model routes enable the post-auth filter only while the tenant has
+	// post-auth filters, so re-check them when one of those inputs changes.
+	for _, src := range tenant.PostAuthFilterSources() {
+		models = models.Watches(src.Object, r.postAuthFilterHandler(src), builder.WithPredicates(src.Predicate))
+	}
+	if err := models.
 		WatchesRawSource(source.Kind(mgr.GetCache(), tenant.NewMaasTenantConfig(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.maasTenantConfigModels))).
 		WatchesRawSource(source.Kind(mgr.GetCache(), tenant.NewAITenant(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.tenantModels))).
 		// Gateway attachments: route acceptance is reported in HTTPRoute
@@ -123,9 +162,14 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r); err != nil {
 		return err
 	}
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &v1alpha1.ExternalProvider{}, providerCredentialNameIndex, indexProviderByCredentialName); err != nil {
+		return fmt.Errorf("index ExternalProviders by tls.credentialName: %w", err)
+	}
 	return builder.ControllerManagedBy(mgr).
 		For(&v1alpha1.ExternalProvider{}, builder.WithPredicates(inScope)).
-		WatchesMetadata(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.secretProviders), builder.WithPredicates(inScope)).
+		// Unfiltered: a tls.credentialName Secret is in the Gateway namespace,
+		// which can be outside the scope; secretProviders applies the scope.
+		WatchesMetadata(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.secretProviders)).
 		WatchesRawSource(source.Kind(mgr.GetCache(), tenant.NewMaasTenantConfig(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.tenantProviders))).
 		WatchesRawSource(source.Kind(mgr.GetCache(), tenant.NewAITenant(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.aitenantProviders))).
 		Complete(&providerReconciler{Reconciler: r})
@@ -137,19 +181,49 @@ func (r *providerReconciler) Reconcile(ctx context.Context, req reconcile.Reques
 	return r.ReconcileProvider(ctx, req)
 }
 
+// providerCredentialNameIndex indexes ExternalProviders by the Secret names
+// Istio reads for tls.credentialName, so a CA Secret event in a Gateway
+// namespace finds providers in any tenant.
+const providerCredentialNameIndex = "spec.config.tls.credentialName" //nolint:gosec // field index name, not a credential
+
+// istioCASuffix names the separate CA Secret Istio prefers for a credential.
+const istioCASuffix = "-cacert"
+
+func indexProviderByCredentialName(obj client.Object) []string {
+	provider, ok := obj.(*v1alpha1.ExternalProvider)
+	if !ok {
+		return nil
+	}
+	if name := strings.TrimSpace(provider.Spec.Config["tls.credentialName"]); name != "" {
+		return []string{name, name + istioCASuffix}
+	}
+	return nil
+}
+
 func (r *Reconciler) secretProviders(ctx context.Context, obj client.Object) []reconcile.Request {
-	if !r.namespaceAllowed(obj.GetNamespace()) {
-		return nil
+	var requests []reconcile.Request
+	if r.namespaceAllowed(obj.GetNamespace()) {
+		var providers v1alpha1.ExternalProviderList
+		if err := r.List(ctx, &providers, client.InNamespace(obj.GetNamespace())); err != nil {
+			r.Log.Error(err, "list providers for Secret event", "secret", obj.GetName())
+			return nil
+		}
+		for i := range providers.Items {
+			if providers.Items[i].Spec.Auth.SecretRef.Name == obj.GetName() {
+				requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&providers.Items[i])})
+			}
+		}
 	}
-	var providers v1alpha1.ExternalProviderList
-	if err := r.List(ctx, &providers, client.InNamespace(obj.GetNamespace())); err != nil {
-		r.Log.Error(err, "list providers for Secret event", "secret", obj.GetName())
-		return nil
+	// The name alone matches: which Gateway namespace a provider uses is
+	// decided by its tenant, and a redundant reconcile is harmless.
+	var trusting v1alpha1.ExternalProviderList
+	if err := r.List(ctx, &trusting, client.MatchingFields{providerCredentialNameIndex: obj.GetName()}); err != nil {
+		r.Log.Error(err, "list providers for CA Secret event", "secret", obj.GetName())
+		return requests
 	}
-	requests := make([]reconcile.Request, 0, len(providers.Items))
-	for i := range providers.Items {
-		if providers.Items[i].Spec.Auth.SecretRef.Name == obj.GetName() {
-			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&providers.Items[i])})
+	for i := range trusting.Items {
+		if r.namespaceAllowed(trusting.Items[i].Namespace) {
+			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&trusting.Items[i])})
 		}
 	}
 	return requests
@@ -245,6 +319,16 @@ func (r *Reconciler) secretModels(ctx context.Context, obj client.Object) []reco
 		}
 	}
 	requests := r.modelsReferencingProviders(ctx, obj.GetNamespace(), providerNames)
+	// Attachments and cross-namespace references check a provider's CA Secret
+	// in their own Gateway's namespace, so its events reach their models.
+	var trusting v1alpha1.ExternalProviderList
+	if err := r.List(ctx, &trusting, client.MatchingFields{providerCredentialNameIndex: obj.GetName()}); err != nil {
+		r.Log.Error(err, "list providers for CA Secret event", "secret", obj.GetName())
+		return requests
+	}
+	for i := range trusting.Items {
+		requests = append(requests, r.modelsReferencingProviders(ctx, trusting.Items[i].Namespace, map[string]bool{trusting.Items[i].Name: true})...)
+	}
 	// Models re-validate an auth override Secret, and credential copies
 	// follow it, whether or not they attach to other tenants.
 	var models v1alpha1.ExternalModelList
@@ -267,6 +351,92 @@ func (r *Reconciler) serviceModels(ctx context.Context, obj client.Object) []rec
 		return nil
 	}
 	return r.modelsInNamespace(ctx, obj.GetNamespace())
+}
+
+// postAuthFilterRetryDelays are the waits between retries when the tenant
+// lookup fails temporarily. The event won't fire again, so without retries
+// models attached to the tenant's Gateway would be missed.
+var postAuthFilterRetryDelays = []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second}
+
+// postAuthFilterHandler queues the models of each tenant affected by a
+// change. It holds the queue so it can retry later.
+//
+//nolint:ireturn // controller-runtime watches take a handler.EventHandler.
+func (r *Reconciler) postAuthFilterHandler(src tenant.PostAuthFilterSource) handler.EventHandler {
+	enqueue := func(ctx context.Context, q workqueue.TypedRateLimitingInterface[reconcile.Request], objects ...client.Object) {
+		for _, obj := range objects {
+			for _, namespace := range src.Tenants(ctx, r.Client, obj) {
+				r.enqueuePostAuthFilterModels(ctx, q, namespace, 0)
+			}
+		}
+	}
+	return handler.Funcs{
+		CreateFunc: func(ctx context.Context, e event.CreateEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+			enqueue(ctx, q, e.Object)
+		},
+		UpdateFunc: func(ctx context.Context, e event.UpdateEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+			enqueue(ctx, q, e.ObjectOld, e.ObjectNew)
+		},
+		DeleteFunc: func(ctx context.Context, e event.DeleteEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+			enqueue(ctx, q, e.Object)
+		},
+		GenericFunc: func(ctx context.Context, e event.GenericEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+			enqueue(ctx, q, e.Object)
+		},
+	}
+}
+
+// enqueuePostAuthFilterModels queues the tenant's models and retries if the
+// tenant lookup failed temporarily. Other failures are only logged; fixing
+// the MaasTenantConfig or AITenant triggers a new pass.
+func (r *Reconciler) enqueuePostAuthFilterModels(ctx context.Context, q workqueue.TypedRateLimitingInterface[reconcile.Request], namespace string, attempt int) {
+	if ctx.Err() != nil || q.ShuttingDown() {
+		return
+	}
+	requests, err := r.postAuthFilterModels(ctx, namespace)
+	for _, request := range requests {
+		q.Add(request)
+	}
+	if err == nil {
+		return
+	}
+	if !transientReadError(err) || attempt >= len(postAuthFilterRetryDelays) {
+		r.Log.Error(err, "resolve tenant for post-auth filter event; gateway-attached models were not enqueued",
+			"namespace", namespace, "attempts", attempt+1)
+		return
+	}
+	time.AfterFunc(postAuthFilterRetryDelays[attempt], func() {
+		r.enqueuePostAuthFilterModels(ctx, q, namespace, attempt+1)
+	})
+}
+
+// postAuthFilterModels returns the tenant's models: those in its namespace
+// and those attached to its Gateway. If the tenant lookup fails, it still
+// returns the ones in its namespace, along with the error.
+func (r *Reconciler) postAuthFilterModels(ctx context.Context, tenantNamespace string) ([]reconcile.Request, error) {
+	if !r.namespaceAllowed(tenantNamespace) {
+		return nil, nil
+	}
+	requests := r.modelsInNamespace(ctx, tenantNamespace)
+	resolution, err := r.resolveTenantForNamespace(ctx, tenantNamespace)
+	if err != nil {
+		return requests, err
+	}
+	if resolution.aitenant == nil {
+		return requests, nil
+	}
+	seen := make(map[types.NamespacedName]struct{}, len(requests))
+	for _, request := range requests {
+		seen[request.NamespacedName] = struct{}{}
+	}
+	for _, request := range r.gatewayAttachedModels(ctx, resolution.aitenant) {
+		if _, ok := seen[request.NamespacedName]; ok {
+			continue
+		}
+		seen[request.NamespacedName] = struct{}{}
+		requests = append(requests, request)
+	}
+	return requests, nil
 }
 
 func (r *Reconciler) tenantModels(ctx context.Context, ait *unstructured.Unstructured) []reconcile.Request {
@@ -370,22 +540,28 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 		if apierrors.IsNotFound(err) {
 			// Clean resources left by a provider that predated the provider
 			// finalizer. All cleanup remains label-gated to this provider.
+			inUse, useErr := r.providerTransportStillInUse(ctx, req.Namespace, req.Name)
+			if useErr != nil {
+				return reconcile.Result{}, useErr
+			}
+			if inUse {
+				return reconcile.Result{RequeueAfter: withdrawalRequeueInterval}, nil
+			}
 			return reconcile.Result{}, r.cleanupProviderTransport(ctx, req.Namespace, req.Name)
 		}
 		return reconcile.Result{}, err
 	}
 	if !provider.DeletionTimestamp.IsZero() {
-		if !controllerutil.ContainsFinalizer(&provider, externalProviderFinalizer) {
-			return reconcile.Result{}, r.cleanupProviderTransport(ctx, provider.Namespace, provider.Name)
-		}
-		if err := r.cleanupProviderTransport(ctx, provider.Namespace, provider.Name); err != nil {
-			return reconcile.Result{}, err
-		}
-		return reconcile.Result{}, r.removeExternalProviderFinalizer(ctx, &provider)
+		return r.reconcileDeletingProvider(ctx, &provider)
 	}
 
 	live, err := r.liveTenantResolution(ctx, provider.Namespace)
 	if err != nil {
+		// A provider in a namespace no tenant claims is never claimed for its
+		// tenant (see below), so the resolution is only retried.
+		if tenantNamespace, nsErr := r.tenantNamespace(ctx, provider.Namespace); nsErr == nil && !tenantNamespace {
+			return reconcile.Result{}, err
+		}
 		// Tenant resolution fails on an unreadable or inconsistent AITenant
 		// owner. Claim the provider and report Pending before returning: a bare
 		// error would leave it with neither our finalizer nor a status writer,
@@ -420,19 +596,24 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 	if !live.missingConfig && live.status == "" {
 		// Praxis is selected but the handoff has not started (see
 		// tenant.LegacyServes): IPP still serves this namespace and owns
-		// provider status until maas-controller writes cleanup-complete.
-		return reconcile.Result{}, nil
+		// provider status until maas-controller writes cleanup-complete. A
+		// claim left by a failed tenant lookup is released once nothing uses
+		// the provider's transport, so IPP reports the provider again.
+		return r.releaseProviderClaim(ctx, &provider)
 	}
 	validationErr := r.validateProvider(ctx, &provider)
 	if validationErr == nil {
 		validationErr = r.validateProviderCredential(ctx, &provider)
 	}
-	if live.missingConfig && !controllerutil.ContainsFinalizer(&provider, externalProviderFinalizer) {
+	if live.missingConfig {
 		// A namespace no tenant claims is served only through Gateway
 		// attachments: its provider has no tenant-local transport, so only its
-		// own configuration is reported. While IPP serves the default tenant,
-		// it serves this namespace's models and reports their providers'
-		// status instead. A tenant namespace whose MaasTenantConfig
+		// own configuration is reported. Our finalizer on it, which an
+		// attachment or a former tenant of the namespace left, is released once
+		// nothing uses its transport. While IPP serves the default tenant, it
+		// serves this namespace's models and reports their providers' status
+		// instead. Every tenant Gateway is in the configured Gateway namespace,
+		// where its CA Secret must be. A tenant namespace whose MaasTenantConfig
 		// maas-controller has not created yet falls through and is claimed
 		// below.
 		tenantNamespace, err := r.tenantNamespace(ctx, provider.Namespace)
@@ -440,13 +621,7 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 			return reconcile.Result{}, err
 		}
 		if !tenantNamespace {
-			if _, _, ipp, err := r.defaultTenantGateway(ctx); err != nil || ipp {
-				return reconcile.Result{}, err
-			}
-			if validationErr != nil {
-				return reconcile.Result{}, r.updateProviderStatus(ctx, &provider, providerPhaseFailed, reasonReconcileFailed, validationErr.Error())
-			}
-			return reconcile.Result{}, r.updateProviderStatus(ctx, &provider, resolver.PhaseReady, reasonValidated, "provider Secret reference is ready; Gateway attachments apply its transport")
+			return r.reconcileAttachmentOnlyProvider(ctx, &provider, validationErr)
 		}
 	}
 	// Claim the provider before any tenant gate: an absent MaasTenantConfig is
@@ -467,6 +642,14 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 		apiTranslationEnabled: live.apiTranslationEnabled,
 	}
 
+	if validationErr == nil {
+		validationErr = r.validateProviderCACredential(ctx, &provider, gatewayNamespace)
+		if transientReadError(validationErr) {
+			// A failed Secret read is not the provider's own failure: retry
+			// instead of withdrawing its transport and reporting it Failed.
+			return reconcile.Result{}, validationErr
+		}
+	}
 	if validationErr != nil {
 		cleanupErr := r.cleanupProviderTransport(ctx, provider.Namespace, provider.Name)
 		if statusErr := r.updateProviderStatus(ctx, &provider, providerPhaseFailed, reasonReconcileFailed, validationErr.Error()); statusErr != nil {
@@ -503,6 +686,59 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 		return reconcile.Result{}, err
 	}
 	return reconcile.Result{}, nil
+}
+
+// releaseProviderClaim removes our claim from a provider we do not serve, such
+// as the claim a failed tenant lookup leaves: its transport, then our
+// finalizer. While a published overlay or an HTTPRoute still uses the
+// transport, such as an attachment of a model in this namespace to a Praxis
+// tenant, the claim is the provider's deletion protection (see
+// ensureAttachmentProviderFinalizers) and stays until that use is withdrawn;
+// the provider is rechecked. A provider without the finalizer has nothing to
+// release.
+func (r *Reconciler) releaseProviderClaim(ctx context.Context, provider *v1alpha1.ExternalProvider) (reconcile.Result, error) {
+	if !controllerutil.ContainsFinalizer(provider, externalProviderFinalizer) {
+		return reconcile.Result{}, nil
+	}
+	inUse, err := r.providerTransportStillInUse(ctx, provider.Namespace, provider.Name)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	if inUse {
+		return reconcile.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+	if err := r.cleanupProviderTransport(ctx, provider.Namespace, provider.Name); err != nil {
+		return reconcile.Result{}, err
+	}
+	return reconcile.Result{}, r.removeExternalProviderFinalizer(ctx, provider)
+}
+
+// reconcileAttachmentOnlyProvider reports the status of a provider in a
+// namespace no tenant claims, given the result of its own validation, and
+// releases its deletion protection once no attachment uses it.
+func (r *Reconciler) reconcileAttachmentOnlyProvider(ctx context.Context, provider *v1alpha1.ExternalProvider, validationErr error) (reconcile.Result, error) {
+	if err := r.releaseUnusedAttachmentProvider(ctx, provider); err != nil {
+		return reconcile.Result{}, err
+	}
+	if _, _, ipp, err := r.defaultTenantGateway(ctx); err != nil || ipp {
+		return reconcile.Result{}, err
+	}
+	if validationErr == nil {
+		validationErr = r.validateProviderCACredential(ctx, provider, r.gatewayNamespace())
+		if transientReadError(validationErr) {
+			// A failed Secret read is not the provider's own failure: retry
+			// instead of reporting it Failed.
+			return reconcile.Result{}, validationErr
+		}
+	}
+	result := reconcile.Result{}
+	if controllerutil.ContainsFinalizer(provider, externalProviderFinalizer) {
+		result.RequeueAfter = 30 * time.Second
+	}
+	if validationErr != nil {
+		return result, r.updateProviderStatus(ctx, provider, providerPhaseFailed, reasonReconcileFailed, validationErr.Error())
+	}
+	return result, r.updateProviderStatus(ctx, provider, resolver.PhaseReady, reasonValidated, "provider Secret reference is ready; Gateway attachments apply its transport")
 }
 
 func (r *Reconciler) ensureExternalProviderFinalizer(ctx context.Context, provider *v1alpha1.ExternalProvider) error {
@@ -549,11 +785,19 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 			}
 		}
 		if err := r.reconcileDeletingModel(ctx, &model); err != nil {
+			var pending *pendingWithdrawalError
+			if errors.As(err, &pending) {
+				return reconcile.Result{RequeueAfter: pending.After}, nil
+			}
 			return reconcile.Result{}, err
 		}
 		return reconcile.Result{}, nil
 	}
 	result, err := r.reconcileModel(ctx, req, &model)
+	var pending *pendingWithdrawalError
+	if errors.As(err, &pending) {
+		return reconcile.Result{RequeueAfter: pending.After}, nil
+	}
 	// Provider transport is collected once the routes that used it are withdrawn.
 	if collectErr := r.collectProviderTransport(ctx, model.Namespace); collectErr != nil {
 		err = errors.Join(err, collectErr)
@@ -588,6 +832,24 @@ func (r *Reconciler) reconcileModel(ctx context.Context, req reconcile.Request, 
 // gatewayRefs aggregate it with their other attachments into one write.
 type modelStatusReporter func(ready bool, reason, message string, env *envelope.Envelope) error
 
+type homeModelPublication struct {
+	result            publisher.Result
+	namespace         string
+	gateway           v1alpha1.NamespacedObjectReference
+	denied            string
+	unserved          string
+	weightDisabled    bool
+	unroutedReason    string
+	unroutedMessage   string
+	servingReason     string
+	servingMessage    string
+	attached          []attachedModel
+	state             map[string]attachedModel
+	remaining         time.Duration
+	withdrawalPending bool
+	report            modelStatusReporter
+}
+
 // reconcileHomeModel serves the model through its own tenant: the tenant
 // whose MaasTenantConfig is in the model namespace. This is the existing
 // tenant-local path; it publishes every model the tenant serves from its own
@@ -611,16 +873,8 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 		return reconcile.Result{}, err
 	}
 
-	modelPtrs := make([]*v1alpha1.ExternalModel, 0, len(models.Items))
-	modelOwners := make(map[string]*v1alpha1.ExternalModel, len(models.Items))
-	for i := range models.Items {
-		if !tenant.ServedByTenantGateway(&models.Items[i], gatewayName, gatewayNamespace) {
-			continue
-		}
-		modelPtrs = append(modelPtrs, &models.Items[i])
-		modelOwners[models.Items[i].Name] = &models.Items[i]
-	}
-	foreign, unready, err := r.foreignProviders(ctx, req.Namespace, modelPtrs)
+	modelPtrs, modelOwners := homeModelInputs(models.Items, gatewayName, gatewayNamespace)
+	foreign, unready, err := r.foreignProviders(ctx, req.Namespace, gatewayNamespace, modelPtrs)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
@@ -633,6 +887,12 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 		if revoked, servesErr := r.servesDeniedReference(ctx, req.Namespace, modelPtrs, foreign); servesErr != nil {
 			return reconcile.Result{}, servesErr
 		} else if revoked {
+			err = nil
+		}
+		// An explicit all-zero weight update is an administrative withdrawal,
+		// not a provider-readiness failure. Let the no-route cleanup below
+		// remove the previous selection instead of preserving it as LKG.
+		if errors.Is(err, resolver.ErrNoRoutes) && allRoutesExplicitlyWeightDisabled(set) {
 			err = nil
 		}
 	}
@@ -660,7 +920,7 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 		if served, err := r.keepTenantAttachments(ctx, home, string(model.UID)); err != nil {
 			return reconcile.Result{}, err
 		} else if !served {
-			if err := r.enableExternalModelRoutes(ctx, tenant.ID(modelTenant.aitenant.GetName()), req.Namespace, gatewayName, gatewayNamespace, nil); err != nil {
+			if _, err := r.enableExternalModelRoutes(ctx, home, nil); err != nil {
 				return reconcile.Result{}, err
 			}
 			if err := r.deleteLegacyExternalModelRouteFilter(ctx, tenant.ID(modelTenant.aitenant.GetName())); err != nil {
@@ -687,7 +947,15 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 	if err != nil {
 		return reconcile.Result{}, err
 	}
-	if err := r.applyTransport(ctx, set.Routes(), req.Namespace, tenant.ID(modelTenant.aitenant.GetName()), gatewayName, gatewayNamespace, modelOwners, attached, state); err != nil {
+	previousOverlay, err := r.readPublishedEnvelope(ctx, req.Namespace)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	transportRoutes, withdrawalPending, err := r.transportRoutesForPublication(ctx, req.Namespace, set.Routes(), previousOverlay, modelTenant.apiTranslationEnabled)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	if err := r.applyTransport(ctx, transportRoutes, req.Namespace, tenant.ID(modelTenant.aitenant.GetName()), gatewayName, gatewayNamespace, modelOwners, attached, state, modelTenant.apiTranslationEnabled); err != nil {
 		if statusErr := report(false, reasonReconcileFailed, err.Error(), nil); statusErr != nil {
 			return reconcile.Result{}, statusErr
 		}
@@ -696,7 +964,7 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 	if err := r.cleanupExternalModelRouteFilters(ctx, req.Namespace, tenant.ID(modelTenant.aitenant.GetName()), gatewayName, gatewayNamespace); err != nil {
 		return reconcile.Result{}, err
 	}
-	if err := r.cleanupModelTransport(ctx, req.Namespace, set.Routes()); err != nil {
+	if err := r.cleanupModelTransport(ctx, req.Namespace, transportRoutes); err != nil {
 		if statusErr := report(false, reasonReconcileFailed, err.Error(), nil); statusErr != nil {
 			return reconcile.Result{}, statusErr
 		}
@@ -712,29 +980,95 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 	// Attachments the tenant's own candidates pushed over the overlay
 	// capacity, and providers in other namespaces its own routes no longer
 	// use, lose their DestinationRules and credential copies.
-	if err := r.gcTenantState(ctx, req.Namespace, excludedRoutes(attached), stateAnnotations(home.gateway, state)); err != nil {
+	if !withdrawalPending {
+		if err := r.gcTenantState(ctx, req.Namespace, excludedRoutes(attached), stateAnnotations(home.gateway, state)); err != nil {
+			return reconcile.Result{}, err
+		}
+	}
+	remaining, err := r.finishProviderWithdrawal(ctx, req.Namespace, tenant.ID(modelTenant.aitenant.GetName()),
+		gatewayName, gatewayNamespace, modelPtrs, modelOwners, set.Routes(), attached, result.Envelope.Revision.Value, withdrawalPending,
+		modelTenant.apiTranslationEnabled, state)
+	if err != nil {
 		return reconcile.Result{}, err
 	}
-	if denial := denied[req.String()]; denial != "" {
-		// The model's permitted references are served; the others are reported.
-		return reconcile.Result{}, report(false, reasonRefNotPermitted, denial, nil)
+	unroutedReason, unroutedMessage, unrouted := unroutedStatus(set, req.String())
+	if !unrouted {
+		unroutedReason, unroutedMessage = "", ""
 	}
-	if message := unserved[req.String()]; message != "" {
-		// Its references inherit a credential that is not ready; other models
-		// keep serving.
-		return reconcile.Result{}, report(false, reasonProviderNotReady, message, nil)
-	}
-	if reason, message, unrouted := unroutedStatus(set, req.String()); unrouted {
-		// Other models of the namespace are served, but none of this model's
-		// references resolved: it has no route or overlay candidate.
-		return reconcile.Result{}, report(false, reason, message, nil)
-	}
+	servingReason, servingMessage := r.homeServingState(ctx, model, home)
+	return r.finishHomeModelPublication(ctx, homeModelPublication{
+		result: result, namespace: req.Namespace,
+		gateway: home.gateway, denied: denied[req.String()],
+		unserved:       unserved[req.String()],
+		weightDisabled: explicitlyWeightDisabledModels(set)[req.String()],
+		unroutedReason: unroutedReason, unroutedMessage: unroutedMessage,
+		servingReason: servingReason, servingMessage: servingMessage,
+		attached: attached, state: state,
+		remaining: remaining, withdrawalPending: withdrawalPending, report: report,
+	})
+}
 
-	message := fmt.Sprintf("distributed routing overlay digest %s generation %d", result.Envelope.Revision.Value, result.Envelope.Provenance.SourceGeneration)
-	if err := report(true, reasonReconciled, message, &result.Envelope); err != nil {
-		return reconcile.Result{}, err
+// homeModelInputs selects live models owned by this tenant without republishing
+// terminating models whose staged withdrawal is handled independently.
+func homeModelInputs(models []v1alpha1.ExternalModel, gatewayName, gatewayNamespace string) ([]*v1alpha1.ExternalModel, map[string]*v1alpha1.ExternalModel) {
+	modelPtrs := make([]*v1alpha1.ExternalModel, 0, len(models))
+	modelOwners := make(map[string]*v1alpha1.ExternalModel, len(models))
+	for i := range models {
+		// A terminating model is handled by its own staged-withdrawal
+		// reconcile. Including it here lets a sibling event republish its
+		// providers and replace the drain revision before its finalizer can
+		// finish.
+		if !models[i].DeletionTimestamp.IsZero() || !tenant.ServedByTenantGateway(&models[i], gatewayName, gatewayNamespace) {
+			continue
+		}
+		modelPtrs = append(modelPtrs, &models[i])
+		modelOwners[models[i].Name] = &models[i]
 	}
-	return reconcile.Result{}, nil
+	return modelPtrs, modelOwners
+}
+
+func (r *Reconciler) finishHomeModelPublication(ctx context.Context, publication homeModelPublication) (reconcile.Result, error) {
+	var statusErr error
+	var waiting time.Duration
+	switch {
+	case publication.weightDisabled:
+		statusErr = publication.report(false, reasonNoRoutes, "all ExternalModel provider references are explicitly disabled by weight", nil)
+	case publication.denied != "":
+		statusErr = publication.report(false, reasonRefNotPermitted, publication.denied, nil)
+	case publication.unserved != "":
+		statusErr = publication.report(false, reasonProviderNotReady, publication.unserved, nil)
+	case publication.unroutedReason != "":
+		statusErr = publication.report(false, publication.unroutedReason, publication.unroutedMessage, nil)
+	case publication.servingReason != "":
+		// The overlay is published, but the model serves only once the
+		// Gateway accepts its route and the tenant's ExtProc is available; a
+		// model waiting for them is rechecked.
+		statusErr = publication.report(false, publication.servingReason, publication.servingMessage, nil)
+		if waitingReason(publication.servingReason) {
+			waiting = attachmentRequeueInterval
+		}
+	default:
+		message := fmt.Sprintf("distributed routing overlay digest %s generation %d", publication.result.Envelope.Revision.Value, publication.result.Envelope.Provenance.SourceGeneration)
+		statusErr = publication.report(true, reasonReconciled, message, &publication.result.Envelope)
+	}
+	if publication.remaining > 0 {
+		if statusErr != nil {
+			return reconcile.Result{}, statusErr
+		}
+		if waiting > 0 {
+			return reconcile.Result{RequeueAfter: min(waiting, publication.remaining)}, nil
+		}
+		return reconcile.Result{RequeueAfter: publication.remaining}, nil
+	}
+	if publication.withdrawalPending {
+		if err := r.gcTenantState(ctx, publication.namespace, excludedRoutes(publication.attached), stateAnnotations(publication.gateway, publication.state)); err != nil {
+			return reconcile.Result{}, err
+		}
+	}
+	if statusErr != nil {
+		return reconcile.Result{}, statusErr
+	}
+	return reconcile.Result{RequeueAfter: waiting}, nil
 }
 
 func (r *Reconciler) handleHomeRouteResolutionError(
@@ -754,8 +1088,17 @@ func (r *Reconciler) handleHomeRouteResolutionError(
 		if unroutedReason, unroutedMessage, ok := unroutedStatus(set, namespace+"/"+modelName); ok {
 			reason, message = unroutedReason, unroutedMessage
 		}
-		policyExcluded := translationPolicyExcludedModels(set)
-		if len(policyExcluded) > 0 {
+		excluded := translationPolicyExcludedModels(set)
+		disabledByWeight := explicitlyWeightDisabledModels(set)
+		for modelRef := range disabledByWeight {
+			excluded[modelRef] = true
+		}
+		if len(excluded) > 0 {
+			if disabledByWeight[namespace+"/"+modelName] {
+				reason = reasonNoRoutes
+			} else if excluded[namespace+"/"+modelName] {
+				reason = reasonTranslationDisabled
+			}
 			valid, err := r.livePraxisBeforeWrite(ctx, namespace, modelTenant)
 			if err != nil {
 				return reconcile.Result{}, err
@@ -771,7 +1114,7 @@ func (r *Reconciler) handleHomeRouteResolutionError(
 			home := attachmentTenant{namespace: namespace, tenantID: tenant.ID(modelTenant.aitenant.GetName()),
 				gateway:               v1alpha1.NamespacedObjectReference{Name: modelTenant.gatewayName, Namespace: modelTenant.gatewayNamespace},
 				apiTranslationEnabled: modelTenant.apiTranslationEnabled}
-			if err := r.cleanupPolicyExcludedHomeModels(ctx, home, set, policyExcluded, sourceUID); err != nil {
+			if err := r.cleanupExcludedHomeModels(ctx, home, set, excluded, sourceUID); err != nil {
 				return reconcile.Result{}, err
 			}
 			return reconcile.Result{}, routeErr
@@ -1160,7 +1503,7 @@ func (r *Reconciler) resolveRemainingHomeModels(
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	foreign, unready, err := r.foreignProviders(ctx, deleted.Namespace, modelPtrs)
+	foreign, unready, err := r.foreignProviders(ctx, deleted.Namespace, gatewayNamespace, modelPtrs)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
@@ -1203,7 +1546,15 @@ func (r *Reconciler) applyRemainingHomeModels(
 	if err != nil {
 		return err
 	}
-	if err := r.applyTransport(ctx, set.Routes(), deleted.Namespace, tenantID, gatewayName, gatewayNamespace, modelOwners, attached, state); err != nil {
+	previousOverlay, err := r.readPublishedEnvelope(ctx, deleted.Namespace)
+	if err != nil {
+		return err
+	}
+	transportRoutes, withdrawalPending, err := r.transportRoutesForPublication(ctx, deleted.Namespace, set.Routes(), previousOverlay, apiTranslationEnabled)
+	if err != nil {
+		return err
+	}
+	if err := r.applyTransport(ctx, transportRoutes, deleted.Namespace, tenantID, gatewayName, gatewayNamespace, modelOwners, attached, state, apiTranslationEnabled); err != nil {
 		return fmt.Errorf("rebuild transport after ExternalModel deletion: %w", err)
 	}
 	if err := r.cleanupExternalModelRouteFilters(ctx, deleted.Namespace, tenantID, gatewayName, gatewayNamespace); err != nil {
@@ -1212,15 +1563,25 @@ func (r *Reconciler) applyRemainingHomeModels(
 	if err := r.deleteLegacyExternalModelRouteFilter(ctx, tenantID); err != nil {
 		return err
 	}
-	if err := r.cleanupModelTransport(ctx, deleted.Namespace, set.Routes()); err != nil {
+	if err := r.cleanupModelTransport(ctx, deleted.Namespace, transportRoutes); err != nil {
 		return err
 	}
 	sourceUID := string(deleted.UID)
 	if len(modelPtrs) > 0 {
 		sourceUID = string(modelPtrs[0].UID)
 	}
-	if _, err := r.publishTenantOverlay(ctx, deleted.Namespace, gatewayName, set, attached, nil, sourceUID, apiTranslationEnabled); err != nil {
+	result, err := r.publishTenantOverlay(ctx, deleted.Namespace, gatewayName, set, attached, nil, sourceUID, apiTranslationEnabled)
+	if err != nil {
 		return fmt.Errorf("publish remaining overlay after ExternalModel deletion: %w", err)
+	}
+	remaining, err := r.finishProviderWithdrawal(ctx, deleted.Namespace, tenantID, gatewayName, gatewayNamespace,
+		modelPtrs, modelOwners, set.Routes(), attached, result.Envelope.Revision.Value, withdrawalPending,
+		apiTranslationEnabled, state)
+	if err != nil {
+		return err
+	}
+	if remaining > 0 {
+		return &pendingWithdrawalError{After: remaining}
 	}
 	return r.gcTenantState(ctx, deleted.Namespace, excludedRoutes(attached), stateAnnotations(home.gateway, state))
 }
@@ -1252,10 +1613,11 @@ func translationPolicyExcludedModels(set *resolver.ResolvedRouteSet) map[string]
 	return excluded
 }
 
-// cleanupPolicyExcludedHomeModels removes only routes made ineligible by the
-// tenant's API-translation policy. Other models with provider/readiness errors
-// keep their last-known route patches and overlay candidates.
-func (r *Reconciler) cleanupPolicyExcludedHomeModels(
+// cleanupExcludedHomeModels removes only candidates made ineligible by an
+// explicit model-local policy, such as disabled API translation or an
+// all-zero provider weight. Other models with provider/readiness errors keep
+// their last-known route patches and overlay candidates.
+func (r *Reconciler) cleanupExcludedHomeModels(
 	ctx context.Context,
 	home attachmentTenant,
 	set *resolver.ResolvedRouteSet,
@@ -1266,9 +1628,13 @@ func (r *Reconciler) cleanupPolicyExcludedHomeModels(
 	if err != nil {
 		return fmt.Errorf("read current overlay candidates before translation-policy cleanup: %w", err)
 	}
+	excludedScopedIDs, err := r.excludedScopedCandidateIDs(ctx, home.namespace, excluded)
+	if err != nil {
+		return err
+	}
 	keptCandidates := make([]envelope.Candidate, 0, len(candidates))
 	for _, candidate := range candidates {
-		policyExcluded := false
+		policyExcluded := excludedScopedIDs[candidate.StableID]
 		for modelRef := range excluded {
 			modelNamespace, modelName, found := strings.Cut(modelRef, "/")
 			if found && modelNamespace == home.namespace && strings.HasPrefix(candidate.StableID, modelName+"/provider-") {
@@ -1313,8 +1679,7 @@ func (r *Reconciler) cleanupPolicyExcludedHomeModels(
 	if err != nil {
 		return fmt.Errorf("resolve served attachments during translation-policy cleanup: %w", err)
 	}
-	if err := r.writeExternalModelRoutes(ctx, home.tenantID, home.namespace, home.gateway.Name, home.gateway.Namespace,
-		set.Routes(), keptPatches, attachments); err != nil {
+	if _, err := r.writeTenantExternalModelRoutes(ctx, home, set.Routes(), keptPatches, attachments, nil, nil); err != nil {
 		return fmt.Errorf("remove translation-disabled model route patches: %w", err)
 	}
 	if err := r.cleanupExternalModelRouteFilters(ctx, home.namespace, home.tenantID, home.gateway.Name, home.gateway.Namespace); err != nil {
@@ -1405,6 +1770,7 @@ func (r *Reconciler) applyProviderTransport(ctx context.Context, provider *v1alp
 	route := resolver.Route{
 		Namespace: provider.Namespace, Provider: provider.Name, ProviderType: provider.Spec.Provider,
 		Endpoint: provider.Spec.Endpoint, Port: port, TLSCACertificates: strings.TrimSpace(provider.Spec.Config["tls.caCertificates"]),
+		TLSCredentialName: strings.TrimSpace(provider.Spec.Config["tls.credentialName"]),
 	}
 	service := providerService(route, provider.Namespace)
 	serviceEntry := providerServiceEntry(route, provider.Namespace)
@@ -1726,9 +2092,45 @@ func (r *Reconciler) validateProvider(_ context.Context, p *v1alpha1.ExternalPro
 	if p.Spec.Auth.SecretRef.Name == "" {
 		return errors.New("auth.secretRef.name is required")
 	}
-	if caCertificates := strings.TrimSpace(p.Spec.Config["tls.caCertificates"]); caCertificates != "" &&
-		(!strings.HasPrefix(caCertificates, "/") || strings.Contains(caCertificates, "..")) {
-		return errors.New("config tls.caCertificates must be an absolute mounted file path")
+	if err := resolver.ValidateProviderTrust(p.Spec.Config); err != nil {
+		return fmt.Errorf("config %w", err)
+	}
+	return nil
+}
+
+// validateProviderCACredential checks the tls.credentialName Secret in the
+// Gateway namespace, where Istio reads it. Without it the Gateway cannot verify
+// the provider, so this is reported on the provider instead of failing TLS.
+// Like Istio, it reads <name>-cacert and falls back to <name> only when that
+// Secret does not exist, taking the CA from the cacert key, or from ca.crt.
+// Tenants cannot read the Gateway namespace, so a missing Secret and one
+// without a CA return the same errProviderCANotReady; a failed read is
+// returned for retry.
+func (r *Reconciler) validateProviderCACredential(ctx context.Context, p *v1alpha1.ExternalProvider, gatewayNamespace string) error {
+	name := strings.TrimSpace(p.Spec.Config["tls.credentialName"])
+	if name == "" {
+		return nil
+	}
+	if r.APIReader == nil {
+		return errors.New("APIReader is required for CA Secret reads")
+	}
+	var secret corev1.Secret
+	err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: gatewayNamespace, Name: name + istioCASuffix}, &secret)
+	if apierrors.IsNotFound(err) {
+		err = r.APIReader.Get(ctx, client.ObjectKey{Namespace: gatewayNamespace, Name: name}, &secret)
+	}
+	if apierrors.IsNotFound(err) {
+		return errProviderCANotReady
+	}
+	if err != nil {
+		return fmt.Errorf("read tls.credentialName Secret: %w", err)
+	}
+	ca := secret.Data["cacert"]
+	if len(ca) == 0 {
+		ca = secret.Data["ca.crt"]
+	}
+	if !x509.NewCertPool().AppendCertsFromPEM(ca) {
+		return errProviderCANotReady
 	}
 	return nil
 }
@@ -1791,25 +2193,24 @@ func (r *Reconciler) validateResolvedRouteSet(ctx context.Context, set *resolver
 
 // excludeUnsupportedModelSelection excludes every model contributing to a
 // conflicting client-visible capability. The overlay selects candidates by
-// client name, so unequal weights or repeated providers across model objects
-// must not affect unrelated models in the namespace.
+// client name, so repeated providers across model objects must not affect
+// unrelated models in the namespace. Unequal positive weights are valid and
+// render as Praxis weightedRandom.
 func excludeUnsupportedModelSelection(set *resolver.ResolvedRouteSet) (*resolver.ResolvedRouteSet, map[string]error) {
 	valid := &resolver.ResolvedRouteSet{Models: make([]resolver.ModelRoutes, 0, len(set.Models))}
 	rejected := make(map[string]error)
-	weights := make(map[string]int)
-	weightConflicts := make(map[string]bool)
 	bindings := make(map[string]bool)
 	duplicateProviders := make(map[string]bool)
 	for _, model := range set.Models {
+		if len(model.Routes) > 0 {
+			if err := validateModelName(model.Routes[0].Model); err != nil {
+				rejected[model.ModelRef] = err
+			}
+		}
 		if count := modelHTTPRouteRuleCount(model.Routes); count > maxHTTPRouteRules {
 			rejected[model.ModelRef] = fmt.Errorf("%d HTTPRoute rules exceed the Gateway API limit of %d", count, maxHTTPRouteRules)
 		}
 		for _, route := range model.Routes {
-			if weight, seen := weights[route.ClientName]; seen && weight != route.Weight {
-				weightConflicts[route.ClientName] = true
-			} else {
-				weights[route.ClientName] = route.Weight
-			}
 			binding := route.ClientName + "\x00" + route.ProviderNamespace + "/" + route.Provider
 			if bindings[binding] {
 				duplicateProviders[route.ClientName] = true
@@ -1819,10 +2220,6 @@ func excludeUnsupportedModelSelection(set *resolver.ResolvedRouteSet) (*resolver
 	}
 	for _, model := range set.Models {
 		for _, route := range model.Routes {
-			if weightConflicts[route.ClientName] {
-				rejected[model.ModelRef] = fmt.Errorf("%w: client model %s has unequal weights", envelope.ErrWeightUnsupported, route.ClientName)
-				break
-			}
 			if duplicateProviders[route.ClientName] {
 				rejected[model.ModelRef] = fmt.Errorf("%w: client model %s repeats a provider", envelope.ErrDuplicateProvider, route.ClientName)
 				break
@@ -1835,6 +2232,55 @@ func excludeUnsupportedModelSelection(set *resolver.ResolvedRouteSet) (*resolver
 	return valid, rejected
 }
 
+// validateModelName rejects an ExternalModel name that cannot be the value of
+// the label on the objects rendered for the model, so at most 63 characters
+// (RHOAIENG-100314). The model's HTTPRoute name and overlay stable_id then fit
+// their limits too, and a selection sink name that is not a valid Service name
+// is hashed (see providerSelectionSinkName).
+func validateModelName(name string) error {
+	if problems := validation.IsValidLabelValue(name); len(problems) > 0 {
+		return fmt.Errorf("%w: %q is not a valid label value (%s); use a shorter metadata.name and set spec.modelName to the client-facing name",
+			errInvalidModelName, name, strings.Join(problems, "; "))
+	}
+	return nil
+}
+
+// rejectionReason is the status reason for a model excludeUnsupportedModelSelection rejects.
+func rejectionReason(err error) string {
+	if errors.Is(err, errInvalidModelName) {
+		return reasonInvalidName
+	}
+	return reasonReconcileFailed
+}
+
+func allRoutesExplicitlyWeightDisabled(set *resolver.ResolvedRouteSet) bool {
+	disabled := explicitlyWeightDisabledModels(set)
+	return set != nil && len(set.Models) > 0 && len(disabled) == len(set.Models)
+}
+
+func explicitlyWeightDisabledModels(set *resolver.ResolvedRouteSet) map[string]bool {
+	disabled := make(map[string]bool)
+	if set == nil {
+		return disabled
+	}
+	for _, model := range set.Models {
+		if len(model.Routes) != 0 || len(model.Skips) == 0 {
+			continue
+		}
+		allDisabled := true
+		for _, skip := range model.Skips {
+			if skip.Reason != resolver.SkipWeightDisabled {
+				allDisabled = false
+				break
+			}
+		}
+		if allDisabled {
+			disabled[model.ModelRef] = true
+		}
+	}
+	return disabled
+}
+
 func (r *Reconciler) validateModelRouteSet(ctx context.Context, set *resolver.ResolvedRouteSet,
 	owners map[string]*v1alpha1.ExternalModel, current *v1alpha1.ExternalModel, report modelStatusReporter) (*resolver.ResolvedRouteSet, error) {
 	valid, rejected := excludeUnsupportedModelSelection(set)
@@ -1843,13 +2289,13 @@ func (r *Reconciler) validateModelRouteSet(ctx context.Context, set *resolver.Re
 			if owner.Namespace == current.Namespace && owner.Name == current.Name {
 				continue
 			}
-			if err := r.updateModelStatus(ctx, owner, false, reasonReconcileFailed, rejection.Error(), nil); err != nil {
+			if err := r.updateModelStatus(ctx, owner, false, rejectionReason(rejection), rejection.Error(), nil); err != nil {
 				return nil, err
 			}
 		}
 	}
 	if err := rejected[current.Namespace+"/"+current.Name]; err != nil {
-		if statusErr := report(false, reasonReconcileFailed, err.Error(), nil); statusErr != nil {
+		if statusErr := report(false, rejectionReason(err), err.Error(), nil); statusErr != nil {
 			return nil, statusErr
 		}
 		return nil, err
@@ -1876,8 +2322,11 @@ func (r *Reconciler) namespaceAllowed(namespace string) bool {
 // as for an attachment, Gateway DestinationRules and credential copies that
 // their HTTPRoute records.
 func (r *Reconciler) applyTransport(ctx context.Context, routes []resolver.Route, modelNamespace, tenantID, gatewayName,
-	gatewayNamespace string, modelOwners map[string]*v1alpha1.ExternalModel, attached []attachedModel, foreign map[string]attachedModel) error {
-	home := attachmentTenant{namespace: modelNamespace, tenantID: tenantID, gateway: v1alpha1.NamespacedObjectReference{Name: gatewayName, Namespace: gatewayNamespace}}
+	gatewayNamespace string, modelOwners map[string]*v1alpha1.ExternalModel, attached []attachedModel, foreign map[string]attachedModel,
+	apiTranslationEnabled bool) error {
+	home := attachmentTenant{namespace: modelNamespace, tenantID: tenantID,
+		gateway:               v1alpha1.NamespacedObjectReference{Name: gatewayName, Namespace: gatewayNamespace},
+		apiTranslationEnabled: apiTranslationEnabled}
 	resources := make([]unstructured.Unstructured, 0, len(routes))
 	seen := map[string]bool{}
 	models := map[string][]resolver.Route{}
@@ -1913,7 +2362,11 @@ func (r *Reconciler) applyTransport(ctx context.Context, routes []resolver.Route
 			setOwnerReference(&obj, owner)
 		}
 		if hasForeign {
-			obj.SetAnnotations(routeStateAnnotations(home.gateway, state))
+			annotations := obj.GetAnnotations()
+			for key, value := range routeStateAnnotations(home.gateway, state) {
+				annotations[key] = value
+			}
+			obj.SetAnnotations(annotations)
 		}
 		key := obj.GetKind() + "/" + obj.GetNamespace() + "/" + obj.GetName()
 		if !seen[key] {
@@ -1944,7 +2397,7 @@ func (r *Reconciler) applyTransport(ctx context.Context, routes []resolver.Route
 			return err
 		}
 	}
-	if err := r.writeExternalModelRoutes(ctx, tenantID, modelNamespace, gatewayName, gatewayNamespace, routes, nil, attached); err != nil {
+	if _, err := r.writeTenantExternalModelRoutes(ctx, home, routes, nil, attached, nil, nil); err != nil {
 		return err
 	}
 	return nil
@@ -1954,8 +2407,8 @@ func (r *Reconciler) applyTransport(ctx context.Context, routes []resolver.Route
 // route-specific ExternalModel filter overrides. The tenant reconciler owns
 // the base EnvoyFilter; keeping these objects separate prevents concurrent
 // tenant/model reconciles from overwriting configPatches.
-func (r *Reconciler) enableExternalModelRoutes(ctx context.Context, tenantID, modelNamespace, gatewayName, gatewayNamespace string, routes []resolver.Route) error {
-	return r.writeExternalModelRoutes(ctx, tenantID, modelNamespace, gatewayName, gatewayNamespace, routes, nil, nil)
+func (r *Reconciler) enableExternalModelRoutes(ctx context.Context, t attachmentTenant, routes []resolver.Route) (bool, error) {
+	return r.writeTenantExternalModelRoutes(ctx, t, routes, nil, nil, nil, nil)
 }
 
 // writeExternalModelRoutes enables the tenant's own routes, then its served
@@ -1990,6 +2443,10 @@ func (r *Reconciler) writeExternalModelRoutes(ctx context.Context, tenantID, mod
 			},
 		},
 	}}
+	postAuth, err := tenant.HasPostAuthFilters(ctx, r.Client, modelNamespace)
+	if err != nil {
+		return err
+	}
 	kept := append(make([]any, 0, len(preserved)+len(routes)*3+len(attached)*3+2), preserved...)
 
 	byModel := map[string][]resolver.Route{}
@@ -2033,6 +2490,62 @@ func (r *Reconciler) writeExternalModelRoutes(ctx context.Context, tenantID, mod
 			responseMode = "STREAMED"
 		}
 		for index := 0; index < route.count; index++ {
+			perFilter := map[string]any{
+				externalModelPreExtProcFilter: map[string]any{
+					"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
+					"overrides": map[string]any{
+						"processing_mode": map[string]any{
+							"request_header_mode": "SEND",
+							// The pre-auth processor extracts the model from JSON before
+							// authentication. Give its body-field-to-header filter the
+							// complete request body; only post-auth Praxis needs streamed
+							// chunks for selected-provider translation.
+							"request_body_mode":     "BUFFERED",
+							"response_header_mode":  "SKIP",
+							"response_body_mode":    "NONE",
+							"request_trailer_mode":  "SKIP",
+							"response_trailer_mode": "SKIP",
+						},
+					},
+				},
+				externalModelExtProcFilter: map[string]any{
+					"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
+					// ExtProcPerRoute is disable-only when the
+					// vhost config is disabled. An overrides
+					// object is the supported way for this
+					// more-specific ExternalModel route to
+					// re-enable the filter.
+					"overrides": map[string]any{
+						"processing_mode": map[string]any{
+							"request_header_mode": "SEND",
+							// Buffer every request so Envoy sends one complete body message,
+							// including when trailers follow: stream_usage_inject and the
+							// translation filters need the whole JSON body. The pre-auth
+							// processor already buffers it.
+							"request_body_mode":    "BUFFERED",
+							"response_header_mode": "SEND",
+							// Envoy chooses the response processing mode before the
+							// provider is selected. Stream all rules for a model that
+							// can select Messages; retain NONE for OpenAI-only models.
+							"response_body_mode":    responseMode,
+							"request_trailer_mode":  "SKIP",
+							"response_trailer_mode": "SKIP",
+						},
+					},
+				},
+				"envoy.filters.http.ext_proc.ipp-pre": map[string]any{
+					"@type":    "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
+					"disabled": true,
+				},
+			}
+			// The "ipp" filter runs the tenant's post-auth filters. Leave it
+			// on when the tenant has any; otherwise turn it off.
+			if !postAuth {
+				perFilter["envoy.filters.http.ext_proc.ipp"] = map[string]any{
+					"@type":    "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
+					"disabled": true,
+				}
+			}
 			kept = append(kept, map[string]any{
 				"applyTo": "HTTP_ROUTE",
 				"match": map[string]any{
@@ -2045,58 +2558,7 @@ func (r *Reconciler) writeExternalModelRoutes(ctx context.Context, tenantID, mod
 				},
 				"patch": map[string]any{
 					"operation": "MERGE",
-					"value": map[string]any{"typed_per_filter_config": map[string]any{
-						externalModelPreExtProcFilter: map[string]any{
-							"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
-							"overrides": map[string]any{
-								"processing_mode": map[string]any{
-									"request_header_mode": "SEND",
-									// The pre-auth processor extracts the model from JSON before
-									// authentication. Give its body-field-to-header filter the
-									// complete request body; only post-auth Praxis needs streamed
-									// chunks for selected-provider translation.
-									"request_body_mode":     "BUFFERED",
-									"response_header_mode":  "SKIP",
-									"response_body_mode":    "NONE",
-									"request_trailer_mode":  "SKIP",
-									"response_trailer_mode": "SKIP",
-								},
-							},
-						},
-						externalModelExtProcFilter: map[string]any{
-							"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
-							// ExtProcPerRoute is disable-only when the
-							// vhost config is disabled. An overrides
-							// object is the supported way for this
-							// more-specific ExternalModel route to
-							// re-enable the filter.
-							"overrides": map[string]any{
-								"processing_mode": map[string]any{
-									"request_header_mode": "SEND",
-									// Buffer every request so Envoy sends one complete body message,
-									// including when trailers follow: stream_usage_inject and the
-									// translation filters need the whole JSON body. The pre-auth
-									// processor already buffers it.
-									"request_body_mode":    "BUFFERED",
-									"response_header_mode": "SEND",
-									// Envoy chooses the response processing mode before the
-									// provider is selected. Stream all rules for a model that
-									// can select Messages; retain NONE for OpenAI-only models.
-									"response_body_mode":    responseMode,
-									"request_trailer_mode":  "SKIP",
-									"response_trailer_mode": "SKIP",
-								},
-							},
-						},
-						"envoy.filters.http.ext_proc.ipp-pre": map[string]any{
-							"@type":    "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
-							"disabled": true,
-						},
-						"envoy.filters.http.ext_proc.ipp": map[string]any{
-							"@type":    "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
-							"disabled": true,
-						},
-					}},
+					"value":     map[string]any{"typed_per_filter_config": perFilter},
 				},
 			})
 		}
@@ -2260,7 +2722,10 @@ func (r *Reconciler) updateModelStatus(ctx context.Context, m *v1alpha1.External
 			setCondition(&m.Status.Conditions, conditionOverlayDistributed, metav1.ConditionTrue, reasonReconciled, message)
 		}
 	} else {
-		m.Status.Phase = "Failed"
+		m.Status.Phase = modelPhaseFailed
+		if waitingReason(reason) {
+			m.Status.Phase = modelPhasePending
+		}
 		setCondition(&m.Status.Conditions, conditionOverlayDistributed, metav1.ConditionFalse, reason, message)
 		if r.staleRouteName(ctx, m) {
 			m.Status.HTTPRouteName = ""
@@ -2414,6 +2879,9 @@ func providerDestinationRuleAtGateway(route resolver.Route, gatewayName, ns, ten
 	if route.TLSCACertificates != "" {
 		tls["caCertificates"] = route.TLSCACertificates
 	}
+	if route.TLSCredentialName != "" {
+		tls["credentialName"] = route.TLSCredentialName
+	}
 	name := providerServicePrefix + route.Provider
 	if tenantID != "" && tenantID != "models-as-a-service" {
 		name += "-" + tenantID
@@ -2520,7 +2988,7 @@ func modelHTTPRouteSet(routes []resolver.Route, ns, gateway, gatewayNS string) u
 			}},
 			"backendRefs": []any{map[string]any{"name": service, "port": providerPort(candidate)}},
 			"filters":     []any{providerURLRewrite(providerEndpointForRoute(candidate)), removeInternalRoutingHeaders()},
-			"timeouts":    map[string]any{"request": "300s"},
+			"timeouts":    map[string]any{"request": fmt.Sprintf("%ds", withdrawalRequestTimeoutSeconds)},
 		})
 		// Body-routed requests enter on a model header rather than the
 		// canonical path. When translation is enabled, the selected profile can
@@ -2544,14 +3012,14 @@ func modelHTTPRouteSet(routes []resolver.Route, ns, gateway, gatewayNS string) u
 			"matches":     bodyMatches,
 			"backendRefs": []any{map[string]any{"name": service, "port": providerPort(candidate)}},
 			"filters":     []any{providerHostnameRewrite(providerEndpointForRoute(candidate)), removeInternalRoutingHeaders()},
-			"timeouts":    map[string]any{"request": "300s"},
+			"timeouts":    map[string]any{"request": fmt.Sprintf("%ds", withdrawalRequestTimeoutSeconds)},
 		})
 	}
 	sinkName := providerSelectionSinkName(route.Model)
 	rules = append(rules, map[string]any{
 		"matches":     []any{map[string]any{"path": map[string]any{"type": "PathPrefix", "value": path}}},
 		"backendRefs": []any{map[string]any{"name": sinkName, "port": int64(443)}},
-		"timeouts":    map[string]any{"request": "300s"},
+		"timeouts":    map[string]any{"request": fmt.Sprintf("%ds", withdrawalRequestTimeoutSeconds)},
 	})
 	// Keep the body-routing rule for requests whose path is not the canonical
 	// model path. The post-auth ExtProc selection header is authoritative for
@@ -2560,11 +3028,24 @@ func modelHTTPRouteSet(routes []resolver.Route, ns, gateway, gatewayNS string) u
 	rules = append(rules, map[string]any{
 		"matches":     []any{map[string]any{"headers": []any{map[string]any{"name": "X-Gateway-Model-Name", "type": "Exact", "value": route.ClientName}}}},
 		"backendRefs": []any{map[string]any{"name": sinkName, "port": int64(443)}},
-		"timeouts":    map[string]any{"request": "300s"},
+		"timeouts":    map[string]any{"request": fmt.Sprintf("%ds", withdrawalRequestTimeoutSeconds)},
 	})
+	metadata := labelledMetadata(modelRouteName(route.Model), ns, "inference.opendatahub.io/external-model", route.Model)
+	localProfiles := make([]resolver.Route, 0, len(routes))
+	for _, profile := range routes {
+		if !profile.CrossNamespace() {
+			localProfiles = append(localProfiles, profile)
+		}
+	}
+	// Route contains only scalar fields and Secret references, never key data.
+	profiles, err := json.Marshal(localProfiles) //nolint:musttag // Internal resolved routes use Go field names in this reference-only snapshot.
+	if err != nil {
+		return unstructured.Unstructured{}
+	}
+	metadata["annotations"] = map[string]any{tenant.AnnotationHomeRuntimeRoutes: string(profiles)}
 	return unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "gateway.networking.k8s.io/v1", "kind": "HTTPRoute",
-		"metadata": labelledMetadata(modelRouteName(route.Model), ns, "inference.opendatahub.io/external-model", route.Model),
+		"metadata": metadata,
 		"spec": map[string]any{
 			"parentRefs": []any{parent},
 			"rules":      rules,
@@ -2589,8 +3070,23 @@ func removeInternalRoutingHeaders() map[string]any {
 	}}
 }
 
+// providerSelectionSinkName names the model's selection sink Service. A model
+// name that makes it an invalid Service name (a DNS-1035 label: no dots, at
+// most 63 characters), such as gpt-4.1, gets
+// provider-selection-required--<model prefix>-<hash12> instead
+// (RHOAIENG-100314). Model names start with an alphanumeric, so the double
+// dash never matches a valid name, and every valid name keeps its form.
 func providerSelectionSinkName(model string) string {
-	return providerSelectionSinkPrefix + strings.ToLower(strings.ReplaceAll(model, "/", "-"))
+	name := providerSelectionSinkPrefix + strings.ToLower(strings.ReplaceAll(model, "/", "-"))
+	if len(validation.IsDNS1035Label(name)) == 0 {
+		return name
+	}
+	hash := shortHash(model)
+	base := strings.ReplaceAll(strings.TrimPrefix(name, providerSelectionSinkPrefix), ".", "-")
+	if limit := 63 - len(providerSelectionSinkPrefix) - len(hash) - 2; len(base) > limit {
+		base = strings.TrimRight(base[:limit], "-")
+	}
+	return providerSelectionSinkPrefix + "-" + base + "-" + hash
 }
 
 func providerSelectionSink(route resolver.Route, namespace string) unstructured.Unstructured {
@@ -2605,3 +3101,78 @@ func providerSelectionSink(route resolver.Route, namespace string) unstructured.
 
 var _ client.Object = (*v1alpha1.ExternalModel)(nil)
 var _ client.Object = (*v1alpha1.ExternalProvider)(nil)
+
+// excludedScopedCandidateIDs derives scoped identities from provider references,
+// including hashed identities, without conflating shared client-visible names.
+func (r *Reconciler) excludedScopedCandidateIDs(ctx context.Context, namespace string, excluded map[string]bool) (map[string]bool, error) {
+	ids := make(map[string]bool)
+	for modelRef := range excluded {
+		modelNamespace, modelName, found := strings.Cut(modelRef, "/")
+		if !found || modelNamespace != namespace {
+			continue
+		}
+		var model v1alpha1.ExternalModel
+		if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: modelNamespace, Name: modelName}, &model); err != nil {
+			return nil, fmt.Errorf("read excluded model %s to identify scoped candidates: %w", modelRef, err)
+		}
+		for _, ref := range model.Spec.ExternalProviderRefs {
+			if ref.Ref.Namespace != "" && ref.Ref.Namespace != modelNamespace {
+				ids[envelope.ScopedStableID(modelNamespace, modelName, ref.Ref.Namespace, ref.Ref.Name)] = true
+			}
+		}
+	}
+	return ids, nil
+}
+
+// reconcileDeletingProvider retains in-use transport until serving requests drain.
+func (r *Reconciler) reconcileDeletingProvider(ctx context.Context, provider *v1alpha1.ExternalProvider) (reconcile.Result, error) {
+	inUse, err := r.providerTransportStillInUse(ctx, provider.Namespace, provider.Name)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	if inUse {
+		if controllerutil.ContainsFinalizer(provider, externalProviderFinalizer) {
+			message, messageErr := r.providerWithdrawalWaitMessage(ctx, provider.Namespace, provider.Name)
+			if messageErr != nil {
+				return reconcile.Result{}, messageErr
+			}
+			if statusErr := r.updateProviderStatus(ctx, provider, providerPhasePending, reasonProviderInUse, message); statusErr != nil {
+				return reconcile.Result{}, statusErr
+			}
+		}
+		return reconcile.Result{RequeueAfter: withdrawalRequeueInterval}, nil
+	}
+	if !controllerutil.ContainsFinalizer(provider, externalProviderFinalizer) {
+		return reconcile.Result{}, r.cleanupProviderTransport(ctx, provider.Namespace, provider.Name)
+	}
+	if err := r.cleanupProviderTransport(ctx, provider.Namespace, provider.Name); err != nil {
+		return reconcile.Result{}, err
+	}
+	return reconcile.Result{}, r.removeExternalProviderFinalizer(ctx, provider)
+}
+
+// releaseUnusedAttachmentProvider releases attachment-only deletion protection
+// without changing the status ownership of a namespace claimed by a tenant.
+func (r *Reconciler) releaseUnusedAttachmentProvider(ctx context.Context, provider *v1alpha1.ExternalProvider) error {
+	if !controllerutil.ContainsFinalizer(provider, externalProviderFinalizer) {
+		return nil
+	}
+	claimed, err := r.tenantNamespace(ctx, provider.Namespace)
+	if err != nil || claimed {
+		return err
+	}
+	mtc := tenant.NewMaasTenantConfig()
+	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: provider.Namespace, Name: "default-tenant"}, mtc); err == nil {
+		return nil
+	} else if !apierrors.IsNotFound(err) {
+		return err
+	}
+	inUse, err := r.providerTransportStillInUse(ctx, provider.Namespace, provider.Name)
+	if err != nil || inUse {
+		return err
+	}
+	if err := r.cleanupProviderTransport(ctx, provider.Namespace, provider.Name); err != nil {
+		return err
+	}
+	return r.removeExternalProviderFinalizer(ctx, provider)
+}

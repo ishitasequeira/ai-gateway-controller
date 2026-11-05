@@ -15,12 +15,16 @@ maas_api_deployment_pod_selector() {
 }
 
 # Require a non-terminating, Running, Ready maas-api pod that requested this
-# run's registry tag and is serving the exact pushed image digest. Containerd
-# can report an older tag alias in status.image when the same image content was
-# already present; status.imageID is the content identity to compare instead.
+# run's registry tag and whose runtime digest belongs to the pulled image. The
+# expected pushed digest and the node's complete repoDigests list are recorded
+# together by crictl inspecti. Containerd may report a prior digest alias in a
+# pod's imageID when identical image content already has multiple repo digests.
 maas_api_pods_have_exact_ready_image() {
-  local pods_json=$1 expected_image=$2 expected_image_digest=$3
-  jq -e --arg image "$expected_image" --arg image_digest "$expected_image_digest" '
+  local pods_json=$1 expected_image=$2 expected_image_digest=$3 node_repo_digests=$4
+  jq -e --arg image "$expected_image" --arg image_digest "$expected_image_digest" \
+    --arg node_repo_digests "$node_repo_digests" '
+    ($node_repo_digests | split(",") | map(select(length > 0))) as $digests |
+    ($digests | index($image_digest)) != null and
     any(.items[]?;
       .metadata.deletionTimestamp == null and .status.phase == "Running" and
       any(.spec.containers[]?;
@@ -28,7 +32,8 @@ maas_api_pods_have_exact_ready_image() {
       ) and
       any(.status.containerStatuses[]?;
         .name == "maas-api" and .ready == true and
-        ((.imageID // "" | sub("^containerd://"; "")) == $image_digest)
+        ((.imageID // "" | sub("^containerd://"; "")) as $pod_digest |
+          ($digests | index($pod_digest)) != null)
       )
     )
   ' <<<"$pods_json" >/dev/null

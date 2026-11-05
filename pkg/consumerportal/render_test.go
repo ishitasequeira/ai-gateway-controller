@@ -42,6 +42,7 @@ func renderTestResources(t *testing.T) []unstructured.Unstructured {
 		Image:              "quay.io/example/kube-auth-proxy:test",
 		OIDCIssuerURL:      testIssuer,
 		Hostname:           testHostname,
+		OIDCClientID:       "test-client",
 		GatewayName:        testGatewayName,
 		GatewayNamespace:   testGatewayNamespace,
 		AuthorinoNamespace: DefaultAuthorinoNamespace,
@@ -215,6 +216,122 @@ func TestRenderBuildsBackendTLS(t *testing.T) {
 	}
 }
 
+func TestRenderRedisSessionArgs(t *testing.T) {
+	// Without a Redis URL the proxy keeps cookie sessions.
+	resources := renderTestResources(t)
+	deployment := findResource(t, resources, "Deployment", AuthProxyName)
+	container := firstNestedMap(t, deployment.Object, "spec", "template", "spec", "containers")
+	args, _, _ := unstructured.NestedStringSlice(container, "args")
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "--session-store-type") || strings.HasPrefix(arg, "--redis-") {
+			t.Errorf("cookie-session deployment has redis arg %q", arg)
+		}
+	}
+
+	// With one, the proxy points at the customer's Redis and the hash rolls
+	// the pod on connection changes.
+	resources = Render(resources, Params{
+		Namespace:          testInfraNamespace,
+		DashboardNamespace: DefaultDashboardNamespace,
+		GatewayName:        testGatewayName,
+		GatewayNamespace:   testGatewayNamespace,
+		OIDCIssuerURL:      testIssuer,
+		OIDCClientID:       "test-client",
+		RedisConnectionURL: "redis://redis.kuadrant-system.svc:6379",
+		RedisHash:          "abc123",
+	})
+	deployment = findResource(t, resources, "Deployment", AuthProxyName)
+	container = firstNestedMap(t, deployment.Object, "spec", "template", "spec", "containers")
+	env, _, _ := unstructured.NestedSlice(container, "env")
+	var storeType, urlRef, passwordRef bool
+	for _, e := range env {
+		m, _ := e.(map[string]any)
+		ref, _, _ := unstructured.NestedMap(m, "valueFrom", "secretKeyRef")
+		if m["name"] == "OAUTH2_PROXY_SESSION_STORE_TYPE" {
+			storeType = m["value"] == "redis"
+		}
+		if m["name"] == "OAUTH2_PROXY_REDIS_CONNECTION_URL" {
+			urlRef = ref["name"] == RedisSecretName && ref["key"] == "connection-url"
+		}
+		if m["name"] == "OAUTH2_PROXY_REDIS_PASSWORD" {
+			passwordRef = ref["name"] == RedisSecretName && ref["key"] == "password" && ref["optional"] == true
+		}
+	}
+	if !storeType || !urlRef || !passwordRef {
+		t.Errorf("redis env config: storeType=%v url=%v password=%v", storeType, urlRef, passwordRef)
+	}
+	// The redis settings must not appear as container arguments: $(VAR)
+	// expansion breaks passwordless Redis and exposes credentials in argv.
+	args, _, _ = unstructured.NestedStringSlice(container, "args")
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "--redis-") || strings.HasPrefix(arg, "--session-store-type") {
+			t.Errorf("redis setting passed as argument: %q", arg)
+		}
+	}
+	hash, _, _ := unstructured.NestedString(deployment.Object,
+		"spec", "template", "metadata", "annotations", RedisHashAnnotation)
+	if hash != "abc123" {
+		t.Errorf("redis hash annotation = %q, want abc123", hash)
+	}
+}
+
+func TestRenderStripsClientIdentityHeaders(t *testing.T) {
+	resources := renderTestResources(t)
+	route := findResource(t, resources, "HTTPRoute", PortalRouteName)
+	rules, _, _ := unstructured.NestedSlice(route.Object, "spec", "rules")
+	if len(rules) < 2 {
+		t.Fatalf("portal route has %d rules, want 2", len(rules))
+	}
+	prefixRule, ok := rules[1].(map[string]any)
+	if !ok {
+		t.Fatalf("portal route rule 1 is %T, want map", rules[1])
+	}
+	filters, found, _ := unstructured.NestedSlice(prefixRule, "filters")
+	if !found {
+		t.Fatal("portal route rule 1 has no filters")
+	}
+	var removed []string
+	var cacheControl string
+	for _, f := range filters {
+		filter, ok := f.(map[string]any)
+		if !ok {
+			continue
+		}
+		if filter["type"] == "RequestHeaderModifier" {
+			removed, _, _ = unstructured.NestedStringSlice(filter, "requestHeaderModifier", "remove")
+		}
+		if filter["type"] == "ResponseHeaderModifier" {
+			sets, _, _ := unstructured.NestedSlice(filter, "responseHeaderModifier", "set")
+			for _, s := range sets {
+				if m, ok := s.(map[string]any); ok && m["name"] == "Cache-Control" {
+					if value, ok := m["value"].(string); ok {
+						cacheControl = value
+					}
+				}
+			}
+		}
+	}
+	// Headers the AuthPolicy does not inject; the four x-maas-* identity
+	// headers and the other policy-injected headers are overwritten by the
+	// AuthPolicy instead (the route filter runs after the auth mutation).
+	want := []string{
+		"x-auth-request-preferred-username", "x-auth-request-groups", "x-auth-request-access-token",
+		"x-forwarded-user", "x-forwarded-email", "x-forwarded-groups", "x-forwarded-preferred-username",
+		"x-maas-keyname", "x-maas-subscription-rate-limit-id",
+	}
+	if len(removed) != len(want) {
+		t.Fatalf("strip list = %v, want %v", removed, want)
+	}
+	for i := range want {
+		if removed[i] != want[i] {
+			t.Errorf("strip list[%d] = %q, want %q", i, removed[i], want[i])
+		}
+	}
+	if cacheControl != "no-store" {
+		t.Errorf("route Cache-Control = %q, want no-store", cacheControl)
+	}
+}
+
 func TestRenderBuildsExtProcBypass(t *testing.T) {
 	resources := renderTestResources(t)
 	filter := findResource(t, resources, "EnvoyFilter", "maas-consumer-portal-extproc-bypass")
@@ -280,9 +397,9 @@ func TestRenderBuildsAuthPolicies(t *testing.T) {
 
 	session := findResource(t, resources, "AuthPolicy", "maas-consumer-portal-session")
 	sessionTarget, _, _ := unstructured.NestedString(session.Object, "spec", "targetRef", "name")
-	rego, _, _ := unstructured.NestedString(session.Object, "spec", "rules", "authorization", "session", "opa", "rego")
+	rego, _, _ := unstructured.NestedString(session.Object, "spec", "rules", "authorization", "session-and-identity", "opa", "rego")
 	requireSessionPattern := firstNestedMap(t, session.Object,
-		"spec", "rules", "authorization", "require-session", "patternMatching", "patterns")
+		"spec", "rules", "authorization", "require-auth", "patternMatching", "patterns")
 	requireSession, _, _ := unstructured.NestedString(requireSessionPattern, "predicate")
 	location, locationFound, locationErr := unstructured.NestedString(session.Object,
 		"spec", "rules", "response", "unauthorized", "headers", "Location", "expression")
@@ -299,7 +416,7 @@ func TestRenderBuildsAuthPolicies(t *testing.T) {
 			strings.Contains(rego, wantProxyURL))
 	}
 	for _, want := range []string{
-		"x-forwarded-access-token",
+		"x-forwarded-id-token",
 		"/oauth2/start?rd=",
 		"allow = true",
 		"login_location := sprintf",
@@ -307,16 +424,38 @@ func TestRenderBuildsAuthPolicies(t *testing.T) {
 		"{200, 202}[response.status_code]",
 		"no-store",
 		"/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt",
+		// RHAI-10610: dual auth, identity building, and the header contract.
+		// The issuer and client-id placeholders are substituted, so assert
+		// their values: the test issuer appears in the JWT rule and the
+		// client-bound azp predicate, and the client id in the latter.
+		"issuerUrl\":\"https://keycloak.apps.example.com/realms/tenant-a",
+		"x-maas-username",
+		"x-maas-group",
+		"x-maas-orgid",
+		"x-maas-roles",
+		"azp == 'test-client",
+		"io.jwt.decode",
+		// RHAI-10610: the flattened MS-0007 contract reads flat scalar
+		// organization claims instead of the orgs array-of-objects.
+		`object.get(organization_claims, "org_id", "")`,
+		`object.get(organization_claims, "roles", [])`,
+		"system:authenticated",
+		"application_cookies",
+		"_maas_consumer_proxy",
+		"Invalid bearer token",
 	} {
 		if !strings.Contains(rego, want) && !strings.Contains(string(raw), want) {
 			t.Errorf("session AuthPolicy missing %q", want)
 		}
 	}
-	if requireSession != "auth.authorization.session.identity.access_token != \"\"" {
+	if requireSession != "auth.authorization['session-and-identity'].identity.authenticated" {
 		t.Errorf("session requirement = %q", requireSession)
 	}
-	if !locationFound || locationErr != nil || location != "auth.authorization.session.login_location" {
-		t.Errorf("session redirect expression = %q found=%t err=%v, policy=%s", location, locationFound, locationErr, raw)
+	if !locationFound || locationErr != nil {
+		t.Errorf("session redirect expression = %q found=%t err=%v", location, locationFound, locationErr)
+	}
+	if !strings.Contains(location, "login_location") || !strings.Contains(location, "/oauth2/start?rd=%2Fmaas-portal%2F") {
+		t.Errorf("session redirect expression = %q, want login_location with fallback", location)
 	}
 }
 

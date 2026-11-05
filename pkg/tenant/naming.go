@@ -58,10 +58,13 @@ func PayloadProcessingServiceAccountName(tenantID string) string {
 	return ResourceName(PayloadProcessingName, tenantID)
 }
 
-// PayloadProcessingPostServiceAccountName is intentionally distinct from
-// MaaS's payload-processing ServiceAccount. MaaS's shared IPP reader binding
-// may grant that account Secret access; the post-auth ExtProc only needs
-// projected volumes and must not inherit the shared MaaS permissions.
+// PayloadProcessingPostServiceAccountName is the gateway-namespace post-auth
+// ExtProc's ServiceAccount. It is intentionally distinct from MaaS's
+// payload-processing ServiceAccount, which the pre-auth ExtProc keeps: MaaS's
+// shared IPP reader binding may grant that account Secret access, while the
+// post-auth ExtProc only needs projected volumes. It holds no binding but the
+// NeMo caller grants, so the token it sends to an authenticated NeMo server
+// carries nothing else.
 func PayloadProcessingPostServiceAccountName(tenantID string) string {
 	return ResourceName(PayloadProcessingName+"-post", tenantID)
 }

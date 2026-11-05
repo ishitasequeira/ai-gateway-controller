@@ -28,6 +28,8 @@ state-based checks:
 - unauthenticated requests are rejected;
 - MaaS API-key creation, use, and revocation;
 - authenticated routing to two credential-enforcing provider fixtures;
+- proportional 80/20 provider weights (`weightedRandom`) with attributed
+  traffic bias (loose band: A preferred over B, not an exact ratio);
 - provider selection changes without restarting post-auth ExtProc;
 - unknown-model handling;
 - semantic configuration no-op behavior;

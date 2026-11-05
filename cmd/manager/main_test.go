@@ -26,7 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 )
 
-const wantFallbackImage = "quay.io/opendatahub/odh-praxis-extproc:odh-stable"
+const wantFallbackImage = "quay.io/opendatahub/odh-praxis-extproc@sha256:a67be44e530961ca7e6dc453220ebe11a6641a2003577f3c4ddb1f426555b874"
 
 func TestResolveExtprocImageUsesEnvVar(t *testing.T) {
 	digest := "quay.io/opendatahub/odh-praxis-extproc@sha256:abc123"

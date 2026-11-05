@@ -59,10 +59,10 @@ _derive_praxis_image_from_controller() {
   fi
 }
 # Prow/Tekton may set PRAXIS_EXTPROC_IMAGE via maas-image-defaults.sh or Konflux snapshot.
-# When unset, fall back to params.env, controller tag alignment, then odh-stable.
+# When unset, fall back to params.env, controller tag alignment, then the pinned release image.
 PRAXIS_EXTPROC_IMAGE="${PRAXIS_EXTPROC_IMAGE:-$(_default_praxis_image)}"
 PRAXIS_EXTPROC_IMAGE="${PRAXIS_EXTPROC_IMAGE:-$(_derive_praxis_image_from_controller)}"
-PRAXIS_EXTPROC_IMAGE="${PRAXIS_EXTPROC_IMAGE:-quay.io/opendatahub/odh-praxis-extproc:odh-stable}"
+PRAXIS_EXTPROC_IMAGE="${PRAXIS_EXTPROC_IMAGE:-quay.io/opendatahub/odh-praxis-extproc@sha256:a67be44e530961ca7e6dc453220ebe11a6641a2003577f3c4ddb1f426555b874}"
 
 if [[ -z "${AI_GATEWAY_CONTROLLER_IMAGE}" ]]; then
   echo "ERROR: AI_GATEWAY_CONTROLLER_IMAGE is required" >&2
@@ -81,14 +81,18 @@ _tenant_config_namespace() {
 }
 
 _apply_ai_gateway_controller() {
-  local work_dir
+  local work_dir params rendered
   work_dir="$(mktemp -d -t aigc-kustomize.XXXXXXXXXX)"
 
   cp -a "${PROJECT_ROOT}/config/self" "${work_dir}/self"
-  sed -i "s|^ai-gateway-controller-image=.*|ai-gateway-controller-image=${AI_GATEWAY_CONTROLLER_IMAGE}|" \
-    "${work_dir}/self/default/params.env"
-  sed -i "s|^praxis-extproc-image=.*|praxis-extproc-image=${PRAXIS_EXTPROC_IMAGE}|" \
-    "${work_dir}/self/default/params.env"
+  # BSD sed (macOS) requires a backup suffix for -i; write a new file instead.
+  params="${work_dir}/self/default/params.env"
+  rendered="$(mktemp)"
+  sed \
+    -e "s|^ai-gateway-controller-image=.*|ai-gateway-controller-image=${AI_GATEWAY_CONTROLLER_IMAGE}|" \
+    -e "s|^praxis-extproc-image=.*|praxis-extproc-image=${PRAXIS_EXTPROC_IMAGE}|" \
+    "${params}" > "${rendered}"
+  mv "${rendered}" "${params}"
 
   if command -v kustomize >/dev/null 2>&1; then
     kustomize build "${work_dir}/self/default"

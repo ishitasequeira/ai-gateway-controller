@@ -39,6 +39,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
+	aigatewayv1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/aigateway/v1alpha1"
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/constants"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/envelope"
@@ -62,10 +63,15 @@ func mtcSchemeForTests() *runtime.Scheme {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
 	_ = v1alpha1.AddToScheme(scheme)
+	_ = aigatewayv1alpha1.AddToScheme(scheme)
 	scheme.AddKnownTypeWithName(MaasTenantConfigGVK, &unstructured.Unstructured{})
 	scheme.AddKnownTypeWithName(MaasTenantConfigGVK.GroupVersion().WithKind("MaasTenantConfigList"), &unstructured.UnstructuredList{})
 	scheme.AddKnownTypeWithName(AITenantGVK, &unstructured.Unstructured{})
 	scheme.AddKnownTypeWithName(AITenantGVK.GroupVersion().WithKind(AITenantGVK.Kind+"List"), &unstructured.UnstructuredList{})
+	scheme.AddKnownTypeWithName(MaaSSubscriptionGVK, &unstructured.Unstructured{})
+	scheme.AddKnownTypeWithName(MaaSSubscriptionGVK.GroupVersion().WithKind(MaaSSubscriptionGVK.Kind+"List"), &unstructured.UnstructuredList{})
+	scheme.AddKnownTypeWithName(MaaSModelRefGVK, &unstructured.Unstructured{})
+	scheme.AddKnownTypeWithName(MaaSModelRefGVK.GroupVersion().WithKind(MaaSModelRefGVK.Kind+"List"), &unstructured.UnstructuredList{})
 	scheme.AddKnownTypeWithName(gvkGateway, &unstructured.Unstructured{})
 	scheme.AddKnownTypeWithName(gvkGateway.GroupVersion().WithKind("GatewayList"), &unstructured.UnstructuredList{})
 	return scheme
@@ -109,7 +115,10 @@ func TestDeletedProviderReferenceDoesNotBlockTenantOverlayReadiness(t *testing.T
 		}
 	}
 	live, later := provider("live"), provider("later")
-	fakeClient := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(model, live).Build()
+	deleting := provider("deleted")
+	deleting.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+	deleting.Finalizers = []string{"test-cleanup"}
+	fakeClient := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(model, live, deleting).Build()
 	r := &Reconciler{Client: fakeClient}
 	writeOverlay := func(providers ...*v1alpha1.ExternalProvider) {
 		t.Helper()
@@ -250,6 +259,40 @@ func TestDisabledAnthropicTranslationDoesNotBlockAttachmentOnlyOverlay(t *testin
 	}
 	if candidates, err := combineRuntimeCandidates(homeCandidates, nil, homeErr, policyExcludedOnly); err != nil || len(candidates) != 0 {
 		t.Fatalf("disabled home binding without an attachment = %#v, error = %v; want empty candidate set for cleanup", candidates, err)
+	}
+}
+
+func TestExternalModelRuntimeExcludesDeletingModels(t *testing.T) {
+	ctx := context.Background()
+	const namespace = "tenant-ns"
+	provider := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: namespace},
+		Spec: v1alpha1.ExternalProviderSpec{Provider: "openai", Endpoint: "provider.example.com",
+			Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "provider-key"}}},
+		Status: v1alpha1.ExternalProviderStatus{Phase: resolver.PhaseReady},
+	}
+	model := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "active", Namespace: namespace},
+		Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
+			Ref: v1alpha1.ExternalProviderReference{Name: provider.Name}, TargetModel: "gpt", APIFormat: "openai-chat", Path: "/v1/chat/completions",
+		}}}}
+	deleting := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "deleting", Namespace: namespace,
+		DeletionTimestamp: &metav1.Time{Time: time.Now()}, Finalizers: []string{"test-cleanup"}},
+		Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
+			Ref: v1alpha1.ExternalProviderReference{Name: provider.Name}, TargetModel: "gpt", APIFormat: "openai-chat", Path: "/v1/chat/completions",
+		}}}}
+	fakeClient := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(model, deleting, provider).Build()
+	r := &Reconciler{Client: fakeClient}
+	owned, err := r.ownExternalModels(ctx, namespace, "gateway", "gateway-system")
+	if err != nil || len(owned) != 2 {
+		t.Fatalf("owned ExternalModels = %d, err=%v; want active and deleting objects for handoff accounting", len(owned), err)
+	}
+	candidates, _, err := r.runtimeCandidates(ctx, namespace, "gateway", "gateway-system", false)
+	if err != nil || len(candidates) != 1 || candidates[0].StableID != "active/provider-provider" {
+		t.Fatalf("runtime candidates = %#v, err=%v; want only active model", candidates, err)
+	}
+	_, required, err := r.providersForTenant(ctx, namespace, "gateway", "gateway-system", false)
+	if err != nil || len(required) != 1 || !required[provider.Name] {
+		t.Fatalf("required providers = %#v, err=%v; deleting model must not add an extra requirement", required, err)
 	}
 }
 
@@ -1465,6 +1508,42 @@ func TestReconcileDeleteForceRemovesFinalizerAfterDeletionTimeout(t *testing.T) 
 	}
 	if mtcPatches != 1 {
 		t.Fatalf("mtcPatches = %d, want 1 (force-removing the cleanup finalizer)", mtcPatches)
+	}
+}
+
+func TestEnqueueMaasTenantConfigForModelRef(t *testing.T) {
+	model := &unstructured.Unstructured{}
+	model.SetGroupVersionKind(MaaSModelRefGVK)
+	model.SetName("granite")
+	model.SetNamespace("models")
+	subscription := subscriptionWithGuardrails("team", nil, []any{
+		map[string]any{"name": "granite", "namespace": "models"},
+	})
+	other := subscriptionWithGuardrails("other", nil, []any{
+		map[string]any{"name": "granite", "namespace": "elsewhere"},
+	})
+	other.SetNamespace("tenant-b")
+	r := &Reconciler{Client: fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(subscription, other).Build()}
+
+	requests := r.enqueueMaasTenantConfigForModelRef(context.Background(), model)
+	if len(requests) != 1 || requests[0].Namespace != "tenant-a" || requests[0].Name != MaasTenantConfigInstanceName {
+		t.Fatalf("model namespace event enqueued %#v, want tenant-a/%s", requests, MaasTenantConfigInstanceName)
+	}
+}
+
+func TestEnqueueModelRefInTenantNamespace(t *testing.T) {
+	model := &unstructured.Unstructured{}
+	model.SetGroupVersionKind(MaaSModelRefGVK)
+	model.SetName("qwen")
+	model.SetNamespace("tenant-a")
+	mtc := NewMaasTenantConfig()
+	mtc.SetName(MaasTenantConfigInstanceName)
+	mtc.SetNamespace("tenant-a")
+	r := &Reconciler{Client: fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(mtc).Build()}
+
+	requests := r.enqueueMaasTenantConfigForModelRef(context.Background(), model)
+	if len(requests) != 1 || requests[0].Namespace != "tenant-a" || requests[0].Name != MaasTenantConfigInstanceName {
+		t.Fatalf("tenant-namespace model ref enqueued %#v, want tenant-a/%s", requests, MaasTenantConfigInstanceName)
 	}
 }
 

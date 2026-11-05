@@ -21,9 +21,15 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/envelope"
+	"github.com/opendatahub-io/ai-gateway-controller/pkg/resolver"
 )
 
 const extprocCredentialDir = "/etc/praxis/credentials" //nolint:gosec // fixed non-secret mount path
+const anthropicTranslationRequestMaxBytes = extprocMaxBodyBytes
+
+// Preserve the existing input allowance while bounding model-rewrite overhead separately.
+const anthropicTranslationAccumulationMaxBytes = extprocMaxBodyBytes + (64 << 10)
+const anthropicTranslationResponseMaxBytes = 1 << 20
 
 type extprocCredential struct {
 	name      string
@@ -155,20 +161,27 @@ func configureSharedExtProcResponseMode(resources []unstructured.Unstructured, t
 	return nil
 }
 
-// sharedExtProcConfig injects stream_options.include_usage into streamed Chat
+// sharedExtProcConfig renders the shared post-auth Praxis configuration.
+// Injects stream_options.include_usage into streamed Chat
 // Completions requests, so the final chunk reports token usage and token rate
-// limits count streams, as IPP did. It then adds the registered
-// Anthropic-client → Chat Completions-backend filters only when the tenant
-// permits translation; the injection runs first and does not touch the
+// limits count streams, as IPP did.
+// It starts the ipp chain with the conditional MaaS header guard, then adds
+// request IDs and, when permitted, the Anthropic-client → Chat Completions
+// filters; the injection runs first and does not touch the
 // Messages requests they translate.
-// The ordered chain validates the Messages envelope, translates buffered JSON,
-// converts SSE responses, strips the client Anthropic key, then rewrites the
-// exact Messages path. The tenant's permission also selects the shared ipp
-// response mode: BUFFERED by default and STREAMED when translation is enabled
-// so the Messages SSE filter can emit progressive events. Retaining the route
-// cache is also scoped to translation-enabled tenants because only that shared
-// path rewrites Messages requests. The separate ipp-pre mode and ExternalModel
-// processor are unchanged.
+// This runtime render owns the effective static chain because it
+// replaces the vendored ConfigMap value during reconciliation. The tenant's
+// permission also selects the shared ipp response mode: BUFFERED by default
+// and STREAMED when translation is enabled so the Messages SSE filter can emit
+// progressive events. Retaining the route cache is also scoped to
+// translation-enabled tenants because only that shared path rewrites Messages
+// requests. The separate ipp-pre mode and ExternalModel processor are
+// unchanged.
+//
+// apiTranslation enables the Anthropic Messages translation filters.
+//
+// Returns the deterministic Praxis YAML configuration for the shared ipp
+// processor.
 func sharedExtProcConfig(apiTranslation bool) string {
 	var b strings.Builder
 	b.WriteString("server:\n")
@@ -180,6 +193,24 @@ func sharedExtProcConfig(apiTranslation bool) string {
 	b.WriteString("filter_chains:\n")
 	b.WriteString("  - name: ipp\n")
 	b.WriteString("    filters:\n")
+	b.WriteString("      - filter: headers\n")
+	b.WriteString("        conditions:\n")
+	b.WriteString("          - unless:\n")
+	b.WriteString("              path_prefix: /maas-api/v1\n")
+	b.WriteString("          - unless:\n")
+	b.WriteString("              path_prefix: /maas-api/health\n")
+	b.WriteString("          - unless:\n")
+	b.WriteString("              path_prefix: /v1/models\n")
+	b.WriteString("          - unless:\n")
+	b.WriteString("              path_prefix: /v1/subscriptions\n")
+	b.WriteString("          - unless:\n")
+	b.WriteString("              path_prefix: /v1/api-keys\n")
+	b.WriteString("          - unless:\n")
+	b.WriteString("              path: /v1/me\n")
+	b.WriteString("        request_remove:\n")
+	for _, header := range guardedRequestHeaders {
+		fmt.Fprintf(&b, "          - %s\n", header)
+	}
 	b.WriteString("      - filter: request_id\n")
 	writeStreamUsageInject(&b)
 	if apiTranslation {
@@ -330,9 +361,65 @@ func configureExternalModelExtProc(resources []unstructured.Unstructured, tenant
 	return nil
 }
 
-// configureExternalModelRequestOrdering removes early body delivery. The routes
-// use BUFFERED request mode, so Envoy supplies a complete body without
-// deferring its header response.
+// ExternalModelRuntimeCandidates converts the resolved home-model routes to
+// the candidate set used by the dedicated ExtProc. API translation metadata
+// is included only when the tenant enabled the corresponding filters, matching
+// the configuration mounted by configureExternalModelExtProc.
+func ExternalModelRuntimeCandidates(routes *resolver.ResolvedRouteSet, apiTranslationEnabled bool) ([]envelope.Candidate, error) {
+	if routes == nil {
+		return nil, errors.New("ExternalModel runtime routes are required")
+	}
+	candidates := make([]envelope.Candidate, 0, len(routes.Routes()))
+	for _, route := range routes.Routes() {
+		strategy, header, err := envelope.StrategyFor(route)
+		if err != nil {
+			return nil, fmt.Errorf("resolve ExtProc runtime credential for model %s provider %s: %w", route.Model, route.Provider, err)
+		}
+		candidate := envelope.Candidate{
+			Cluster: route.Cluster, StableID: envelope.CandidateStableID(route.Model, route.Provider),
+			Kind: "inference_model", Name: route.ClientName, Fresh: true,
+		}
+		if apiTranslationEnabled {
+			candidate.APIFormat = route.APIFormat
+			candidate.Path = route.Path
+			candidate.TargetModel = route.TargetModel
+		}
+		if strategy != "" {
+			candidate.Credential = &envelope.Credential{
+				Strategy: strategy, Header: header,
+				SecretRef: envelope.SecretRef{Name: route.SecretName, Namespace: route.Namespace, Key: route.SecretKey},
+			}
+		}
+		candidates = append(candidates, candidate)
+	}
+	return candidates, nil
+}
+
+// ExternalModelExtProcConfigHash returns the rollout hash for a candidate set
+// using the same translation setting as the rendered ExternalModel config.
+func ExternalModelExtProcConfigHash(namespace string, candidates []envelope.Candidate, apiTranslationEnabled bool) (string, error) {
+	_, configHash, err := ExternalModelExtProcConfig(namespace, candidates, apiTranslationEnabled)
+	if err != nil {
+		return "", err
+	}
+	return configHash, nil
+}
+
+// ExternalModelExtProcConfig returns the exact ExtProc YAML for the supplied
+// candidate set and translation setting.
+func ExternalModelExtProcConfig(namespace string, candidates []envelope.Candidate, apiTranslationEnabled bool) (string, string, error) {
+	credentials, err := extprocCredentials(namespace, candidates)
+	if err != nil {
+		return "", "", err
+	}
+	config := extprocPostAuthConfig(candidates, credentials, apiTranslationEnabled)
+	digest := sha256.Sum256([]byte(config))
+	return config, hex.EncodeToString(digest[:]), nil
+}
+
+// configureExternalModelRequestOrdering removes early body delivery. The route
+// uses BUFFERED mode when translation is enabled, so Envoy supplies a complete
+// body without deferring its header response.
 func configureExternalModelRequestOrdering(resources []unstructured.Unstructured, tenantID string) error {
 	wantFilter := PayloadProcessingExternalModelFilterNameForTenant(tenantID)
 	filterFound := false
@@ -443,10 +530,18 @@ func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extpro
 	// translation disabled, omit the translation and provider-profile filters
 	// and retain main's unbounded-body setting.
 	if apiTranslationEnabled {
-		fmt.Fprintf(&b, "  max_body_bytes: %d\n", extprocMaxBodyBytes)
+		fmt.Fprintf(&b, "  max_body_bytes: %d\n", anthropicTranslationAccumulationMaxBytes)
 	}
 	b.WriteString("  tls:\n    mode: self_signed\n\n")
-	b.WriteString("filter_chains:\n  - name: post-auth\n    filters:\n      - filter: intelligent_route\n")
+	// headers must stay first: it strips caller credentials and internal MaaS
+	// identity headers before intelligent_route / credential_inject run, so
+	// credential_inject's injected provider credential is never clobbered by
+	// the strip and the caller's own credential never reaches the upstream.
+	b.WriteString("filter_chains:\n  - name: post-auth\n    filters:\n      - filter: headers\n        request_remove:\n")
+	for _, header := range guardedRequestHeaders {
+		fmt.Fprintf(&b, "          - %s\n", header)
+	}
+	b.WriteString("      - filter: intelligent_route\n")
 	b.WriteString("        overlay_file: /etc/praxis/routing/routing-overlay.json\n")
 	b.WriteString("        model_header: X-Gateway-Model-Name\n        provider_hop_clusters: [")
 	for i, cluster := range clusters {
@@ -464,7 +559,8 @@ func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extpro
 		b.WriteString("        max_partial_event_bytes: 1048576\n        max_tool_blocks: 256\n")
 		b.WriteString("      - filter: openai_chat_completions_to_anthropic\n")
 		b.WriteString("        api_translation_enabled: true\n")
-		fmt.Fprintf(&b, "        max_body_bytes: %d\n", extprocMaxBodyBytes)
+		fmt.Fprintf(&b, "        max_request_body_bytes: %d\n", anthropicTranslationRequestMaxBytes)
+		fmt.Fprintf(&b, "        max_response_body_bytes: %d\n", anthropicTranslationResponseMaxBytes)
 	}
 	if len(credentials) > 0 {
 		b.WriteString("      - filter: credential_inject\n        credentials:\n")

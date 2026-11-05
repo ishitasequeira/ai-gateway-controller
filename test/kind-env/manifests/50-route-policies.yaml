@@ -1,5 +1,7 @@
-# Purpose: Attaches Kuadrant/Authorino authentication and token-rate-limit
-# policies to tenant A's generated ExternalModel HTTPRoute.
+# Purpose: Attaches tenant A's token-rate-limit policy to its generated
+# ExternalModel HTTPRoute. Authentication is supplied by MaaS's controller-
+# owned Gateway AuthPolicy; this fixture must not install a competing route
+# AuthPolicy.
 #
 # Scope: Kind E2E fixture only. This is not a production deployment manifest.
 #
@@ -7,44 +9,9 @@
 # Authorino/Kuadrant controllers, and the generated external-model-demo-model
 # HTTPRoute from the tenant-A fixtures.
 #
-# Qualification role: Proves bearer API-key authentication, authorization,
-# MaaS API validation, and tenant-A rate-limit policy attachment at the
-# generated HTTPRoute boundary. The API key pattern is test-only; credentials
-# must never be treated as production secrets.
+# Qualification role: Keeps tenant-A rate limiting active while the E2E
+# exercises the controller-owned MaaS authentication policy.
 
-apiVersion: kuadrant.io/v1
-kind: AuthPolicy
-metadata:
-  name: external-model-auth
-  namespace: models-as-a-service
-  labels:
-    app.kubernetes.io/managed-by: local-env
-spec:
-  rules:
-    authentication:
-      api-key:
-        plain:
-          selector: request.headers.authorization
-    metadata:
-      apiKeyValidation:
-        http:
-          method: POST
-          url: https://maas-api.maas-system.svc.cluster.local:8443/internal/v1/api-keys/validate
-          contentType: application/json
-          body:
-            expression: '{"key": request.headers.authorization.replace("Bearer ", "")}'
-    authorization:
-      valid-api-key:
-        patternMatching:
-          patterns:
-            - operator: eq
-              selector: auth.metadata.apiKeyValidation.valid
-              value: "true"
-  targetRef:
-    group: gateway.networking.k8s.io
-    kind: HTTPRoute
-    name: external-model-demo-model
----
 apiVersion: kuadrant.io/v1alpha1
 kind: TokenRateLimitPolicy
 metadata:

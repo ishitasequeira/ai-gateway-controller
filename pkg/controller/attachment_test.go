@@ -1116,6 +1116,20 @@ func TestTooManyProvidersExcludesOnlyThatModel(t *testing.T) {
 	}
 }
 
+func TestInvalidModelNameExcludesOnlyThatAttachment(t *testing.T) {
+	objects := attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")
+	provider, secret := attachmentProvider("team")
+	model := attachmentModel(strings.Repeat("m", 64), "team", "long-model", time.Unix(100, 0), gatewayB)
+	r := attachmentReconciler(t, append(objects, provider, secret, model)...)
+	reconcileModel(t, r, model)
+	if got := getModel(t, r, model); readyReason(got) != reasonInvalidName {
+		t.Fatalf("reason = %q, want %q", readyReason(got), reasonInvalidName)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(model, gatewayB)); !apierrors.IsNotFound(err) {
+		t.Fatalf("long-named model received a route: %v", err)
+	}
+}
+
 func TestSevenMessagesProvidersFitAttachmentRouteLimit(t *testing.T) {
 	objects := attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")
 	model := attachmentModel("wide", "team", "wide-model", time.Unix(100, 0), gatewayB)
@@ -1321,10 +1335,16 @@ func TestRebindingAwayFromOwnTenantRemovesHomeRoute(t *testing.T) {
 	if err := r.Update(context.Background(), got); err != nil {
 		t.Fatal(err)
 	}
-	reconcileModel(t, r, model)
+	result, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RequeueAfter <= 0 {
+		t.Fatalf("home withdrawal requeue = %s, want old route drain", result.RequeueAfter)
+	}
 
-	if _, err := getUnstructured(r, httpRouteGVK, "tenant-a", "external-model-chat"); !apierrors.IsNotFound(err) {
-		t.Fatalf("the old home route survived rebinding to another Gateway: %v", err)
+	if _, err := getUnstructured(r, httpRouteGVK, "tenant-a", "external-model-chat"); err != nil {
+		t.Fatalf("the old home route should remain until its serving ExtProc drains: %v", err)
 	}
 	if _, err := getUnstructured(r, httpRouteGVK, "tenant-a", "external-model-other"); err != nil {
 		t.Fatalf("a sibling's route was removed: %v", err)
@@ -1469,6 +1489,446 @@ func TestAttachmentPreservesTenantOwnOverlayCandidates(t *testing.T) {
 	if again := overlayEnvelope(t, r, "tenant-b").Overlay.Candidates; len(again) != 2 || again[1].StableID != "team/chat/team/openai" {
 		t.Fatalf("own reconcile dropped the attachment: %#v", again)
 	}
+}
+
+func TestAttachedProviderWithdrawalStagesRouteAndFilterUntilDrain(t *testing.T) {
+	for _, mode := range []string{"explicit GatewayRef", "implicit default Gateway"} {
+		t.Run(mode, func(t *testing.T) {
+			providerA, secretA := attachmentProvider("team")
+			providerB := &v1alpha1.ExternalProvider{
+				ObjectMeta: metav1.ObjectMeta{Name: "provider-b", Namespace: "team", UID: "provider-team-b"},
+				Spec: v1alpha1.ExternalProviderSpec{Provider: "anthropic", Endpoint: "api.anthropic.com",
+					Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "anthropic-key"}}},
+			}
+			secretB := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "anthropic-key", Namespace: "team"}, Data: map[string][]byte{"api-key": []byte("fixture-anthropic-key")}}
+			model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0))
+			if mode == "explicit GatewayRef" {
+				model.Spec.GatewayRefs = []v1alpha1.NamespacedObjectReference{gatewayB}
+			}
+			model.Spec.ExternalProviderRefs = []v1alpha1.ExternalProviderRef{
+				{Ref: v1alpha1.ExternalProviderReference{Name: providerA.Name}, TargetModel: "gpt-4o", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
+				{Ref: v1alpha1.ExternalProviderReference{Name: providerB.Name}, TargetModel: "claude-3-5-sonnet", APIFormat: "messages", Path: "/v1/messages"},
+			}
+			gateway, tenantName, tenantID, tenantNamespace := gatewayB, "tenant-b", tenant.ID("tenant-b"), "tenant-b"
+			tenantObjects := attachmentTenantObjects(tenantName, tenantNamespace, gateway, "praxis")
+			if mode == "implicit default Gateway" {
+				gateway = defaultGateway
+				tenantName, tenantID, tenantNamespace = tenant.DefaultAITenantName, tenant.ID(tenant.DefaultAITenantName), "models-as-a-service"
+				tenantObjects = attachmentTenantObjects(tenantName, tenantNamespace, gateway, "praxis")
+			}
+			r := attachmentReconciler(t, append([]client.Object{providerA, secretA, providerB, secretB, model}, tenantObjects...)...)
+			setControllerTranslationEnabled(t, r, tenantNamespace, true)
+			reconcileModel(t, r, model)
+			setRouteParentStatus(t, r, model, gateway, metav1.ConditionTrue, "Accepted")
+			reconcileModel(t, r, model)
+			seedSafeExternalModelRuntime(t, r, tenantID, tenantNamespace, nil, true)
+
+			initial := getModel(t, r, model)
+			initial.Spec.ExternalProviderRefs = initial.Spec.ExternalProviderRefs[:1]
+			if err := r.Update(context.Background(), initial); err != nil {
+				t.Fatal(err)
+			}
+			request := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}
+			result, err := r.Reconcile(context.Background(), request)
+			if err != nil || result.RequeueAfter != withdrawalRequeueInterval {
+				t.Fatalf("stage attached provider withdrawal: result=%#v err=%v", result, err)
+			}
+
+			routeName := attachmentRouteName(model, gateway)
+			route, err := getUnstructured(r, httpRouteGVK, model.Namespace, routeName)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertAttachmentRouteProviders(t, route, "openai", "provider-b")
+			env := overlayEnvelope(t, r, tenantNamespace)
+			if len(env.Overlay.Candidates) != 1 || env.Overlay.Candidates[0].Cluster != "provider-openai" {
+				t.Fatalf("reduced tenant overlay = %#v, want active Provider A only", env.Overlay.Candidates)
+			}
+			var withdrawn envelope.Candidate
+			for _, candidate := range envCandidateWithdrawalAnnotation(t, r, model.Namespace, routeName) {
+				if candidate.Cluster == "provider-provider-b" {
+					withdrawn = candidate
+				}
+			}
+			if withdrawn.StableID == "" || withdrawn.APIFormat != "messages" || withdrawn.Path != "/v1/messages" || withdrawn.TargetModel != "claude-3-5-sonnet" {
+				t.Fatalf("retained Anthropic candidate lost its serving contract: %#v", withdrawn)
+			}
+			assertExactSelectedPathRule(t, route, "/v1/messages", withdrawn.StableID)
+			if names := routeFilterNames(t, r, tenantID, gateway.Namespace); len(names) != 6 {
+				t.Fatalf("staged route filter patches = %d, want A and retained B rules (6): %v", len(names), names)
+			}
+			filter, err := getUnstructured(r, schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1alpha3", Kind: "EnvoyFilter"},
+				gateway.Namespace, tenant.PayloadProcessingExternalModelEnvoyFilterName(tenantID))
+			if err != nil {
+				t.Fatal(err)
+			}
+			expectedRoutePatches, responseModes := map[string]bool{}, map[string]string{}
+			for i := 0; i < 6; i++ {
+				name := fmt.Sprintf("team.%s.%d", routeName, i)
+				expectedRoutePatches[name], responseModes[name] = false, "STREAMED"
+			}
+			assertExternalModelRoutePatches(t, nestedSlice(t, filter.Object, "spec", "configPatches"), expectedRoutePatches, responseModes, 6)
+			var copied corev1.Secret
+			copyName := credentialCopyName(tenantNamespace, "team", "anthropic-key", "api-key", "x-api-key")
+			if err := r.Get(context.Background(), client.ObjectKey{Namespace: tenantNamespace, Name: copyName}, &copied); err != nil {
+				t.Fatalf("Anthropic credential copy removed before drain: %v", err)
+			}
+			drName := attachmentDestinationRuleName(gateway, "team", "provider-b")
+			if _, err := getUnstructured(r, destinationRuleGVK, gateway.Namespace, drName); err != nil {
+				t.Fatalf("Anthropic transport policy removed before drain: %v", err)
+			}
+			var stagedOverlay corev1.ConfigMap
+			if err := r.Get(context.Background(), client.ObjectKey{Namespace: tenantNamespace, Name: r.configMapName()}, &stagedOverlay); err != nil {
+				t.Fatal(err)
+			}
+			if stagedOverlay.Annotations[withdrawalDrainAnnotation] != "" {
+				t.Fatalf("stale A+B ExtProc revision started the drain timer: %q", stagedOverlay.Annotations[withdrawalDrainAnnotation])
+			}
+
+			markSafeExternalModelRuntimeCurrent(t, r, tenantID, tenantNamespace, true)
+			result, err = r.Reconcile(context.Background(), request)
+			if err != nil || result.RequeueAfter != withdrawalDrainDuration {
+				t.Fatalf("start attached route drain: result=%#v err=%v", result, err)
+			}
+			route, err = getUnstructured(r, httpRouteGVK, model.Namespace, routeName)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertAttachmentRouteProviders(t, route, "openai", "provider-b")
+			markWithdrawalDrainElapsed(t, r, tenantNamespace)
+			result, err = r.Reconcile(context.Background(), request)
+			if err != nil || result.RequeueAfter != 0 {
+				t.Fatalf("finish attached route drain: result=%#v err=%v", result, err)
+			}
+			route, err = getUnstructured(r, httpRouteGVK, model.Namespace, routeName)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertAttachmentRouteProviders(t, route, "openai")
+			if names := routeFilterNames(t, r, tenantID, gateway.Namespace); len(names) != 4 {
+				t.Fatalf("post-drain route filter patches = %d, want Provider A only (4): %v", len(names), names)
+			}
+			filter, err = getUnstructured(r, schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1alpha3", Kind: "EnvoyFilter"},
+				gateway.Namespace, tenant.PayloadProcessingExternalModelEnvoyFilterName(tenantID))
+			if err != nil {
+				t.Fatal(err)
+			}
+			expectedRoutePatches, responseModes = map[string]bool{}, map[string]string{}
+			for i := 0; i < 4; i++ {
+				name := fmt.Sprintf("team.%s.%d", routeName, i)
+				expectedRoutePatches[name], responseModes[name] = false, "NONE"
+			}
+			assertExternalModelRoutePatches(t, nestedSlice(t, filter.Object, "spec", "configPatches"), expectedRoutePatches, responseModes, 4)
+			if _, err := getUnstructured(r, destinationRuleGVK, gateway.Namespace, drName); !apierrors.IsNotFound(err) {
+				t.Fatalf("withdrawn Anthropic DestinationRule remains after drain: %v", err)
+			}
+			if err := r.Get(context.Background(), client.ObjectKey{Namespace: tenantNamespace, Name: copyName}, &copied); !apierrors.IsNotFound(err) {
+				t.Fatalf("withdrawn Anthropic credential copy remains after drain: %v", err)
+			}
+		})
+	}
+}
+
+func TestSiblingAttachmentReconcilePreservesOtherWithdrawalDrain(t *testing.T) {
+	ctx := context.Background()
+	homeProvider, homeSecret := attachmentProvider("tenant-b")
+	home := attachmentModel("home", "tenant-b", "home-model", time.Unix(50, 0))
+	providerA, secretA := attachmentProvider("team")
+	providerB := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "provider-b", Namespace: "team", UID: "provider-team-b"},
+		Spec: v1alpha1.ExternalProviderSpec{Provider: "anthropic", Endpoint: "api.anthropic.com",
+			Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "anthropic-key"}}},
+	}
+	secretB := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "anthropic-key", Namespace: "team"}, Data: map[string][]byte{"api-key": []byte("fixture-anthropic-key")}}
+	withdrawing := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), gatewayB)
+	withdrawing.Spec.ExternalProviderRefs = []v1alpha1.ExternalProviderRef{
+		{Ref: v1alpha1.ExternalProviderReference{Name: providerA.Name}, TargetModel: "gpt-4o", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
+		{Ref: v1alpha1.ExternalProviderReference{Name: providerB.Name}, TargetModel: "claude-3-5-sonnet", APIFormat: "messages", Path: "/v1/messages"},
+	}
+	sibling := attachmentModel("completion", "team", "completion-model", time.Unix(200, 0), gatewayB)
+	objects := append([]client.Object{homeProvider, homeSecret, home, providerA, secretA, providerB, secretB, withdrawing, sibling}, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	setControllerTranslationEnabled(t, r, "tenant-b", true)
+	reconcileModel(t, r, home)
+	for _, model := range []*v1alpha1.ExternalModel{withdrawing, sibling} {
+		reconcileModel(t, r, model)
+	}
+	for _, model := range []*v1alpha1.ExternalModel{withdrawing, sibling} {
+		setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
+	}
+	for _, model := range []*v1alpha1.ExternalModel{withdrawing, sibling} {
+		reconcileModel(t, r, model)
+	}
+	seedSafeExternalModelRuntime(t, r, "tenant-b", "tenant-b", []*v1alpha1.ExternalModel{home}, true)
+
+	updated := getModel(t, r, withdrawing)
+	updated.Spec.ExternalProviderRefs = updated.Spec.ExternalProviderRefs[:1]
+	if err := r.Update(ctx, updated); err != nil {
+		t.Fatal(err)
+	}
+	before := overlayEnvelope(t, r, "tenant-b").Revision.Value
+	originalClient := r.Client
+	r.Client = withdrawalAnnotationFailureClient{Client: originalClient}
+	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(home)}); err == nil {
+		t.Fatal("home writer published despite failed withdrawal persistence")
+	}
+	if revision := overlayEnvelope(t, r, "tenant-b").Revision.Value; revision != before {
+		t.Fatal("failed persistence replaced the prior overlay")
+	}
+	r.Client = originalClient
+	reconcileModel(t, r, home)
+	if retained := envCandidateWithdrawalAnnotation(t, r, withdrawing.Namespace, attachmentRouteName(withdrawing, gatewayB)); len(retained) != 1 {
+		t.Fatalf("home-first writer did not persist withdrawn B: %#v", retained)
+	}
+	reconcileModel(t, r, home)
+	reconcileModel(t, r, sibling)
+	withdrawRequest := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(withdrawing)}
+	result, err := r.Reconcile(ctx, withdrawRequest)
+	if err != nil || result.RequeueAfter != withdrawalRequeueInterval {
+		t.Fatalf("stage Provider B withdrawal: result=%#v err=%v", result, err)
+	}
+	markSafeExternalModelRuntimeCurrent(t, r, "tenant-b", "tenant-b", true, home)
+	result, err = r.Reconcile(ctx, withdrawRequest)
+	if err != nil || result.RequeueAfter != withdrawalDrainDuration {
+		t.Fatalf("start Provider B drain: result=%#v err=%v", result, err)
+	}
+
+	var overlay corev1.ConfigMap
+	if err := r.Get(ctx, client.ObjectKey{Namespace: "tenant-b", Name: r.configMapName()}, &overlay); err != nil {
+		t.Fatal(err)
+	}
+	drainState := overlay.Annotations[withdrawalDrainAnnotation]
+	if drainState == "" {
+		t.Fatal("Provider B withdrawal did not persist drain state")
+	}
+
+	// A sibling reconcile rebuilds the tenant-wide EnvoyFilter while the old
+	// ExtProc revision may still select Provider B. It must retain X's persisted
+	// withdrawal rules and response translation until X's drain completes.
+	reconcileModel(t, r, sibling)
+	assertAttachmentWithdrawalProtection(t, r, withdrawing, gatewayB, drainState, 14, "sibling")
+
+	// The tenant-local home-model path is another writer of the same shared
+	// EnvoyFilter. It must retain X's drain patches without publishing B again.
+	reconcileModel(t, r, home)
+	assertAttachmentWithdrawalProtection(t, r, withdrawing, gatewayB, drainState, 14, "home-model")
+
+	markWithdrawalDrainElapsed(t, r, "tenant-b")
+	result, err = r.Reconcile(ctx, withdrawRequest)
+	if err != nil || result.RequeueAfter != 0 {
+		t.Fatalf("finish Provider B drain: result=%#v err=%v", result, err)
+	}
+	xRouteName := attachmentRouteName(withdrawing, gatewayB)
+	xRoute, err := getUnstructured(r, httpRouteGVK, withdrawing.Namespace, xRouteName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertAttachmentRouteProviders(t, xRoute, "openai")
+	if names := routeFilterNames(t, r, "tenant-b", gatewayB.Namespace); len(names) != 12 {
+		t.Fatalf("post-drain route patches = %d, want home, X and Y's four active rules each: %v", len(names), names)
+	}
+	drName := attachmentDestinationRuleName(gatewayB, "team", "provider-b")
+	if _, err := getUnstructured(r, destinationRuleGVK, gatewayB.Namespace, drName); !apierrors.IsNotFound(err) {
+		t.Fatalf("Provider B transport remains after X's drain: %v", err)
+	}
+}
+
+func assertAttachmentWithdrawalProtection(t *testing.T, r *Reconciler, model *v1alpha1.ExternalModel,
+	gateway v1alpha1.NamespacedObjectReference, drainState string, wantPatchCount int, writer string) {
+	t.Helper()
+	if names := routeFilterNames(t, r, "tenant-b", gateway.Namespace); len(names) != wantPatchCount {
+		t.Fatalf("%s reconcile route patches = %d, want %d: %v", writer, len(names), wantPatchCount, names)
+	}
+	routeName := attachmentRouteName(model, gateway)
+	prefix := "team." + routeName + "."
+	filter, err := getUnstructured(r, schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1alpha3", Kind: "EnvoyFilter"},
+		gateway.Namespace, tenant.PayloadProcessingExternalModelEnvoyFilterName(tenant.ID("tenant-b")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	patchCount := 0
+	for _, raw := range nestedSlice(t, filter.Object, "spec", "configPatches") {
+		patch, ok := raw.(map[string]any)
+		if !ok || patch["applyTo"] != "HTTP_ROUTE" {
+			continue
+		}
+		name, _, _ := unstructured.NestedString(patch, "match", "routeConfiguration", "vhost", "route", "name")
+		if strings.HasPrefix(name, prefix) {
+			patchCount++
+			assertExternalModelRouteExtProcPatch(t, patch, name, "BUFFERED", "STREAMED")
+		}
+	}
+	if patchCount != 6 {
+		t.Fatalf("%s reconcile retained X route patches = %d, want six including Provider B translation", writer, patchCount)
+	}
+	route, err := getUnstructured(r, httpRouteGVK, model.Namespace, routeName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertAttachmentRouteProviders(t, route, "openai", "provider-b")
+	var withdrawnB envelope.Candidate
+	for _, candidate := range envCandidateWithdrawalAnnotation(t, r, model.Namespace, routeName) {
+		if candidate.Cluster == "provider-provider-b" {
+			withdrawnB = candidate
+		}
+	}
+	if withdrawnB.StableID == "" {
+		t.Fatalf("%s reconcile lost Provider B withdrawal identity", writer)
+	}
+	assertExactSelectedPathRule(t, route, "/v1/messages", withdrawnB.StableID)
+	env := overlayEnvelope(t, r, "tenant-b")
+	for _, candidate := range env.Overlay.Candidates {
+		if candidate.Cluster == "provider-provider-b" {
+			t.Fatalf("%s reconcile re-published withdrawn Provider B: %#v", writer, candidate)
+		}
+	}
+	var expectedDrain withdrawalDrainState
+	if err := json.Unmarshal([]byte(drainState), &expectedDrain); err != nil {
+		t.Fatalf("decode active withdrawal drain: %v", err)
+	}
+	if expectedDrain.Revision != env.Revision.Value {
+		t.Fatalf("%s reconcile changed overlay revision during X's drain: drain=%q overlay=%q", writer, expectedDrain.Revision, env.Revision.Value)
+	}
+	var overlay corev1.ConfigMap
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: r.configMapName()}, &overlay); err != nil {
+		t.Fatal(err)
+	}
+	if got := overlay.Annotations[withdrawalDrainAnnotation]; got != drainState {
+		t.Fatalf("%s reconcile changed the active drain state: before %q after %q", writer, drainState, got)
+	}
+	copyName := credentialCopyName("tenant-b", "team", "anthropic-key", "api-key", "x-api-key")
+	var copied corev1.Secret
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: copyName}, &copied); err != nil {
+		t.Fatalf("%s reconcile removed Provider B credential copy: %v", writer, err)
+	}
+	drName := attachmentDestinationRuleName(gateway, "team", "provider-b")
+	if _, err := getUnstructured(r, destinationRuleGVK, gateway.Namespace, drName); err != nil {
+		t.Fatalf("%s reconcile removed Provider B transport: %v", writer, err)
+	}
+}
+
+func TestFinalAttachedProviderDeletionWaitsForTenantRevisionAndDrain(t *testing.T) {
+	ctx := context.Background()
+	providerA, secretA := attachmentProvider("tenant-b")
+	home := attachmentModel("home", "tenant-b", "home-model", time.Unix(50, 0))
+	providerB := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "anthropic", Namespace: "team", UID: "anthropic-provider-team"},
+		Spec: v1alpha1.ExternalProviderSpec{Provider: "anthropic", Endpoint: "api.anthropic.com",
+			Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "anthropic-key"}}},
+	}
+	secretB := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "anthropic-key", Namespace: "team"}, Data: map[string][]byte{"api-key": []byte("fixture-anthropic-key")}}
+	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), gatewayB)
+	model.Spec.ExternalProviderRefs = []v1alpha1.ExternalProviderRef{{
+		Ref: v1alpha1.ExternalProviderReference{Name: providerB.Name}, TargetModel: "claude-3-5-sonnet", APIFormat: "messages", Path: "/v1/messages",
+	}}
+	objects := append([]client.Object{providerA, secretA, home, providerB, secretB, model}, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	setControllerTranslationEnabled(t, r, "tenant-b", true)
+	reconcileModel(t, r, home)
+	reconcileModel(t, r, model)
+	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, model)
+	seedSafeExternalModelRuntime(t, r, "tenant-b", "tenant-b", []*v1alpha1.ExternalModel{home}, true)
+
+	var storedProvider v1alpha1.ExternalProvider
+	if err := r.Get(ctx, client.ObjectKeyFromObject(providerB), &storedProvider); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delete(ctx, &storedProvider); err != nil {
+		t.Fatal(err)
+	}
+	providerReq := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(providerB)}
+	if result, err := r.ReconcileProvider(ctx, providerReq); err != nil || result.RequeueAfter != withdrawalRequeueInterval {
+		t.Fatalf("deleting attached provider status: result=%#v err=%v", result, err)
+	}
+	modelReq := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}
+	result, err := r.Reconcile(ctx, modelReq)
+	if err != nil || result.RequeueAfter != withdrawalRequeueInterval {
+		t.Fatalf("stage final attached provider withdrawal: result=%#v err=%v", result, err)
+	}
+	routeName := attachmentRouteName(model, gatewayB)
+	route, err := getUnstructured(r, httpRouteGVK, model.Namespace, routeName)
+	if err != nil {
+		t.Fatalf("accepted Anthropic route removed before runtime convergence: %v", err)
+	}
+	assertAttachmentRouteProviders(t, route, "anthropic")
+	assertExactSelectedPathRule(t, route, "/v1/messages", envelope.ScopedStableID("team", "chat", "team", "anthropic"))
+	if candidates := overlayEnvelope(t, r, "tenant-b").Overlay.Candidates; len(candidates) != 1 || candidates[0].Cluster != "provider-openai" {
+		t.Fatalf("reduced tenant overlay = %#v, want home Provider A only", candidates)
+	}
+	if names := routeFilterNames(t, r, "tenant-b", gatewayB.Namespace); len(names) != 8 {
+		t.Fatalf("staged route filter patches = %v, want home route and retained Anthropic route", names)
+	}
+
+	markSafeExternalModelRuntimeCurrent(t, r, "tenant-b", "tenant-b", true, home)
+	result, err = r.Reconcile(ctx, modelReq)
+	if err != nil || result.RequeueAfter != withdrawalDrainDuration {
+		t.Fatalf("start final attached-provider drain: result=%#v err=%v", result, err)
+	}
+	markWithdrawalDrainElapsed(t, r, "tenant-b")
+	result, err = r.Reconcile(ctx, modelReq)
+	if err != nil || result.RequeueAfter != 0 {
+		t.Fatalf("finish final attached-provider drain: result=%#v err=%v", result, err)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, model.Namespace, routeName); !apierrors.IsNotFound(err) {
+		t.Fatalf("withdrawn final attachment route remains: %v", err)
+	}
+	if candidates := overlayEnvelope(t, r, "tenant-b").Overlay.Candidates; len(candidates) != 1 || candidates[0].Cluster != "provider-openai" {
+		t.Fatalf("home route was changed while removing attachment: %#v", candidates)
+	}
+	if result, err := r.ReconcileProvider(ctx, providerReq); err != nil || result.RequeueAfter != 0 {
+		t.Fatalf("complete provider cleanup after attachment drain: result=%#v err=%v", result, err)
+	}
+	if _, err := getUnstructured(r, schema.GroupVersionKind{Version: "v1", Kind: "Service"}, "team", "provider-anthropic"); !apierrors.IsNotFound(err) {
+		t.Fatalf("Anthropic source transport remains after finalizer cleanup: %v", err)
+	}
+}
+
+func assertAttachmentRouteProviders(t *testing.T, route *unstructured.Unstructured, want ...string) {
+	t.Helper()
+	rules := nestedSlice(t, route.Object, "spec", "rules")
+	got := map[string]int{}
+	for _, raw := range rules {
+		rule, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		refs, _, _ := unstructured.NestedSlice(rule, "backendRefs")
+		if len(refs) == 0 {
+			continue
+		}
+		backend, ok := refs[0].(map[string]any)
+		if !ok {
+			continue
+		}
+		name, _ := backend["name"].(string)
+		if strings.HasPrefix(name, providerServicePrefix) && !strings.HasPrefix(name, providerSelectionSinkPrefix) {
+			got[name]++
+		}
+	}
+	for _, provider := range want {
+		name := providerServicePrefix + provider
+		if got[name] == 0 {
+			t.Fatalf("attachment HTTPRoute has no rule for %s: %#v", name, got)
+		}
+		delete(got, name)
+	}
+	if len(got) > 0 {
+		t.Fatalf("attachment HTTPRoute has unexpected provider rules: %#v", got)
+	}
+}
+
+func envCandidateWithdrawalAnnotation(t *testing.T, r *Reconciler, namespace, name string) []envelope.Candidate {
+	t.Helper()
+	route, err := getUnstructured(r, httpRouteGVK, namespace, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var candidates []envelope.Candidate
+	if err := json.Unmarshal([]byte(route.GetAnnotations()[annotationWithdrawalCandidates]), &candidates); err != nil {
+		t.Fatalf("decode retained candidates: %v", err)
+	}
+	return candidates
 }
 
 func TestSameNamedProvidersFromNamespacesStayDistinct(t *testing.T) {
@@ -1652,11 +2112,38 @@ func TestModelDeletedWithoutAttachmentFinalizerCollectsItsState(t *testing.T) {
 
 func TestDeletedCredentialSourceWithdrawsAttachment(t *testing.T) {
 	r, model := servedAttachmentFixture(t)
+	seedSafeExternalModelRuntime(t, r, "tenant-b", "tenant-b", nil)
 	_, secret := attachmentProvider("team")
 	if err := r.Delete(context.Background(), secret); err != nil {
 		t.Fatal(err)
 	}
-	reconcileModel(t, r, model)
+	request := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}
+	result, err := r.Reconcile(context.Background(), request)
+	if err != nil || result.RequeueAfter != withdrawalRequeueInterval {
+		t.Fatalf("stage attachment withdrawal after credential loss: result=%#v err=%v", result, err)
+	}
+	if got := getModel(t, r, model); readyReason(got) != reasonAttachmentPending {
+		t.Fatalf("reason = %q, want staged withdrawal reason %q", readyReason(got), reasonAttachmentPending)
+	}
+	if !attachmentRouteExists(t, r, model) {
+		t.Fatal("accepted route was removed before the reduced ExtProc revision served")
+	}
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: credentialCopyName("tenant-b", "team", "openai-key", "api-key", "")}, &corev1.Secret{}); err != nil {
+		t.Fatalf("projected credential was removed before the drain: %v", err)
+	}
+	if candidates := overlayEnvelope(t, r, "tenant-b").Overlay.Candidates; len(candidates) != 0 {
+		t.Fatalf("reduced overlay = %#v, want no candidates", candidates)
+	}
+	markSafeExternalModelRuntimeCurrent(t, r, tenant.ID("tenant-b"), "tenant-b", false)
+	result, err = r.Reconcile(context.Background(), request)
+	if err != nil || result.RequeueAfter != withdrawalDrainDuration {
+		t.Fatalf("begin attachment drain after rollout: result=%#v err=%v", result, err)
+	}
+	markWithdrawalDrainElapsed(t, r, "tenant-b")
+	result, err = r.Reconcile(context.Background(), request)
+	if err != nil || result.RequeueAfter != 0 {
+		t.Fatalf("finish attachment drain after credential loss: result=%#v err=%v", result, err)
+	}
 	if got := getModel(t, r, model); readyReason(got) != reasonProviderNotReady {
 		t.Fatalf("reason = %q, want %q", readyReason(got), reasonProviderNotReady)
 	}
@@ -1671,7 +2158,10 @@ func TestDeletedCredentialSourceWithdrawsAttachment(t *testing.T) {
 	if err := r.Create(context.Background(), secret); err != nil {
 		t.Fatal(err)
 	}
-	reconcileModel(t, r, model)
+	_, err = r.Reconcile(context.Background(), request)
+	if err != nil {
+		t.Fatalf("restore attachment after credential recreation: %v", err)
+	}
 	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
 	reconcileModel(t, r, model)
 	if len(overlayEnvelope(t, r, "tenant-b").Overlay.Candidates) != 1 {
@@ -1704,6 +2194,83 @@ func TestTransientCredentialReadKeepsServedAttachment(t *testing.T) {
 	}
 	if got := getModel(t, r, model); readyReason(got) != reasonReconcileFailed {
 		t.Fatalf("reason = %q, want %q", readyReason(got), reasonReconcileFailed)
+	}
+}
+
+func TestAttachmentChecksProviderCAInItsGatewayNamespace(t *testing.T) {
+	provider, secret := attachmentProvider("team")
+	provider.Spec.Config = map[string]string{"tls.credentialName": "provider-ca"}
+	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), gatewayB)
+	// The provider's own check passes in the configured Gateway namespace, but
+	// gateway-b, whose DestinationRule names the Secret, has no CA.
+	objects := append([]client.Object{provider, secret, model, providerCASecret(t, "openshift-ingress")},
+		attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := controllerTestClient(t, objects...)
+	r.Network, r.GatewayNamespace = "external-model", "openshift-ingress"
+	ctx := context.Background()
+	if _, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(provider)}); err != nil {
+		t.Fatal(err)
+	}
+	var got v1alpha1.ExternalProvider
+	if err := r.Get(ctx, client.ObjectKeyFromObject(provider), &got); err != nil || got.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("provider phase = %q, %v; want Ready", got.Status.Phase, err)
+	}
+	ruleName := attachmentDestinationRuleName(gatewayB, "team", "openai")
+
+	reconcileModel(t, r, model)
+	result := apiMeta.FindStatusCondition(gatewayResult(t, getModel(t, r, model), gatewayB).Conditions, conditionReady)
+	if result == nil || result.Reason != reasonProviderNotReady || !strings.Contains(result.Message, errProviderCANotReady.Error()) {
+		t.Fatalf("attachment without a CA in its Gateway namespace = %#v, want %s", result, reasonProviderNotReady)
+	}
+	if attachmentRouteExists(t, r, model) {
+		t.Fatal("attachment without a CA in its Gateway namespace has a route")
+	}
+	if _, err := getUnstructured(r, destinationRuleGVK, gatewayB.Namespace, ruleName); !apierrors.IsNotFound(err) {
+		t.Fatalf("attachment DestinationRule without its CA: %v", err)
+	}
+
+	caSecret := providerCASecret(t, gatewayB.Namespace)
+	if err := r.Create(ctx, caSecret); err != nil {
+		t.Fatal(err)
+	}
+	reconcileModel(t, r, model)
+	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, model)
+	if len(overlayEnvelope(t, r, "tenant-b").Overlay.Candidates) != 1 {
+		t.Fatal("the attachment is not served once its Gateway namespace has the CA")
+	}
+	rule, err := getUnstructured(r, destinationRuleGVK, gatewayB.Namespace, ruleName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name := nestedString(t, rule.Object, "spec", "trafficPolicy", "tls", "credentialName"); name != "provider-ca" {
+		t.Fatalf("attachment DestinationRule credentialName = %q, want provider-ca", name)
+	}
+
+	// A failed read is retried and keeps the served attachment.
+	reader := r.APIReader
+	r.APIReader = failingCASecretReader{Reader: reader, namespace: gatewayB.Namespace}
+	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); !apierrors.IsServiceUnavailable(err) {
+		t.Fatalf("reconcile on a failed CA Secret read = %v, want ServiceUnavailable to retry", err)
+	}
+	if len(overlayEnvelope(t, r, "tenant-b").Overlay.Candidates) != 1 {
+		t.Fatal("a failed CA Secret read withdrew the served attachment")
+	}
+
+	// Without its CA the provider leaves the overlay at once, so no new request
+	// selects it; its route and transport stay until in-flight requests drain.
+	r.APIReader = reader
+	if err := r.Delete(ctx, caSecret); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil || res.RequeueAfter != withdrawalRequeueInterval {
+		t.Fatalf("stage the withdrawal of a provider without its CA: result=%#v err=%v", res, err)
+	}
+	if candidates := overlayEnvelope(t, r, "tenant-b").Overlay.Candidates; len(candidates) != 0 {
+		t.Fatalf("overlay without the CA = %#v, want no candidates", candidates)
+	}
+	if ready := apiMeta.FindStatusCondition(gatewayResult(t, getModel(t, r, model), gatewayB).Conditions, conditionReady); ready == nil || ready.Status == metav1.ConditionTrue {
+		t.Fatalf("attachment without its CA = %#v, want not Ready", ready)
 	}
 }
 
@@ -2294,6 +2861,15 @@ func TestAttachedModelReportsWhyNoProviderResolved(t *testing.T) {
 		t.Fatal(err)
 	}
 	reconcileModel(t, r, model)
+	pending := getModel(t, r, model)
+	if condition := apiMeta.FindStatusCondition(gatewayResult(t, pending, defaultGateway).Conditions, conditionReady); condition == nil || condition.Reason != reasonAttachmentPending {
+		t.Fatalf("served attachment must drain before reporting final exclusion: %#v", condition)
+	}
+	seedSafeExternalModelRuntime(t, r, tenant.ID(tenant.DefaultAITenantName), "models-as-a-service", nil, false)
+	markSafeExternalModelRuntimeCurrent(t, r, tenant.ID(tenant.DefaultAITenantName), "models-as-a-service", false)
+	reconcileModel(t, r, model)
+	markWithdrawalDrainElapsed(t, r, "models-as-a-service")
+	reconcileModel(t, r, model)
 	got = getModel(t, r, model)
 	result := apiMeta.FindStatusCondition(gatewayResult(t, got, defaultGateway).Conditions, conditionReady)
 	if got.Status.Phase != modelPhaseFailed || result == nil || result.Reason != reasonProviderNotReady ||
@@ -2303,5 +2879,618 @@ func TestAttachedModelReportsWhyNoProviderResolved(t *testing.T) {
 	}
 	if got.Status.HTTPRouteName != "" {
 		t.Fatalf("failed model keeps httpRouteName %q", got.Status.HTTPRouteName)
+	}
+}
+
+// ippRoute returns the HTTPRoute a 3.5 IPP creates for model: named after it,
+// owned by it and attached to gateway.
+func ippRoute(model *v1alpha1.ExternalModel, gateway v1alpha1.NamespacedObjectReference) *unstructured.Unstructured {
+	route := newHTTPRoute()
+	route.SetNamespace(model.Namespace)
+	route.SetName(model.Name)
+	route.SetLabels(map[string]string{tenant.LabelManagedBy: ippRouteManager})
+	route.SetOwnerReferences([]metav1.OwnerReference{{APIVersion: v1alpha1.GroupVersion.String(), Kind: "ExternalModel", Name: model.Name, UID: model.UID}})
+	route.Object["spec"] = map[string]any{"parentRefs": []any{map[string]any{"name": gateway.Name, "namespace": gateway.Namespace}}}
+	return route
+}
+
+// setIPPStatus writes the status IPP reports for a model it serves.
+func setIPPStatus(t *testing.T, r *Reconciler, model *v1alpha1.ExternalModel) {
+	t.Helper()
+	got := getModel(t, r, model)
+	got.Status.Phase, got.Status.HTTPRouteName = resolver.PhaseReady, model.Name
+	got.Status.Conditions = []metav1.Condition{{Type: conditionReady, Status: metav1.ConditionTrue, Reason: "Reconciled", Message: "HTTPRoute created successfully", LastTransitionTime: metav1.Now()}}
+	if err := r.Status().Update(context.Background(), got); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A model naming the Gateway of a tenant whose migration is blocked is still
+// served by that tenant's 3.5 IPP, which ignores gatewayRefs and writes the
+// model's status. Our result would flip it against IPP's Ready.
+func TestGatewayRefsModelOfIPPServedTenantKeepsIPPStatus(t *testing.T) {
+	ait, mtc := blockedDefaultTenantObjects()
+	provider, secret := attachmentProvider("team")
+	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), defaultGateway)
+	r := attachmentReconciler(t, provider, secret, model, ait, mtc, ippRoute(model, defaultGateway))
+	setIPPStatus(t, r, model)
+	// A result written before IPP's route was recognised.
+	written := getModel(t, r, model)
+	written.Status.Gateways = []v1alpha1.ExternalModelGatewayStatus{{NamespacedObjectReference: defaultGateway, Conditions: []metav1.Condition{{
+		Type: conditionReady, Status: metav1.ConditionFalse, Reason: reasonTenantNotSteady, LastTransitionTime: metav1.Now(),
+	}}}}
+	if err := r.Status().Update(context.Background(), written); err != nil {
+		t.Fatal(err)
+	}
+
+	reconcileModel(t, r, model)
+	got := getModel(t, r, model)
+	if got.Status.Phase != resolver.PhaseReady || readyReason(got) != "Reconciled" || got.Status.HTTPRouteName != "chat" || len(got.Status.Gateways) > 0 {
+		t.Fatalf("status of a model IPP serves = %#v", got.Status)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(model, defaultGateway)); !apierrors.IsNotFound(err) {
+		t.Fatalf("attached to a tenant IPP still serves: %v", err)
+	}
+
+	// Without IPP's route nothing serves the model, which is reported.
+	if err := r.Delete(context.Background(), ippRoute(model, defaultGateway)); err != nil {
+		t.Fatal(err)
+	}
+	reconcileModel(t, r, model)
+	if got := getModel(t, r, model); got.Status.Phase != modelPhasePending || readyReason(got) != reasonTenantNotSteady {
+		t.Fatalf("status without IPP's route = %#v", got.Status)
+	}
+}
+
+// A route left by an IPP whose tenant has moved to Praxis no longer serves:
+// the model's status is ours again.
+func TestGatewayRefsModelIgnoresRouteOfIPPThatNoLongerServes(t *testing.T) {
+	provider, secret := attachmentProvider("team")
+	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), defaultGateway)
+	objects := append([]client.Object{provider, secret, model, ippRoute(model, defaultGateway)},
+		attachmentTenantObjects(tenant.DefaultAITenantName, "models-as-a-service", defaultGateway, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	setIPPStatus(t, r, model)
+	reconcileModel(t, r, model)
+	setRouteParentStatus(t, r, model, defaultGateway, metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, model)
+	got := getModel(t, r, model)
+	if got.Status.Phase != resolver.PhaseReady || got.Status.HTTPRouteName != attachmentRouteName(model, defaultGateway) || len(got.Status.Gateways) != 1 {
+		t.Fatalf("status of a model served through Praxis = %#v", got.Status)
+	}
+}
+
+// One failed tenant lookup claims a provider IPP serves. Once the lookup
+// works again the claim is released and IPP's status is left alone.
+func TestTransientTenantLookupErrorReleasesProviderClaim(t *testing.T) {
+	tests := []struct {
+		name      string
+		namespace string
+		claims    bool
+		objects   func() []client.Object
+	}{{
+		// A provider outside tenant namespaces keeps no finalizer, so the
+		// failed lookup is only retried.
+		name:      "outside tenant namespaces while IPP serves the default tenant",
+		namespace: "team",
+		claims:    false,
+		objects: func() []client.Object {
+			ait, mtc := blockedDefaultTenantObjects()
+			return []client.Object{ait, mtc}
+		},
+	}, {
+		name:      "tenant namespace IPP still serves",
+		namespace: "tenant-b",
+		claims:    true,
+		objects: func() []client.Object {
+			objects := attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")
+			mtc, ok := objects[1].(*unstructured.Unstructured)
+			if !ok {
+				t.Fatalf("MaasTenantConfig fixture is %T", objects[1])
+			}
+			annotations := mtc.GetAnnotations()
+			delete(annotations, tenant.AnnotationPayloadProcessingStatus)
+			mtc.SetAnnotations(annotations)
+			return objects
+		},
+	}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			provider, secret := attachmentProvider(tt.namespace)
+			r := controllerTestClient(t, append(tt.objects(), provider, secret)...)
+			ctx := context.Background()
+			key := client.ObjectKeyFromObject(provider)
+			base, ok := r.APIReader.(client.WithWatch)
+			if !ok {
+				t.Fatal("APIReader must be a client.WithWatch")
+			}
+			failed := false
+			r.APIReader = interceptor.NewClient(base, interceptor.Funcs{
+				Get: func(ctx context.Context, c client.WithWatch, k client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					if u, ok := obj.(*unstructured.Unstructured); ok && !failed && k.Namespace == tt.namespace && u.GetKind() == "MaasTenantConfig" {
+						failed = true
+						return apierrors.NewTimeoutError("injected API server timeout", 1)
+					}
+					return c.Get(ctx, k, obj, opts...)
+				},
+			})
+			if _, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: key}); err == nil {
+				t.Fatal("first reconcile: want the injected error")
+			}
+			var got v1alpha1.ExternalProvider
+			if err := r.Get(ctx, key, &got); err != nil {
+				t.Fatal(err)
+			}
+			if controllerutil.ContainsFinalizer(&got, externalProviderFinalizer) != tt.claims {
+				t.Fatalf("finalizers after a failed lookup = %v, want claimed %v", got.Finalizers, tt.claims)
+			}
+			// IPP serves the namespace and writes the provider's status.
+			got.Status.Phase = resolver.PhaseReady
+			got.Status.Conditions = []metav1.Condition{{Type: conditionReady, Status: metav1.ConditionTrue, Reason: "Reconciled", Message: "IPP", LastTransitionTime: metav1.Now()}}
+			if err := r.Status().Update(ctx, &got); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: key}); err != nil {
+				t.Fatalf("reconcile after recovery: %v", err)
+			}
+			if err := r.Get(ctx, key, &got); err != nil {
+				t.Fatal(err)
+			}
+			if controllerutil.ContainsFinalizer(&got, externalProviderFinalizer) || got.Status.Phase != resolver.PhaseReady {
+				t.Fatalf("provider IPP serves after recovery: finalizers %v, status %#v", got.Finalizers, got.Status)
+			}
+			if condition := apiMeta.FindStatusCondition(got.Status.Conditions, conditionReady); condition == nil || condition.Message != "IPP" {
+				t.Fatalf("IPP's provider status overwritten: %#v", got.Status.Conditions)
+			}
+		})
+	}
+}
+
+// While IPP serves the default tenant it reports the providers of namespaces
+// no tenant claims, so such a claim of ours is released.
+func TestProviderClaimOutsideTenantsIsReleasedWhileIPPServes(t *testing.T) {
+	provider, secret := attachmentProvider("team")
+	controllerutil.AddFinalizer(provider, externalProviderFinalizer)
+	ait, mtc := blockedDefaultTenantObjects()
+	r := controllerTestClient(t, provider, secret, ait, mtc)
+	if _, err := r.ReconcileProvider(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(provider)}); err != nil {
+		t.Fatal(err)
+	}
+	var got v1alpha1.ExternalProvider
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(provider), &got); err != nil {
+		t.Fatal(err)
+	}
+	if controllerutil.ContainsFinalizer(&got, externalProviderFinalizer) || got.Status.Phase != "" {
+		t.Fatalf("provider IPP serves: finalizers %v, status %#v", got.Finalizers, got.Status)
+	}
+}
+
+// A model in a tenant namespace IPP still serves can attach to a Praxis
+// tenant. Its attachment route uses the provider's transport, so our claim
+// stays as the provider's deletion protection, and is released once the route
+// is gone.
+func TestProviderClaimInUseIsKeptWhileIPPServesItsTenant(t *testing.T) {
+	ctx := context.Background()
+	provider, secret := attachmentProvider("tenant-b")
+	controllerutil.AddFinalizer(provider, externalProviderFinalizer)
+	objects := attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")
+	mtc, ok := objects[1].(*unstructured.Unstructured)
+	if !ok {
+		t.Fatalf("MaasTenantConfig fixture is %T", objects[1])
+	}
+	annotations := mtc.GetAnnotations()
+	delete(annotations, tenant.AnnotationPayloadProcessingStatus)
+	mtc.SetAnnotations(annotations)
+	serviceName := resolver.Route{Namespace: "tenant-b", ProviderNamespace: "tenant-b", Provider: provider.Name}.ServiceName()
+	service := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: "tenant-b", Labels: map[string]string{
+		"app.kubernetes.io/managed-by": "ai-gateway-controller", "inference.opendatahub.io/external-provider": provider.Name,
+	}}}
+	route := newHTTPRoute()
+	route.SetNamespace("tenant-b")
+	route.SetName("chat-attachment")
+	route.SetLabels(map[string]string{"app.kubernetes.io/managed-by": "ai-gateway-controller", tenant.LabelAttachmentTenant: "tenant-a"})
+	route.Object["spec"] = map[string]any{"rules": []any{map[string]any{"backendRefs": []any{map[string]any{"name": serviceName}}}}}
+	r := controllerTestClient(t, append(objects, provider, secret, service, route)...)
+	key := client.ObjectKeyFromObject(provider)
+
+	result, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got v1alpha1.ExternalProvider
+	if err := r.Get(ctx, key, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !controllerutil.ContainsFinalizer(&got, externalProviderFinalizer) || result.RequeueAfter == 0 {
+		t.Fatalf("claim on a provider an attachment uses: finalizers %v, result %#v", got.Finalizers, result)
+	}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(service), &corev1.Service{}); err != nil {
+		t.Fatalf("provider Service an attachment uses: %v", err)
+	}
+
+	if err := r.Delete(ctx, route); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: key}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Get(ctx, key, &got); err != nil {
+		t.Fatal(err)
+	}
+	if controllerutil.ContainsFinalizer(&got, externalProviderFinalizer) || got.Status.Phase != "" {
+		t.Fatalf("unused claim while IPP serves its tenant: finalizers %v, status %#v", got.Finalizers, got.Status)
+	}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(service), &corev1.Service{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("unused provider Service kept: %v", err)
+	}
+}
+
+// setExtProcAvailable sets the Available condition of the tenant's ExtProc
+// Deployment.
+func setExtProcAvailable(t *testing.T, r *Reconciler, namespace, tenantID string, available bool) {
+	t.Helper()
+	extProc, err := getUnstructured(r, deploymentGVK, namespace, tenant.PayloadProcessingExternalModelDeploymentName(tenantID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	extProc.Object["status"] = tenantExtProc(namespace, tenantID, available).Object["status"]
+	if err := r.Status().Update(context.Background(), extProc); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The tenant's first model is published before its ExtProc runs; requests
+// fail until it is available, so the model waits.
+func TestHomeModelWaitsForTenantExtProc(t *testing.T) {
+	r, model := reconcilerFixture(t)
+	ctx := context.Background()
+	setExtProcAvailable(t, r, "tenant-a", tenant.ID("tenant"), false)
+	result, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := getModel(t, r, model)
+	if got.Status.Phase != modelPhasePending || readyReason(got) != reasonExtProcNotReady || result.RequeueAfter != attachmentRequeueInterval {
+		t.Fatalf("model before its ExtProc is available: result %#v, status %#v", result, got.Status)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, "tenant-a", modelRouteName(model.Name)); err != nil {
+		t.Fatalf("route not published while the ExtProc starts: %v", err)
+	}
+
+	setExtProcAvailable(t, r, "tenant-a", tenant.ID("tenant"), true)
+	reconcileModel(t, r, model)
+	if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("model with an available ExtProc = %#v", got.Status)
+	}
+}
+
+// Requests to a home route fail until the Gateway accepts it, so the model
+// waits for the Gateway's decision too.
+func TestHomeModelWaitsForGatewayToAcceptRoute(t *testing.T) {
+	r, model := reconcilerFixture(t)
+	ctx := context.Background()
+	accepting, ok := r.APIReader.(client.WithWatch)
+	if !ok {
+		t.Fatal("APIReader must be a client.WithWatch")
+	}
+	// No Gateway has reported on the route yet.
+	r.APIReader = interceptor.NewClient(accepting, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if err := c.Get(ctx, key, obj, opts...); err != nil {
+				return err
+			}
+			if route, ok := obj.(*unstructured.Unstructured); ok && route.GroupVersionKind() == httpRouteGVK {
+				unstructured.RemoveNestedField(route.Object, "status")
+			}
+			return nil
+		},
+	})
+	result, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := getModel(t, r, model)
+	if got.Status.Phase != modelPhasePending || readyReason(got) != reasonAttachmentPending || result.RequeueAfter != attachmentRequeueInterval {
+		t.Fatalf("model before the Gateway accepts its route: result %#v, status %#v", result, got.Status)
+	}
+
+	r.APIReader = accepting
+	reconcileModel(t, r, model)
+	if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("model whose route the Gateway accepted = %#v", got.Status)
+	}
+}
+
+// A home route the Gateway rejects serves nothing: the model reports the
+// Gateway's reason, and the route's status update reconciles it again.
+func TestHomeModelReportsRouteRejectedByGateway(t *testing.T) {
+	r, model := reconcilerFixture(t)
+	reconcileModel(t, r, model)
+	gateway := v1alpha1.NamespacedObjectReference{Name: "gateway", Namespace: "tenant-a"}
+	route, err := getUnstructured(r, httpRouteGVK, "tenant-a", modelRouteName(model.Name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := r.attachmentRouteModels(context.Background(), route); !slices.Contains(got, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}) {
+		t.Fatalf("home route event enqueued %v", got)
+	}
+	setHomeRouteParentStatus := func(status metav1.ConditionStatus, reason string) {
+		t.Helper()
+		route, err := getUnstructured(r, httpRouteGVK, "tenant-a", modelRouteName(model.Name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		parents := []any{map[string]any{
+			"parentRef":  map[string]any{"name": gateway.Name, "namespace": gateway.Namespace},
+			"conditions": []any{map[string]any{"type": "Accepted", "status": string(status), "reason": reason, "message": "not allowed"}},
+		}}
+		if err := unstructured.SetNestedSlice(route.Object, parents, "status", "parents"); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Update(context.Background(), route); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	setHomeRouteParentStatus(metav1.ConditionFalse, "NotAllowedByListeners")
+	reconcileModel(t, r, model)
+	got := getModel(t, r, model)
+	ready := apiMeta.FindStatusCondition(got.Status.Conditions, conditionReady)
+	if got.Status.Phase != modelPhaseFailed || ready == nil || ready.Reason != "NotAllowedByListeners" || !strings.Contains(ready.Message, "did not accept HTTPRoute") {
+		t.Fatalf("model whose route the Gateway rejects = %#v", got.Status)
+	}
+
+	setHomeRouteParentStatus(metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, model)
+	if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("model whose route is accepted again = %#v", got.Status)
+	}
+}
+
+// After an update the Gateway's acceptance of the route's earlier generation
+// remains until it processes the new spec, so the model waits for the current
+// generation to be accepted.
+func TestHomeModelWaitsForAcceptanceOfCurrentRouteGeneration(t *testing.T) {
+	r, model := reconcilerFixture(t)
+	reconcileModel(t, r, model)
+	setAccepted := func(generation, observedGeneration int64) {
+		t.Helper()
+		route, err := getUnstructured(r, httpRouteGVK, "tenant-a", modelRouteName(model.Name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		route.SetGeneration(generation)
+		parents := []any{map[string]any{
+			"parentRef":  map[string]any{"name": "gateway", "namespace": "tenant-a"},
+			"conditions": []any{map[string]any{"type": "Accepted", "status": string(metav1.ConditionTrue), "reason": "Accepted", "observedGeneration": observedGeneration}},
+		}}
+		if err := unstructured.SetNestedSlice(route.Object, parents, "status", "parents"); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Update(context.Background(), route); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	setAccepted(2, 1)
+	result, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := getModel(t, r, model)
+	if got.Status.Phase != modelPhasePending || readyReason(got) != reasonAttachmentPending || result.RequeueAfter != attachmentRequeueInterval {
+		t.Fatalf("model whose route generation 2 the Gateway has not accepted yet: result %#v, status %#v", result, got.Status)
+	}
+
+	setAccepted(2, 2)
+	reconcileModel(t, r, model)
+	if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("model whose current route generation is accepted = %#v", got.Status)
+	}
+}
+
+// An attachment serves through the attached tenant's ExtProc, so it waits for
+// that ExtProc too.
+func TestAttachmentWaitsForAttachedTenantExtProc(t *testing.T) {
+	r, model := implicitAttachmentFixture(t, append(attachmentTenantObjects(tenant.DefaultAITenantName, "models-as-a-service", defaultGateway, "praxis"),
+		tenantExtProc("models-as-a-service", tenant.ID(tenant.DefaultAITenantName), false))...)
+	setRouteParentStatus(t, r, model, defaultGateway, metav1.ConditionTrue, "Accepted")
+	result, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := getModel(t, r, model)
+	if got.Status.Phase != modelPhasePending || readyReason(got) != reasonExtProcNotReady || result.RequeueAfter != attachmentRequeueInterval {
+		t.Fatalf("attachment before the tenant ExtProc is available: result %#v, status %#v", result, got.Status)
+	}
+	setExtProcAvailable(t, r, "models-as-a-service", tenant.ID(tenant.DefaultAITenantName), true)
+	reconcileModel(t, r, model)
+	if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("attachment with an available ExtProc = %#v", got.Status)
+	}
+}
+
+// A model that attaches to a Praxis tenant keeps our status, which MaaS reads
+// per Gateway, even while a 3.5 IPP of a blocked default tenant claims it too.
+func TestGatewayRefsModelOfPraxisTenantKeepsOurStatusDuringBlockedMigration(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		gateways []v1alpha1.NamespacedObjectReference
+	}{
+		{name: "Praxis tenant only", gateways: []v1alpha1.NamespacedObjectReference{gatewayB}},
+		{name: "IPP-served and Praxis tenants", gateways: []v1alpha1.NamespacedObjectReference{defaultGateway, gatewayB}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ait, mtc := blockedDefaultTenantObjects()
+			provider, secret := attachmentProvider("team")
+			model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), tt.gateways...)
+			objects := append([]client.Object{provider, secret, model, ait, mtc, ippRoute(model, defaultGateway)},
+				attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+			r := attachmentReconciler(t, objects...)
+			setIPPStatus(t, r, model)
+			reconcileModel(t, r, model)
+			got := getModel(t, r, model)
+			if len(got.Status.Gateways) != len(tt.gateways) {
+				t.Fatalf("status.gateways = %#v, want one result per gatewayRefs entry", got.Status.Gateways)
+			}
+			gatewayResult(t, got, gatewayB)
+		})
+	}
+}
+
+func TestIPPRouteEventsRecheckTheModel(t *testing.T) {
+	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), defaultGateway)
+	r := controllerTestClient(t, model)
+	if got := r.attachmentRouteModels(context.Background(), ippRoute(model, defaultGateway)); !slices.Equal(got, []reconcile.Request{{NamespacedName: client.ObjectKeyFromObject(model)}}) {
+		t.Fatalf("IPP route event enqueued %v", got)
+	}
+}
+
+// A failed read of the ExtProc Deployment is retried, never reported as the
+// model's failure.
+func TestExtProcReadErrorKeepsAttachmentPending(t *testing.T) {
+	r, model := implicitAttachmentFixture(t, attachmentTenantObjects(tenant.DefaultAITenantName, "models-as-a-service", defaultGateway, "praxis")...)
+	setRouteParentStatus(t, r, model, defaultGateway, metav1.ConditionTrue, "Accepted")
+	base, ok := r.APIReader.(client.WithWatch)
+	if !ok {
+		t.Fatal("APIReader must be a client.WithWatch")
+	}
+	r.APIReader = interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, k client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if u, ok := obj.(*unstructured.Unstructured); ok && u.GroupVersionKind() == deploymentGVK {
+				return apierrors.NewTimeoutError("injected API server timeout", 1)
+			}
+			return c.Get(ctx, k, obj, opts...)
+		},
+	})
+	result, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := getModel(t, r, model)
+	if got.Status.Phase != modelPhasePending || readyReason(got) != reasonExtProcNotReady || result.RequeueAfter != attachmentRequeueInterval {
+		t.Fatalf("attachment after a failed ExtProc read: result %#v, status %#v", result, got.Status)
+	}
+}
+
+func TestCredentialCopyOwnedFallsBackToLiveRead(t *testing.T) {
+	copyName := "agc-cred-lagged"
+	copied := credentialCopy{name: copyName, sourceNamespace: "llm", sourceName: "api-key", key: "token"}
+	owned := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Namespace:   "tenant-a",
+		Name:        copyName,
+		Labels:      map[string]string{tenant.LabelCredentialCopy: "true"},
+		Annotations: map[string]string{annotationCredentialSource: copied.source()},
+	}}
+	r := controllerTestClient(t, owned)
+	cached, ok := r.Client.(client.WithWatch)
+	if !ok {
+		t.Fatal("the test client must support watches")
+	}
+	// Simulate metadata-cache lag: the cached client has not seen the Secret
+	// yet, while the API server (APIReader) already serves it.
+	r.Client = interceptor.NewClient(cached, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, meta := obj.(*metav1.PartialObjectMetadata); meta && key.Name == copyName {
+				return apierrors.NewNotFound(corev1.Resource("secrets"), copyName)
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+
+	if exists, isOwned, err := r.credentialCopyOwned(context.Background(), "tenant-a", copied); err != nil || !exists || !isOwned {
+		t.Fatalf("cache-miss read: exists=%v owned=%v err=%v, want the live read to find the controller-owned copy", exists, isOwned, err)
+	}
+
+	// When the Secret is truly absent, the live read confirms the miss
+	// instead of speculatively marking the copy ready.
+	if exists, _, err := r.credentialCopyOwned(context.Background(), "tenant-a", credentialCopy{name: "agc-cred-absent", sourceNamespace: "llm", sourceName: "api-key", key: "token"}); err != nil || exists {
+		t.Fatalf("absent copy: exists=%v err=%v, want exists=false", exists, err)
+	}
+
+	// A foreign Secret at the copy name must not be adopted through the
+	// live-read fallback either.
+	foreign := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "tenant-a", Name: "agc-cred-foreign"}}
+	writer, canWrite := r.APIReader.(client.Client)
+	if !canWrite {
+		t.Fatal("the test APIReader must be a writable client")
+	}
+	if err := writer.Create(context.Background(), foreign); err != nil {
+		t.Fatal(err)
+	}
+	foreignCopy := credentialCopy{name: "agc-cred-foreign", sourceNamespace: "llm", sourceName: "api-key", key: "token"}
+	if exists, isOwned, err := r.credentialCopyOwned(context.Background(), "tenant-a", foreignCopy); err != nil || !exists || isOwned {
+		t.Fatalf("foreign copy: exists=%v owned=%v err=%v, want owned=false", exists, isOwned, err)
+	}
+}
+
+type withdrawalAnnotationFailureClient struct{ client.Client }
+
+func (c withdrawalAnnotationFailureClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+	if route, ok := obj.(*unstructured.Unstructured); ok && route.GetKind() == "HTTPRoute" && route.GetAnnotations()[annotationWithdrawalCandidates] != "" {
+		return errors.New("injected withdrawal annotation persistence failure")
+	}
+	return c.Client.Patch(ctx, obj, patch, opts...)
+}
+
+func TestAttachmentProtectionDoesNotClaimStandaloneProviderStatus(t *testing.T) {
+	ctx := context.Background()
+	r, model := servedImplicitFixture(t)
+	key := client.ObjectKey{Namespace: model.Namespace, Name: "openai"}
+	provider := &v1alpha1.ExternalProvider{}
+	if err := r.Get(ctx, key, provider); err != nil {
+		t.Fatal(err)
+	}
+	if !controllerutil.ContainsFinalizer(provider, externalProviderFinalizer) {
+		t.Fatal("served attachment lacks provider protection")
+	}
+	if _, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: key}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Get(ctx, key, provider); err != nil {
+		t.Fatal(err)
+	}
+	if provider.Status.Phase != resolver.PhaseReady || !controllerutil.ContainsFinalizer(provider, externalProviderFinalizer) {
+		t.Fatalf("protected standalone provider must remain Ready: %#v", provider)
+	}
+	if err := r.removeAttachmentRoute(ctx, model, defaultGateway); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.collectProviderTransport(ctx, model.Namespace); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Get(ctx, key, provider); err != nil {
+		t.Fatal(err)
+	}
+	if controllerutil.ContainsFinalizer(provider, externalProviderFinalizer) {
+		t.Fatal("unused standalone provider retains protection")
+	}
+}
+
+func TestStandaloneProviderProtectionIncludesForeignAttachmentRoutes(t *testing.T) {
+	ctx := context.Background()
+	provider, secret := attachmentProvider("shared")
+	model := referenceProvider(attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), gatewayB), "shared")
+	grant := referenceGrant("shared", "team", "openai")
+	objects := append([]client.Object{provider, secret, model, grant}, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	reconcileModel(t, r, model)
+	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, model)
+	if err := r.Get(ctx, client.ObjectKeyFromObject(provider), provider); err != nil {
+		t.Fatal(err)
+	}
+	if !controllerutil.ContainsFinalizer(provider, externalProviderFinalizer) {
+		t.Fatal("foreign provider lacks protection")
+	}
+	if err := r.releaseUnusedAttachmentProvider(ctx, provider); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(provider), provider); err != nil {
+		t.Fatal(err)
+	}
+	if !controllerutil.ContainsFinalizer(provider, externalProviderFinalizer) {
+		t.Fatal("active foreign attachment lost protection")
 	}
 }

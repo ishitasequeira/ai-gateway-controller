@@ -386,18 +386,23 @@ func TestPublishAnnotationDriftIsHarmless(t *testing.T) {
 	}
 }
 
-func TestPublishWeightGuardRefuses(t *testing.T) {
+func TestPublishUnequalWeightsEmitsWeightedRandom(t *testing.T) {
 	set := routeSetOne()
 	set.Models[0].Routes[1].Weight = 2 // non-uniform: 1 vs 2
 	p := newTestPublisher(t)
-	_, err := p.Publish(context.Background(), set, testScope, testOpts())
-	if !errors.Is(err, envelope.ErrWeightUnsupported) {
-		t.Fatalf("Publish error = %v, want ErrWeightUnsupported", err)
+	result, err := p.Publish(context.Background(), set, testScope, testOpts())
+	if err != nil {
+		t.Fatalf("Publish: %v", err)
 	}
-	var cm corev1.ConfigMap
-	err = p.client.Get(context.Background(), client.ObjectKey{Namespace: "praxis", Name: DefaultName}, &cm)
-	if err == nil {
-		t.Error("ConfigMap was created despite the weight guard refusing")
+	env := parseEnvelope(t, readCM(t, p).Data[DefaultDataKey])
+	var policy struct {
+		Mode string `json:"mode"`
+	}
+	if err := json.Unmarshal(env.Overlay.SelectionPolicy, &policy); err != nil || policy.Mode != "weightedRandom" {
+		t.Fatalf("selection_policy = %s, want weightedRandom (err=%v)", env.Overlay.SelectionPolicy, err)
+	}
+	if result.Envelope.Revision.Value == "" || result.Envelope.Revision.Value != env.Revision.Value {
+		t.Fatalf("publish result digest = %q, envelope = %q", result.Envelope.Revision.Value, env.Revision.Value)
 	}
 }
 

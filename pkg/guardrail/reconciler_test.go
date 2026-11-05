@@ -106,18 +106,18 @@ func newNemo(namespace, name string, namespacesPolicy map[string]any) *unstructu
 	// Providers are discoverable by default, so every test that is about
 	// something other than readiness reaches the verdict it is written for.
 	// withoutNemoEndpoint takes it back off.
-	if err := unstructured.SetNestedField(u.Object, "https://"+name+"."+namespace+".svc.cluster.local",
-		"status", "endpoint"); err != nil {
+	u.SetAnnotations(map[string]string{nemoAuthAnnotation: "true"})
+	if err := unstructured.SetNestedField(u.Object, namespace, "status", "workloadNamespace"); err != nil {
 		panic(err)
 	}
 	return withNemoConfigs(u, guardrailConfig)
 }
 
-// withoutNemoEndpoint clears the provider's published endpoint, the way
-// TrustyAI does when the server is not auth-protected. Nothing else about the
-// provider changes, so a refusal can only come from discovery failing.
+// withoutNemoEndpoint clears the provider's published workload namespace, as
+// before TrustyAI's workload is ready. Nothing else about the provider
+// changes, so a refusal can only come from discovery failing.
 func withoutNemoEndpoint(u *unstructured.Unstructured) *unstructured.Unstructured {
-	unstructured.RemoveNestedField(u.Object, "status", "endpoint")
+	unstructured.RemoveNestedField(u.Object, "status", "workloadNamespace")
 	return u
 }
 
@@ -450,7 +450,7 @@ func TestReconcileLeavesSameNamespaceReferencesUnaffected(t *testing.T) {
 // the short one.
 //
 // Acceptance here is now earned rather than assumed: newNemo publishes a
-// status.endpoint, which is what ProviderReady gates on, so removing it makes
+// status.workloadNamespace, which is what ProviderReady gates on, so removing it makes
 // these cases refuse (see the readiness case in
 // TestReconcileClearsTheBindingRevisionOnRefusal).
 func TestReconcileAcceptsPermittedCrossNamespaceReference(t *testing.T) {
@@ -635,9 +635,8 @@ func TestReconcileRepublishesTheBindingRevisionWhenDependenciesMove(t *testing.T
 			mutate: func(t *testing.T, f *fixture) {
 				t.Helper()
 				mutateLiveProvider(t, f, func(u *unstructured.Unstructured) {
-					if err := unstructured.SetNestedField(u.Object,
-						"https://"+nemoName+".relocated.svc.cluster.local", "status", "endpoint"); err != nil {
-						t.Fatalf("set status.endpoint: %v", err)
+					if err := unstructured.SetNestedField(u.Object, "relocated", "status", "workloadNamespace"); err != nil {
+						t.Fatalf("set status.workloadNamespace: %v", err)
 					}
 				})
 			},
@@ -773,6 +772,38 @@ func TestReconcileDeniesInvalidAllowedConsumers(t *testing.T) {
 			res := f.reconcile(t, consumerNS)
 			requireDenied(t, f, res, consumerNS, "InvalidAllowedConsumers")
 		})
+	}
+}
+
+// TestReconcileRefusesSubMillisecondTimeout covers a timeout Praxis would
+// render as timeout_ms 0. The provider is ready; the policy is still refused
+// before that endpoint is published, and 1ms remains acceptable.
+func TestReconcileRefusesSubMillisecondTimeout(t *testing.T) {
+	guardrail := newGuardrail(consumerNS, nemoName, providerNS)
+	guardrail.Spec.Provider.Timeout.Duration = 500 * time.Microsecond
+	f := newStandardFixture(guardrail, newNemo(providerNS, nemoName, map[string]any{"from": "All"}))
+
+	res := f.reconcile(t, consumerNS)
+	got := f.reload(t, consumerNS)
+	requireCondition(t, got, ConditionAccepted, metav1.ConditionFalse, reasonTimeoutBelowMinimum)
+	if got.Status.BindingRevision != "" || got.Status.ProviderEndpoint != "" {
+		t.Fatalf("revision %q endpoint %q, want both empty on a refused timeout", got.Status.BindingRevision, got.Status.ProviderEndpoint)
+	}
+	if res.RequeueAfter != f.reconciler.ResyncInterval {
+		t.Fatalf("RequeueAfter = %v, want the resync interval %v", res.RequeueAfter, f.reconciler.ResyncInterval)
+	}
+	if events := len(f.events); events != 1 {
+		t.Fatalf("%d events emitted, want 1 for the transition to refused", events)
+	}
+
+	accepted := newGuardrail(consumerNS, nemoName, providerNS)
+	accepted.Spec.Provider.Timeout.Duration = time.Millisecond
+	f = newStandardFixture(accepted, newNemo(providerNS, nemoName, map[string]any{"from": "All"}))
+	f.reconcile(t, consumerNS)
+	got = f.reload(t, consumerNS)
+	requireCondition(t, got, ConditionAccepted, metav1.ConditionTrue, reasonPolicyAccepted)
+	if got.Status.ProviderEndpoint == "" {
+		t.Fatal("1ms timeout was refused")
 	}
 }
 

@@ -27,8 +27,11 @@ The controller watches ExternalModel and ExternalProvider, publishes transport
 resources before the content-addressed overlay, and the local manifests
 provide two Katan backends plus tenant-local ExternalModel ExtProc. The default
 qualification entrypoint is `e2e.sh`, which executes the ExtProc-only suite.
-The transition implementation is not part of this checkout's executable
-qualification. Istio, Kuadrant, and the MaaS platform remain
+The equal-provider selection and staged A+B-to-A withdrawal qualification is a
+separate, manually invoked test; it is not included in `e2e.sh` or the default
+CI workflow. It requires an already provisioned cluster and verifies overlay
+publication, serving revisions, provider traffic, drain, and cleanup.
+Istio, Kuadrant, and the MaaS platform remain
 explicit prerequisites for the full authenticated chain; the provisioner
 records a failure rather than silently substituting them.
 
@@ -57,7 +60,10 @@ status-gate loss/recovery. An
 explicitly non-Ready provider is excluded from the next resolved route set;
 the previously distributed overlay remains intact until a valid replacement
 is published. A newly-created provider with an empty phase is admitted once
-for bootstrap so its transport resources can establish Ready.
+for bootstrap so its transport resources can establish Ready. Provider A's
+private CA is also trusted through `tls.credentialName`: a missing CA Secret
+fails the provider's status, creating it restores traffic, and with no CA the
+Gateway rejects the provider certificate.
 
 The local configuration now provisions two independently serving tenant
 stacks. Tenant A is `models-as-a-service`; tenant B is
@@ -101,6 +107,104 @@ LOCAL_ENV_EVIDENCE_ROOT="$PWD/evidence/<run-id>" ./run.sh --destroy
 Replace `<run-id>` consistently. The normal qualification does not apply the
 optional OpenAI resources; that workflow must opt in explicitly through its
 documented OpenAI command path.
+
+### Static ExternalModel provider-weight qualification
+
+The control-plane renderer consumes `ExternalProviderRef.weight` and writes
+selection metadata to the same content-addressed Praxis overlay used by normal
+ExternalModel requests. Praxis `intelligent_route` chooses the destination;
+Envoy forwards to the selected provider. Configured positive integer weights
+are relative and passed through as `traffic_weight`; equal weights use
+`random`, unequal weights use `weightedRandom`, and zero-weight bindings are
+omitted from serving candidates while remaining preloaded for administrative
+updates. Multiplying every weight by a common factor preserves the intended
+share, but changes the published overlay bytes and revision because the raw
+configured values are part of the contract.
+
+After the base `e2e.sh` passes, run the focused static-weight suite on that same
+fresh cluster. The suite creates three credential-enforcing HTTPS provider
+recorders, first makes a one-request receipt-storage smoke probe, and then
+checks 50:50, 50:25:25, equivalent 2:1:1, 100:0 followed by an explicit 0:100
+update, and a 95:5 canary. It sends 500 requests for each measured
+distribution (50:50, 50:25:25, and 95:5), and 50 for each direction of the
+100:0 to 0:100 administrative switch. The 2:1:1 case verifies the converged
+rendered weights and ratio equivalence without repeating the traffic sample.
+It then validates all-zero withdrawal as a sequential scenario. With all
+providers Ready, it proves attributed traffic, withdraws all routes, and proves
+that requests return 404 without a backend receipt before restoring serving.
+It repeats the sequence with Provider B first unready, and then absent; each
+case requires a fresh request-backed baseline through the remaining healthy
+providers before withdrawal. Each case restores B and verifies serving again.
+Finally, it withdraws one all-zero model beside a healthy sibling and checks
+that only the target route/candidate disappears while the sibling keeps serving.
+Each sample uses unique request IDs, at most eight concurrent requests, and one
+independently retrieved TLS-verified backend receipt per response. The three
+distribution windows use fixed Pearson goodness-of-fit cutoffs at alpha 0.001
+per window (family-wise false-rejection bound at most 0.003). Failed requests
+are reported separately. The serving configuration is captured before and
+after each sample window. A traffic sample starts only after the published,
+mounted, accepted, and serving overlay revisions agree. No sample uses session
+affinity. These tests
+establish static allocation only; they do not establish health-based failover
+or automatic promotion.
+
+Use `--withdrawal-only` to run just the ready, unready, missing-provider, and
+healthy-sibling all-zero scenarios. The separate `--switch-diagnostic-only`
+mode attempts to record 50 uniquely identified requests if it observes an
+A-to-B overlay update mounted while the prior ExtProc revision is still
+serving; it also captures matching Gateway access-log lines. This deliberately
+probes an in-flight transition for diagnosis and is not part of the normal
+qualification pass. If that interval is not observed, the result records that
+limit and still verifies serving after convergence.
+
+```sh
+: "${LOCAL_ENV_CLUSTER:?Set to the cluster used for the base qualification}"
+: "${LOCAL_ENV_EVIDENCE_ROOT:?Set to the base qualification evidence directory}"
+
+LOCAL_ENV_WEIGHT_EVIDENCE="$LOCAL_ENV_EVIDENCE_ROOT/weights" \
+  python3 ./e2e-static-provider-weights.py
+
+# Optional isolated diagnostics on that same run-owned cluster:
+LOCAL_ENV_WEIGHT_EVIDENCE="$LOCAL_ENV_EVIDENCE_ROOT/weight-transition-diagnostics" \
+  python3 ./e2e-static-provider-weights.py --switch-diagnostic-only
+
+./demo.sh --context "kind-$LOCAL_ENV_CLUSTER" --non-interactive
+./run.sh --destroy
+```
+
+Run this command block from `test/kind-env`. It assumes the cluster was just provisioned and the base
+`e2e.sh` passed. Keep the same run ID and context for the base suite, weighted
+suite, demo, and teardown. The weighted suite restores the original
+ExternalModel provider references, waits for the Provider A serving revision,
+checks the reset request, revokes its temporary MaaS key, and removes only its
+owned recorder resources. The final destroy remains ownership-checked.
+
+### Staged provider-withdrawal qualification
+
+To run the equal-provider selection and withdrawal qualification, first
+provision a fresh cluster as above, then run the dedicated script against that
+cluster with the same ExtProc source checkout and local image used by
+provisioning:
+
+```sh
+RUN_ID=pr145-withdrawal-20261024
+export LOCAL_ENV_CLUSTER="external-model-kind-${RUN_ID}"
+export LOCAL_ENV_SELECTION_EVIDENCE="$PWD/evidence/${RUN_ID}-selection"
+export EXTPROC_IMAGE="praxis-extproc:${RUN_ID}"
+export PRAXIS_EXTPROC_REPO=/path/to/clean/praxis-extproc
+export EXPECTED_EXTPROC_MAIN_SHA="$(git -C "$PRAXIS_EXTPROC_REPO" rev-parse HEAD)"
+python3 ./e2e-equal-provider-selection.py
+```
+
+The script fails unless the ExtProc source checkout is clean `main`, the
+optional expected SHA matches, and the running ExtProc image matches the local
+image loaded into Kind. It exercises one-provider routing, two independent
+100-request A+B samples, session affinity, and the staged A+B-to-A transition;
+the transition assertions require A traffic during the update and defer B route
+and credential cleanup until the replacement revision is serving and the
+request drain period has elapsed. This specialized qualification uses test
+credentials and recorders. Destroy only the named run-owned cluster after
+preserving its evidence.
 
 ### Shared External Model resources
 
@@ -172,6 +276,12 @@ the real API emits it and TLS fingerprints. Direct API key creation is only
 fixture setup and is not counted as callback proof. No key or Authorization
 value is written to evidence.
 
+After applying the run-owned CA to the Authorino resource, provisioning waits
+for the operator-generated Authorino Deployment to mount that ConfigMap and
+finish its rollout before configuring the process trust environment. This is a
+bounded readiness gate; timeout evidence includes the Authorino resource,
+workloads, and namespace events.
+
 The current route-scoped Kind fixture observes API-key validation and the full
 authorized ExtProc request. The generated AuthPolicy is inspected before
 classifying subscription-selection callback evidence: if the policy requires
@@ -179,6 +289,18 @@ classifying subscription-selection callback evidence: if the policy requires
 qualification; if it does not, the behavior is recorded separately as
 `NOT_DEMONSTRATED` and is excluded from the functional routing total. No
 canned response or synthetic MaaS service is used.
+
+The ExternalModel HTTPRoute inherits authentication from MaaS's Gateway
+AuthPolicy. The Kind fixture attaches only its token-rate-limit policy to that
+route; it must not add a second route-targeted AuthPolicy. MaaS reports
+`ConflictingAuthPolicy=True` when another AuthPolicy targets a MaaS-managed
+route, and that conflict can change the normal Gateway authorization result.
+Before qualification, the harness removes only the exact old `local-env`
+`external-model-auth` fixture after verifying its UID, ownership label, and
+HTTPRoute target. It fails if any other route AuthPolicy remains or MaaS still
+reports the conflict. Diagnostic bypass mode, when explicitly requested,
+creates a separately named run-owned policy and deletes it only after UID and
+ownership checks; it is never counted as normal-auth qualification.
 
 This proves single-tenant MaaS authorization callback compatibility. It does
 not prove tenant-aware dispatch for multiple tenant-qualified MaaS APIs; that
@@ -289,18 +411,114 @@ the selected provider is OpenAI-compatible. The setting therefore opts into
 both API conversion and this provider-specific target-model mapping; there is
 not currently a separate switch for target-model rewriting.
 
-When translation is enabled, the selected-provider request filter applies a
-1 MiB limit before model validation and target-model rewriting, including for
-OpenAI-compatible candidates; larger requests are rejected before the upstream
-provider. The dedicated ExtProc process uses a 10 MiB accumulation ceiling for
-that translation configuration. The Kind request-limit probe currently observes
-Envoy's preselection 413 before the request reaches Praxis, so it does not
-qualify the filter's 1 MiB limit. With translation disabled, the translation
-filter and its bounds are absent and the main `allow_unbounded_body` setting is
-retained. For Anthropic JSON responses, the translator buffers chunks in
-request-local filter state and enforces its 1 MiB limit. SSE remains
-incremental, and OpenAI-compatible responses pass through without this response
-buffer or limit.
+For Anthropic candidates, the translator chooses `max_completion_tokens`
+before `max_tokens` and defaults to 4096 when both are omitted. It accepts and
+discards `user`, `n`, `seed`, and `parallel_tool_calls` after validating their
+types; this does not provide multiple completions or deterministic generation.
+Text and supported `image_url` blocks are converted in order. Base64 data URLs
+become Anthropic base64 image sources, while HTTPS image URLs are passed to the
+provider without the Gateway fetching them. Other unknown request fields and
+unsupported content remain rejected. `response_format` is currently unsupported
+by the pinned Praxis AI v0.9.0 translator and returns HTTP 400 for Anthropic
+translation. This known upgrade-compatibility gap requires an upstream AI fix;
+this PR does not claim to restore that behavior.
+
+When translation is enabled, the selected-provider request filter retains
+main's 10 MiB request allowance (`extprocMaxBodyBytes`), independently of the
+1 MiB buffered Anthropic JSON response limit. OpenAI-compatible providers in
+the translation-enabled chain share the request limit. Rewritten output has
+64 KiB of bounded headroom above the input allowance in the server accumulator.
+Streaming Anthropic responses remain incremental.
+
+The ExternalModel EnvoyFilter sets the selected Gateway listeners' soft buffer
+limit to 10 MiB plus 64 KiB, allowing buffered pre-auth model extraction to
+handle the intended request allowance. This is Gateway-wide and also affects
+response buffering and flow control; it is not a request-only hard limit. The
+Anthropic JSON response cap remains independent. Other platform buffering and
+gRPC message limits remain independent constraints: rendering a
+10 MiB filter allowance alone does not prove end-to-end acceptance of that size.
+The qualification probes below, at, and above 10 MiB must pass on the selected
+runtime before that boundary is described as qualified. Previous 2 MiB results
+are historical and do not qualify the updated configuration.
+
+The harness verifies the mounted 10 MiB request limit, 1 MiB response limit,
+and 10 MiB + 64 KiB server accumulator. It preserves the 1.5 MiB compatibility
+checks and measures exact serialized request bytes for the boundary matrix.
+HTTP 413 is attributed to the ExtProc input guard only with a same-runtime
+rejection-counter increment and no provider receipt; earlier transport or
+Gateway rejection is not described as a translator-limit result.
+Large prompt text and image bytes are excluded from evidence and provider
+receipts. The current Kind setup installs KServe CRDs but does not deploy a
+serving runtime or internal model, so an internal-model large-request control
+is not claimed by this qualification.
+
+Run these commands from the repository root after
+`test/kind-env/run.sh --provision` and the base `test/kind-env/e2e.sh` suite. The translation command covers both shared-route controls and
+the ExternalModel provider-aware path; it restores its temporary provider and
+tenant settings on exit:
+
+```console
+: "${CLUSTER:?Set to the provisioned Kind cluster name}"
+: "${PROVIDER_RECORDER_IMAGE:?Set to the recorder image used for provisioning}"
+: "${EXTPROC_IMAGE:?Set to the ExtProc image used for provisioning}"
+: "${RUN_EVIDENCE:?Set to this run evidence directory}"
+LOCAL_ENV_CLUSTER="$CLUSTER" \
+LOCAL_ENV_TRANSLATION_EVIDENCE="$RUN_EVIDENCE/api-translation" \
+PROVIDER_RECORDER_IMAGE="$PROVIDER_RECORDER_IMAGE" \
+PRAXIS_EXTPROC_IMAGE="$EXTPROC_IMAGE" \
+  python3 test/kind-env/e2e-api-translation.py --scope all
+
+test/kind-env/demo.sh --context "kind-$CLUSTER" --evidence-dir "$RUN_EVIDENCE/demo" --non-interactive
+```
+
+The mounted-limit parser and harness policy contracts can be checked without
+a cluster:
+
+```sh
+python3 -m unittest discover -s test/kind-env -p 'test_api_translation_contract.py' -v
+bash test/kind-env/test_run_contracts.sh
+```
+
+Use a distinct `RUN_EVIDENCE` directory for every cold run. The translation
+test uses synthetic request bodies and records body sizes and structural
+provider receipts only; large prompt contents and image bytes are not retained.
+
+### Qualifying a published ExtProc image
+
+The default Kind path builds ExtProc from `PRAXIS_EXTPROC_REPO`. To qualify a
+published release artifact instead, use `EXTPROC_IMAGE_MODE=published` with an
+immutable registry digest and the matching, clean ExtProc source checkout. The
+provisioner checks the digest, platform, OCI source and revision labels, then
+checks the image digest and image ID in the Kind node and serving Pods. It
+fails closed if the configured source checkout or runtime identity differs.
+Do not pass a mutable tag in published mode. `PRAXIS_AI_REPO` must be unset
+in this mode; it is used only when testing a local AI source override.
+
+```sh
+CLUSTER="anthropic-published-$(date -u +%Y%m%dT%H%M%SZ | tr '[:upper:]' '[:lower:]')"
+export PROVIDER_RECORDER_IMAGE="provider-recorder:$CLUSTER"
+unset PRAXIS_AI_REPO
+EXT_SOURCE_SHA=cffd4219f080348176d3bfdbc99028372dec7e50
+EXT_IMAGE='quay.io/opendatahub/odh-praxis-extproc@sha256:a67be44e530961ca7e6dc453220ebe11a6641a2003577f3c4ddb1f426555b874'
+RUN_EVIDENCE="$PWD/evidence/published-extproc-qualification"
+export PRAXIS_EXTPROC_REPO=/path/to/clean/praxis-extproc-at-merge-sha
+export EXTPROC_IMAGE_MODE=published EXPECTED_EXTPROC_SOURCE_SHA="$EXT_SOURCE_SHA"
+export EXPECTED_EXTPROC_PLATFORM=linux/amd64 EXTPROC_IMAGE="$EXT_IMAGE"
+LOCAL_ENV_CLUSTER="$CLUSTER" LOCAL_ENV_EVIDENCE_ROOT="$RUN_EVIDENCE/provision" test/kind-env/run.sh --provision
+LOCAL_ENV_CLUSTER="$CLUSTER" test/kind-env/e2e.sh
+LOCAL_ENV_CLUSTER="$CLUSTER" LOCAL_ENV_TRANSLATION_EVIDENCE="$RUN_EVIDENCE/translation" \
+PRAXIS_EXTPROC_IMAGE="$EXT_IMAGE" \
+PRAXIS_EXTPROC_IMAGE_MODE=published \
+PRAXIS_EXTPROC_SOURCE_SHA="$EXT_SOURCE_SHA" \
+PRAXIS_EXTPROC_PLATFORM=linux/amd64 \
+  python3 test/kind-env/e2e-api-translation.py --scope all
+```
+
+Use the same run evidence directory for provisioning and tests. The provisioner
+records `extproc-published-image-provenance.json` and per-tenant
+`extproc-runtime-digest-*.json`; the translation E2E independently records the
+requested reference, pulled image identity, source labels, and running Pod
+image IDs. Source mode remains the default for ordinary local development.
 
 The transition fixture uses a real `MaasTenantConfig` explicitly set to
 `ipp` and MaaS model
@@ -340,13 +558,13 @@ records only CA/certificate fingerprints and paths, never keys or credentials.
 Required source checkouts are supplied through environment variables:
 
 * `LLM_KATAN_REPO`
-* `PRAXIS_REPO`
+* `PRAXIS_AI_REPO` (optional local AI override; unset for published images)
 * `MAAS_CONTROLLER_REPO`
 * `KUADRANT_OPERATOR_REPO`
 * `PRAXIS_EXTPROC_REPO`
 
-Source selection and provenance are explicit. `PRAXIS_REPO` and
-`PRAXIS_EXTPROC_REPO` point at the checked-out integration sources; the
+Source selection and provenance are explicit. `PRAXIS_EXTPROC_REPO` points at
+the checked-out ExtProc source; optional `PRAXIS_AI_REPO` selects a local AI override; the
 expected revisions are recorded before each build. `MAAS_CONTROLLER_REPO`
 must point at the merged `main` branch for new runs (the harness verifies that
 the checkout is clean but does not enforce the branch name). `KUADRANT_OPERATOR_REPO`
@@ -354,6 +572,11 @@ is the pinned dependency checkout used for platform fixtures. `LLM_KATAN_REPO`
 is optional in the normal workflow because the default provider image is the
 public digest-pinned artifact; a source checkout is used only for explicit
 development builds.
+
+For source-built ExtProc qualification, the build helper replaces ExtProc's
+Praxis AI Git dependencies with the supplied `PRAXIS_AI_REPO` checkout.
+The runtime image therefore contains the exact recorded Praxis AI source, not
+the published tag artifact.
 
 When the selected MaaS controller revision predates the `MaasTenantConfig`
 `spec.apiTranslation` field, the translation qualification must supply

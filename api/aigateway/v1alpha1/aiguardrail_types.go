@@ -89,6 +89,7 @@ type AIGuardrailProvider struct {
 	// +kubebuilder:validation:Type=string
 	// +kubebuilder:validation:MaxLength=64
 	// +kubebuilder:validation:XValidation:rule="duration(self) > duration('0s')",message="timeout must be a valid positive duration"
+	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('1ms')",message="timeout must be at least 1ms"
 	Timeout metav1.Duration `json:"timeout"`
 }
 
@@ -148,7 +149,10 @@ type AIGuardrailStatus struct {
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
 	// ProviderEndpoint is the in-cluster base URL of the NeMo Guardrails
-	// server, read verbatim from NemoGuardrails.status.endpoint.
+	// server: the Service TrustyAI creates in
+	// NemoGuardrails.status.workloadNamespace, https when the NemoGuardrails
+	// enables auth and http otherwise. NemoGuardrails.status.endpoint is not
+	// read.
 	//
 	// It is published so a consumer compiles against the same endpoint this
 	// controller accepted, rather than re-deriving one from the provider's

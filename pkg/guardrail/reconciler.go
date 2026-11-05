@@ -260,6 +260,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			"TrustyAI's NemoGuardrails CRD is not installed on this cluster, so no guardrail provider can be resolved")
 	}
 
+	// A sub-millisecond timeout cannot be rendered. Praxis stores timeout_ms and
+	//  rejects zero, so accepting the policy would stall the post-auth rollout.
+	if ProviderTimeoutTooFine(guardrail.Spec.Provider.Timeout.Duration) {
+		log.Info("AIGuardrail timeout is below 1ms", "timeout", guardrail.Spec.Provider.Timeout.Duration)
+		return r.refuse(ctx, &guardrail, original, reasonTimeoutBelowMinimum,
+			"timeout must be at least 1ms; Praxis records provider timeouts in whole milliseconds and rejects zero")
+	}
+
 	// The same resolution the field index uses, so a provider event and this
 	// path can never disagree about which provider a policy is bound to.
 	provider := providerRef(&guardrail)
