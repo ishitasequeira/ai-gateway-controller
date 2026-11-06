@@ -254,6 +254,13 @@ func subscriptionModelRefKeys(subscription *unstructured.Unstructured) []types.N
 	return keys
 }
 
+// aiTenantGuardrails returns the baseline the owning AITenant carries, which
+// is the first attachment level and the one a narrower list cannot displace.
+// A config with no owning-AITenant annotations is not AITenant-managed and
+// has no baseline. An owner that is named but does not resolve is a baseline
+// this call cannot read, and reading no baseline is indistinguishable from
+// reading an empty one: it attaches every tenant policy rather than none, the
+// same way an unreadable guardrails entry does.
 func aiTenantGuardrails(ctx context.Context, reader client.Reader, mtc *unstructured.Unstructured, tenantNamespace string) ([]attachmentRef, error) {
 	name, namespace, ok := OwningAITenantRef(mtc)
 	if !ok {
@@ -262,13 +269,15 @@ func aiTenantGuardrails(ctx context.Context, reader client.Reader, mtc *unstruct
 	aitenant := NewAITenant()
 	err := reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, aitenant)
 	if apierrors.IsNotFound(err) {
-		return nil, nil
+		return []attachmentRef{unreadableRef}, fmt.Errorf("%w: owning AITenant %s/%s is gone", errMalformedAttachment, namespace, name)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("get AITenant %s/%s: %w", namespace, name, err)
 	}
 	if got, ok := ConfigNamespace(aitenant); !ok || got != tenantNamespace {
-		return nil, nil
+		return []attachmentRef{unreadableRef}, fmt.Errorf(
+			"%w: AITenant %s/%s status.tenantNamespace %q does not own the config in %q",
+			errMalformedAttachment, namespace, name, got, tenantNamespace)
 	}
 	return guardrailRefs(aitenant, "spec", "guardrails")
 }
