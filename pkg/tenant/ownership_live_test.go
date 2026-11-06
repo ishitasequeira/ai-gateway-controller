@@ -5,8 +5,12 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/go-logr/logr"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -32,6 +36,79 @@ func TestWaitForForeignOwnershipUsesLiveReads(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "another-controller") {
 		t.Fatalf("waitForForeignOwnership error = %v, want another-controller ownership error", err)
+	}
+}
+
+func TestOmitOptionalUnavailableResourcesDropsMissingServiceMonitor(t *testing.T) {
+	scheme := mtcSchemeForTests()
+	deploy := &unstructured.Unstructured{}
+	deploy.SetGroupVersionKind(gvkDeployment)
+	deploy.SetName("payload-processing-tenant")
+	deploy.SetNamespace("gateway-system")
+
+	monitor := &unstructured.Unstructured{}
+	monitor.SetGroupVersionKind(gvkServiceMonitor)
+	monitor.SetName("payload-processing-metrics-tenant")
+	monitor.SetNamespace("gateway-system")
+
+	liveClient := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(interceptor.Funcs{
+		Get: func(_ context.Context, _ client.WithWatch, key client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
+			if key.Name == monitor.GetName() {
+				return &apimeta.NoKindMatchError{
+					GroupKind:        gvkServiceMonitor.GroupKind(),
+					SearchedVersions: []string{gvkServiceMonitor.Version},
+				}
+			}
+			return apierrors.NewNotFound(schema.GroupResource{Resource: "deployments"}, key.Name)
+		},
+	}).Build()
+
+	r := &Reconciler{Client: liveClient, APIReader: liveClient}
+	out, err := r.omitOptionalUnavailableResources(context.Background(), logr.Discard(), []unstructured.Unstructured{*deploy, *monitor})
+	if err != nil {
+		t.Fatalf("omitOptionalUnavailableResources: %v", err)
+	}
+	if len(out) != 1 || out[0].GetKind() != "Deployment" {
+		t.Fatalf("got %#v, want only Deployment kept", out)
+	}
+}
+
+func TestWaitForForeignOwnershipIgnoresNoMatch(t *testing.T) {
+	scheme := mtcSchemeForTests()
+	monitor := &unstructured.Unstructured{}
+	monitor.SetGroupVersionKind(gvkServiceMonitor)
+	monitor.SetName("payload-processing-metrics-tenant")
+	monitor.SetNamespace("gateway-system")
+
+	liveClient := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(interceptor.Funcs{
+		Get: func(_ context.Context, _ client.WithWatch, _ client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
+			return &apimeta.NoKindMatchError{
+				GroupKind:        gvkServiceMonitor.GroupKind(),
+				SearchedVersions: []string{gvkServiceMonitor.Version},
+			}
+		},
+	}).Build()
+
+	r := &Reconciler{Client: liveClient, APIReader: liveClient}
+	if err := r.waitForForeignOwnership(context.Background(), []unstructured.Unstructured{*monitor}); err != nil {
+		t.Fatalf("waitForForeignOwnership: %v", err)
+	}
+}
+
+func TestDeleteResourceIfOwnedIgnoresNoMatch(t *testing.T) {
+	scheme := mtcSchemeForTests()
+	liveClient := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(interceptor.Funcs{
+		Get: func(_ context.Context, _ client.WithWatch, _ client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
+			return &apimeta.NoKindMatchError{
+				GroupKind:        gvkServiceMonitor.GroupKind(),
+				SearchedVersions: []string{gvkServiceMonitor.Version},
+			}
+		},
+	}).Build()
+
+	r := &Reconciler{Client: liveClient, APIReader: liveClient}
+	if err := r.deleteResourceIfOwned(context.Background(), gvkServiceMonitor, "payload-processing-metrics-tenant", "gateway-system"); err != nil {
+		t.Fatalf("deleteResourceIfOwned: %v", err)
 	}
 }
 

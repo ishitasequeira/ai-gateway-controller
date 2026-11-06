@@ -45,6 +45,10 @@ func deploymentFixture(name, appLabel, serviceAccountName, configMapName string)
 							"name":      "plugins-config-volume",
 							"configMap": map[string]any{"name": configMapName},
 						},
+						map[string]any{
+							"name":   "tls",
+							"secret": map[string]any{"secretName": name + "-tls"},
+						},
 					},
 				},
 			},
@@ -125,6 +129,9 @@ func TestRenameNonDefaultTenantPayloadProcessingDeployment(t *testing.T) {
 	if cmRef["name"] != "payload-processing-plugins-redteam" {
 		t.Fatalf("plugins ConfigMap volume ref = %q, want %q", cmRef["name"], "payload-processing-plugins-redteam")
 	}
+	if got := out[0].GetAnnotations()[reloaderSecretAnnotation]; got != PayloadProcessingTLSSecretName("redteam") {
+		t.Fatalf("reloader annotation = %q, want %q", got, PayloadProcessingTLSSecretName("redteam"))
+	}
 }
 
 func TestRenameNonDefaultTenantPreProcessingDeploymentSharesServiceAccount(t *testing.T) {
@@ -155,6 +162,9 @@ func TestRenameServiceAlwaysGetsTenantInstanceSelector(t *testing.T) {
 	selector, _, _ := unstructured.NestedStringMap(out[0].Object, "spec", "selector")
 	if selector["app"] != PayloadProcessingName || selector[LabelTenantInstance] != PayloadProcessingName {
 		t.Fatalf("selector = %v, want tenant-instance set even for the default tenant", selector)
+	}
+	if got := out[0].GetAnnotations()[servingCertSecretAnnotation]; got != PayloadProcessingTLSSecretName("") {
+		t.Fatalf("serving-cert annotation = %q, want %q (controller owns OpenShift annotation even when absent from base)", got, PayloadProcessingTLSSecretName(""))
 	}
 }
 
@@ -265,7 +275,7 @@ func TestRenameNetworkPolicyReplacesPodSelector(t *testing.T) {
 	}
 }
 
-func TestRenameClusterRoleBinding(t *testing.T) {
+func TestRenameLeavesReaderClusterRoleBindingUntouched(t *testing.T) {
 	in := []unstructured.Unstructured{{Object: map[string]any{
 		"apiVersion": "rbac.authorization.k8s.io/v1",
 		"kind":       "ClusterRoleBinding",
@@ -279,16 +289,45 @@ func TestRenameClusterRoleBinding(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Rename: %v", err)
 	}
-	if got := out[0].GetName(); got != "payload-processing-reader-redteam" {
-		t.Fatalf("name = %q, want %q", got, "payload-processing-reader-redteam")
+	if got := out[0].GetName(); got != PayloadProcessingReaderClusterRoleBindingName {
+		t.Fatalf("name = %q, want unchanged %q (reader bindings are dropped later, not renamed)", got, PayloadProcessingReaderClusterRoleBindingName)
 	}
 	subjects, _, _ := unstructured.NestedSlice(out[0].Object, "subjects")
 	subject0, ok := subjects[0].(map[string]any)
 	if !ok {
 		t.Fatalf("subjects[0] is %T, want map[string]any", subjects[0])
 	}
-	if subject0["name"] != "payload-processing-redteam" {
-		t.Fatalf("subjects[0].name = %v, want %q", subject0["name"], "payload-processing-redteam")
+	if subject0["name"] != PayloadProcessingName {
+		t.Fatalf("subjects[0].name = %v, want unchanged %q", subject0["name"], PayloadProcessingName)
+	}
+}
+
+func TestRenameRewritesMetricsAuthBinding(t *testing.T) {
+	in := []unstructured.Unstructured{{Object: map[string]any{
+		"apiVersion": "rbac.authorization.k8s.io/v1",
+		"kind":       "ClusterRoleBinding",
+		"metadata":   map[string]any{"name": PayloadProcessingMetricsAuthName},
+		"subjects": []any{
+			map[string]any{"kind": "ServiceAccount", "name": PayloadProcessingName, "namespace": "istio-system"},
+		},
+	}}}
+
+	out, err := Rename(in, "redteam", "istio-system")
+	if err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+	wantName := PayloadProcessingMetricsAuthClusterRoleBindingNameForTenant("redteam")
+	if got := out[0].GetName(); got != wantName {
+		t.Fatalf("name = %q, want %q", got, wantName)
+	}
+	subjects, _, _ := unstructured.NestedSlice(out[0].Object, "subjects")
+	subject0, ok := subjects[0].(map[string]any)
+	if !ok {
+		t.Fatalf("subjects[0] is %T, want map[string]any", subjects[0])
+	}
+	wantSA := PayloadProcessingServiceAccountName("redteam")
+	if subject0["name"] != wantSA {
+		t.Fatalf("subjects[0].name = %v, want %q", subject0["name"], wantSA)
 	}
 }
 
@@ -309,14 +348,18 @@ func TestRenameLeavesClusterRoleUnchanged(t *testing.T) {
 }
 
 func destinationRuleFixture(name string) unstructured.Unstructured {
+	fqdn := name + ".istio-system.svc.cluster.local"
 	return unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "networking.istio.io/v1",
 		"kind":       "DestinationRule",
 		"metadata":   map[string]any{"name": name},
 		"spec": map[string]any{
-			"host": name + ".istio-system.svc.cluster.local",
+			"host": fqdn,
 			"trafficPolicy": map[string]any{
-				"tls": map[string]any{"sni": name + ".istio-system.svc.cluster.local"},
+				"tls": map[string]any{
+					"sni":             fqdn,
+					"subjectAltNames": []any{fqdn},
+				},
 			},
 		},
 	}}
@@ -335,9 +378,13 @@ func TestRenameDestinationRulePayloadProcessing(t *testing.T) {
 	}
 	host, _, _ := unstructured.NestedString(out[0].Object, "spec", "host")
 	sni, _, _ := unstructured.NestedString(out[0].Object, "spec", "trafficPolicy", "tls", "sni")
+	sans, _, _ := unstructured.NestedStringSlice(out[0].Object, "spec", "trafficPolicy", "tls", "subjectAltNames")
 	wantFQDN := want + ".istio-system.svc.cluster.local"
 	if host != wantFQDN || sni != wantFQDN {
 		t.Fatalf("host/sni = %q/%q, want %q", host, sni, wantFQDN)
+	}
+	if len(sans) != 1 || sans[0] != wantFQDN {
+		t.Fatalf("subjectAltNames = %v, want [%q]", sans, wantFQDN)
 	}
 }
 
@@ -352,6 +399,11 @@ func TestRenameDestinationRulePreProcessing(t *testing.T) {
 	if got := out[0].GetName(); got != want {
 		t.Fatalf("name = %q, want %q", got, want)
 	}
+	wantFQDN := want + ".istio-system.svc.cluster.local"
+	sans, _, _ := unstructured.NestedStringSlice(out[0].Object, "spec", "trafficPolicy", "tls", "subjectAltNames")
+	if len(sans) != 1 || sans[0] != wantFQDN {
+		t.Fatalf("subjectAltNames = %v, want [%q]", sans, wantFQDN)
+	}
 }
 
 // clusterPatch builds one EnvoyFilter CLUSTER-applyTo configPatch entry for
@@ -365,7 +417,19 @@ func clusterPatch(clusterName, address string) map[string]any {
 			"value": map[string]any{
 				"name": clusterName,
 				"transport_socket": map[string]any{
-					"typed_config": map[string]any{"sni": address},
+					"typed_config": map[string]any{
+						"sni": address,
+						"common_tls_context": map[string]any{
+							"validation_context": map[string]any{
+								"match_typed_subject_alt_names": []any{
+									map[string]any{
+										"san_type": "DNS",
+										"matcher":  map[string]any{"exact": address},
+									},
+								},
+							},
+						},
+					},
 				},
 				"load_assignment": map[string]any{
 					"cluster_name": clusterName,
@@ -467,6 +531,17 @@ func assertClusterAddress(t *testing.T, value map[string]any, wantFQDN string) {
 	if err != nil || sni != wantFQDN {
 		t.Fatalf("sni = %q (err=%v), want %q", sni, err, wantFQDN)
 	}
+	sans, found, err := unstructured.NestedSlice(value,
+		"transport_socket", "typed_config", "common_tls_context", "validation_context",
+		"match_typed_subject_alt_names")
+	if err != nil || !found || len(sans) == 0 {
+		t.Fatalf("match_typed_subject_alt_names missing (err=%v found=%v)", err, found)
+	}
+	san0 := mustMap(t, sans[0])
+	matcher := mustMap(t, san0["matcher"])
+	if matcher["exact"] != wantFQDN {
+		t.Fatalf("san matcher.exact = %v, want %q", matcher["exact"], wantFQDN)
+	}
 
 	loadAssignment := mustMap(t, value["load_assignment"])
 	endpoints := mustSlice(t, loadAssignment["endpoints"])
@@ -478,6 +553,34 @@ func assertClusterAddress(t *testing.T, value map[string]any, wantFQDN string) {
 	socketAddress := mustMap(t, address["socket_address"])
 	if socketAddress["address"] != wantFQDN {
 		t.Fatalf("socket_address.address = %v, want %q", socketAddress["address"], wantFQDN)
+	}
+}
+
+func TestSetClusterUpstreamAddressRequiresSANMatchers(t *testing.T) {
+	t.Parallel()
+	value := map[string]any{
+		"transport_socket": map[string]any{
+			"typed_config": map[string]any{"sni": "old.example"},
+		},
+		"load_assignment": map[string]any{
+			"endpoints": []any{
+				map[string]any{
+					"lb_endpoints": []any{
+						map[string]any{
+							"endpoint": map[string]any{
+								"address": map[string]any{
+									"socket_address": map[string]any{"address": "old.example"},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	err := setClusterUpstreamAddress(value, "new.example")
+	if err == nil || !strings.Contains(err.Error(), "match_typed_subject_alt_names") {
+		t.Fatalf("error = %v, want fail-closed SAN matcher error", err)
 	}
 }
 

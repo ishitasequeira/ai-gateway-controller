@@ -10,7 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 PRAXIS_EXTPROC_REPO="https://github.com/opendatahub-io/praxis-extproc"
-PRAXIS_EXTPROC_COMMIT="46569788aedec0992ce5cf1ceb585ce6cee352c9"
+PRAXIS_EXTPROC_COMMIT="1632a345668940cb1cf415f8a1982c9723e02d9e"
 
 # The "odh" overlay references "../../base/..." paths that resolve relative to
 # deploy/, so we vendor deploy/base and deploy/overlays/odh together, preserving
@@ -93,5 +93,12 @@ normalize_extproc_cluster_role() {
 
 if [[ "${GET_MANIFESTS_TEST_ONLY:-false}" != true ]]; then
     fetch_praxis_extproc
-    normalize_extproc_cluster_role "${DST_ROOT}/overlays/odh/rbac/clusterrole.yaml"
+    # Upstream ODH no longer ships payload-processing-reader; keep the
+    # structural Secret-strip for older pins / accidental reintroduction.
+    cluster_role="${DST_ROOT}/overlays/odh/rbac/clusterrole.yaml"
+    if [[ -f "${cluster_role}" ]]; then
+        normalize_extproc_cluster_role "${cluster_role}"
+    else
+        echo "[praxis-extproc] no overlays/odh/rbac/clusterrole.yaml (already Secret-free upstream); skipping normalize"
+    fi
 fi

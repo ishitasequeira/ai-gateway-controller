@@ -25,11 +25,12 @@ import (
 )
 
 const extprocCredentialDir = "/etc/praxis/credentials" //nolint:gosec // fixed non-secret mount path
-const anthropicTranslationRequestMaxBytes = extprocMaxBodyBytes
-
-// Preserve the existing input allowance while bounding model-rewrite overhead separately.
-const anthropicTranslationAccumulationMaxBytes = extprocMaxBodyBytes + (64 << 10)
 const anthropicTranslationResponseMaxBytes = 1 << 20
+
+// anthropicTranslationAccumulationOverhead is extra headroom above the request
+// body budget so model-rewrite can retain the original request while emitting
+// the translated body under the same server max_body_bytes ceiling family.
+const anthropicTranslationAccumulationOverhead = 64 << 10
 
 type extprocCredential struct {
 	name      string
@@ -47,18 +48,12 @@ type extprocCredential struct {
 
 const extprocConfigHashAnnotation = "ai-gateway-controller.opendatahub.io/extproc-config-sha256"
 
-// extprocMaxBodyBytes bounds the request bodies Praxis buffers: the
-// translation-enabled ExternalModel server limit, the request JSON the
-// selected-provider translator retains, and the stream_usage_inject buffer.
-// The translator limit is also the selected-upstream request body limit, so a
-// smaller value rejects long-context requests to every provider with 413.
-const extprocMaxBodyBytes = 10485760
-
 // configureSharedExtProc renders the shared post-auth chain from the
 // authoritative MaasTenantConfig permission. The translation filters are
 // restricted to Anthropic Messages requests and do not change the dedicated
-// ExternalModel processor.
-func configureSharedExtProc(resources []unstructured.Unstructured, tenantID, gatewayNamespace string, apiTranslation bool) error {
+// ExternalModel processor. maxBodyBytes bounds stream_usage_inject buffering
+// (and related translation filters when enabled).
+func configureSharedExtProc(resources []unstructured.Unstructured, tenantID, gatewayNamespace string, apiTranslation bool, maxBodyBytes int64) error {
 	wantCM := PayloadProcessingPluginsConfigMapForTenant(tenantID)
 	wantDeploy := PayloadProcessingDeploymentName(tenantID)
 	var configMap *unstructured.Unstructured
@@ -88,7 +83,7 @@ func configureSharedExtProc(resources []unstructured.Unstructured, tenantID, gat
 	if !found {
 		return errors.New("shared ExtProc ConfigMap data is missing")
 	}
-	config := sharedExtProcConfig(apiTranslation)
+	config := sharedExtProcConfig(apiTranslation, maxBodyBytes)
 	data["extproc.yaml"] = config
 	if err := unstructured.SetNestedStringMap(configMap.Object, data, "data"); err != nil {
 		return fmt.Errorf("write shared ExtProc ConfigMap data: %w", err)
@@ -179,17 +174,24 @@ func configureSharedExtProcResponseMode(resources []unstructured.Unstructured, t
 // unchanged.
 //
 // apiTranslation enables the Anthropic Messages translation filters.
+// maxBodyBytes bounds stream_usage_inject (and related translation buffers).
 //
 // Returns the deterministic Praxis YAML configuration for the shared ipp
 // processor.
-func sharedExtProcConfig(apiTranslation bool) string {
+func sharedExtProcConfig(apiTranslation bool, maxBodyBytes int64) string {
 	var b strings.Builder
 	b.WriteString("server:\n")
 	b.WriteString("  grpc_address: \"0.0.0.0:9004\"\n")
 	b.WriteString("  health_address: \"0.0.0.0:50052\"\n")
 	b.WriteString("  metrics_address: \"0.0.0.0:9090\"\n")
+	// Bound every buffered body at the server, matching the vendored ODH
+	// ConfigMap. Do not set insecure_options.allow_unbounded_body: after
+	// RHOAIENG-102139 that flag leaves streamed bodies uncapped.
+	fmt.Fprintf(&b, "  max_body_bytes: %d\n", maxBodyBytes)
 	b.WriteString("  tls:\n")
-	b.WriteString("    mode: self_signed\n\n")
+	b.WriteString("    mode: provided\n")
+	b.WriteString("    cert_path: /etc/tls/private/tls.crt\n")
+	b.WriteString("    key_path: /etc/tls/private/tls.key\n\n")
 	b.WriteString("filter_chains:\n")
 	b.WriteString("  - name: ipp\n")
 	b.WriteString("    filters:\n")
@@ -212,7 +214,7 @@ func sharedExtProcConfig(apiTranslation bool) string {
 		fmt.Fprintf(&b, "          - %s\n", header)
 	}
 	b.WriteString("      - filter: request_id\n")
-	writeStreamUsageInject(&b)
+	writeStreamUsageInject(&b, maxBodyBytes)
 	if apiTranslation {
 		b.WriteString("      - filter: anthropic_messages_request\n")
 		b.WriteString("        on_invalid: reject\n")
@@ -225,7 +227,7 @@ func sharedExtProcConfig(apiTranslation bool) string {
 		b.WriteString("          - when:\n")
 		b.WriteString("              path: \"/v1/messages\"\n")
 		b.WriteString("      - filter: anthropic_messages_to_chat_completions_stream\n")
-		b.WriteString("        max_partial_event_bytes: 10485760\n")
+		fmt.Fprintf(&b, "        max_partial_event_bytes: %d\n", maxBodyBytes)
 		b.WriteString("        max_tool_blocks: 10000\n")
 		b.WriteString("        conditions:\n")
 		b.WriteString("          - when:\n")
@@ -248,16 +250,14 @@ func sharedExtProcConfig(apiTranslation bool) string {
 		b.WriteString("          - when:\n")
 		b.WriteString("              path: \"/v1/messages\"\n")
 	}
-	b.WriteString("\ninsecure_options:\n")
-	b.WriteString("  allow_unbounded_body: true\n")
 	return b.String()
 }
 
 // writeStreamUsageInject renders the stream_usage_inject filter. It needs the
 // complete request body, which both chains receive in BUFFERED mode.
-func writeStreamUsageInject(b *strings.Builder) {
+func writeStreamUsageInject(b *strings.Builder, maxBodyBytes int64) {
 	b.WriteString("      - filter: stream_usage_inject\n")
-	fmt.Fprintf(b, "        max_body_bytes: %d\n", extprocMaxBodyBytes)
+	fmt.Fprintf(b, "        max_body_bytes: %d\n", maxBodyBytes)
 }
 
 // configureExternalModelExtProc completes the dedicated ExternalModel ExtProc
@@ -265,12 +265,12 @@ func writeStreamUsageInject(b *strings.Builder) {
 // MaaS/KServe post-auth workload is intentionally not modified. Secret values
 // are never read: kubelet projects the referenced Secret into this workload and
 // credential_inject reads the mounted file at request time.
-func configureExternalModelExtProc(resources []unstructured.Unstructured, tenantID, namespace string, candidates []envelope.Candidate, apiTranslationEnabled bool) error {
+func configureExternalModelExtProc(resources []unstructured.Unstructured, tenantID, namespace string, candidates []envelope.Candidate, apiTranslationEnabled bool, maxBodyBytes int64) error {
 	credentials, err := extprocCredentials(namespace, candidates)
 	if err != nil {
 		return err
 	}
-	config := extprocPostAuthConfig(candidates, credentials, apiTranslationEnabled)
+	config := extprocPostAuthConfig(candidates, credentials, apiTranslationEnabled, maxBodyBytes)
 
 	var configMap *unstructured.Unstructured
 	var deployment *unstructured.Unstructured
@@ -396,9 +396,10 @@ func ExternalModelRuntimeCandidates(routes *resolver.ResolvedRouteSet, apiTransl
 }
 
 // ExternalModelExtProcConfigHash returns the rollout hash for a candidate set
-// using the same translation setting as the rendered ExternalModel config.
-func ExternalModelExtProcConfigHash(namespace string, candidates []envelope.Candidate, apiTranslationEnabled bool) (string, error) {
-	_, configHash, err := ExternalModelExtProcConfig(namespace, candidates, apiTranslationEnabled)
+// using the same translation setting and body budget as the rendered
+// ExternalModel config.
+func ExternalModelExtProcConfigHash(namespace string, candidates []envelope.Candidate, apiTranslationEnabled bool, maxBodyBytes int64) (string, error) {
+	_, configHash, err := ExternalModelExtProcConfig(namespace, candidates, apiTranslationEnabled, maxBodyBytes)
 	if err != nil {
 		return "", err
 	}
@@ -406,13 +407,13 @@ func ExternalModelExtProcConfigHash(namespace string, candidates []envelope.Cand
 }
 
 // ExternalModelExtProcConfig returns the exact ExtProc YAML for the supplied
-// candidate set and translation setting.
-func ExternalModelExtProcConfig(namespace string, candidates []envelope.Candidate, apiTranslationEnabled bool) (string, string, error) {
+// candidate set, translation setting, and body budget.
+func ExternalModelExtProcConfig(namespace string, candidates []envelope.Candidate, apiTranslationEnabled bool, maxBodyBytes int64) (string, string, error) {
 	credentials, err := extprocCredentials(namespace, candidates)
 	if err != nil {
 		return "", "", err
 	}
-	config := extprocPostAuthConfig(candidates, credentials, apiTranslationEnabled)
+	config := extprocPostAuthConfig(candidates, credentials, apiTranslationEnabled, maxBodyBytes)
 	digest := sha256.Sum256([]byte(config))
 	return config, hex.EncodeToString(digest[:]), nil
 }
@@ -513,7 +514,7 @@ func extprocCredentials(namespace string, candidates []envelope.Candidate) ([]ex
 	return credentials, nil
 }
 
-func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extprocCredential, apiTranslationEnabled bool) string {
+func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extprocCredential, apiTranslationEnabled bool, maxBodyBytes int64) string {
 	clusterSet := make(map[string]bool, len(candidates))
 	for _, candidate := range candidates {
 		clusterSet[candidate.Cluster] = true
@@ -526,13 +527,15 @@ func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extpro
 	var b strings.Builder
 	b.WriteString("server:\n  grpc_address: \"0.0.0.0:9004\"\n  health_address: \"0.0.0.0:50052\"\n")
 	b.WriteString("  metrics_address: \"0.0.0.0:9090\"\n")
-	// Bound buffered translation work only when the tenant opts in. With
-	// translation disabled, omit the translation and provider-profile filters
-	// and retain main's unbounded-body setting.
+	// Always bound at the server (ODH 10 MiB default / tenant annotation).
+	// Translation keeps a small overhead above the request budget for
+	// model-rewrite copies. Never emit allow_unbounded_body (RHOAIENG-102139).
+	serverBody := maxBodyBytes
 	if apiTranslationEnabled {
-		fmt.Fprintf(&b, "  max_body_bytes: %d\n", anthropicTranslationAccumulationMaxBytes)
+		serverBody = maxBodyBytes + anthropicTranslationAccumulationOverhead
 	}
-	b.WriteString("  tls:\n    mode: self_signed\n\n")
+	fmt.Fprintf(&b, "  max_body_bytes: %d\n", serverBody)
+	b.WriteString("  tls:\n    mode: provided\n    cert_path: /etc/tls/private/tls.crt\n    key_path: /etc/tls/private/tls.key\n\n")
 	// headers must stay first: it strips caller credentials and internal MaaS
 	// identity headers before intelligent_route / credential_inject run, so
 	// credential_inject's injected provider credential is never clobbered by
@@ -553,13 +556,13 @@ func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extpro
 	b.WriteString("]\n        reload: {enabled: true, debounce_ms: 500}\n")
 	// Streamed requests to every provider report usage, so token rate
 	// limits count them. The Anthropic translator maps include_usage.
-	writeStreamUsageInject(&b)
+	writeStreamUsageInject(&b, maxBodyBytes)
 	if apiTranslationEnabled {
 		b.WriteString("      - filter: openai_chat_completions_to_anthropic_stream\n")
 		b.WriteString("        max_partial_event_bytes: 1048576\n        max_tool_blocks: 256\n")
 		b.WriteString("      - filter: openai_chat_completions_to_anthropic\n")
 		b.WriteString("        api_translation_enabled: true\n")
-		fmt.Fprintf(&b, "        max_request_body_bytes: %d\n", anthropicTranslationRequestMaxBytes)
+		fmt.Fprintf(&b, "        max_request_body_bytes: %d\n", maxBodyBytes)
 		fmt.Fprintf(&b, "        max_response_body_bytes: %d\n", anthropicTranslationResponseMaxBytes)
 	}
 	if len(credentials) > 0 {
@@ -577,9 +580,6 @@ func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extpro
 			}
 			fmt.Fprintf(&b, "            file: %s\n", credential.file)
 		}
-	}
-	if !apiTranslationEnabled {
-		b.WriteString("\ninsecure_options:\n  allow_unbounded_body: true\n")
 	}
 	return b.String()
 }
