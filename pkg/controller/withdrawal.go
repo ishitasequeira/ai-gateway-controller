@@ -1035,7 +1035,15 @@ func runtimeConfigHash(ctx context.Context, r *Reconciler, models []*v1alpha1.Ex
 			candidates = append(candidates, candidate)
 		}
 	}
-	hash, err := tenant.ExternalModelExtProcConfigHash(namespace, candidates, apiTranslationEnabled)
+	maxBodyBytes := tenant.DefaultExtProcMaxBodyBytes
+	mtc := &unstructured.Unstructured{}
+	mtc.SetGroupVersionKind(tenant.MaasTenantConfigGVK)
+	if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: tenant.MaasTenantConfigInstanceName}, mtc); err == nil {
+		maxBodyBytes = tenant.ExtProcMaxBodyBytesFor(mtc)
+	} else if !apierrors.IsNotFound(err) {
+		return "", fmt.Errorf("get MaasTenantConfig for ExtProc body budget: %w", err)
+	}
+	hash, err := tenant.ExternalModelExtProcConfigHash(namespace, candidates, apiTranslationEnabled, maxBodyBytes)
 	if err != nil {
 		return "", fmt.Errorf("compute current ExternalModel ExtProc config hash: %w", err)
 	}

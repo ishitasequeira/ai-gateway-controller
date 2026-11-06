@@ -13,6 +13,7 @@ package tenant
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
@@ -50,6 +51,9 @@ func SplitPostAuthResources(resources []unstructured.Unstructured, tenantID, gat
 				if err := setServiceSelector(external, map[string]string{"app": PayloadProcessingExternalModelName, LabelTenantInstance: PayloadProcessingExternalModelDeploymentName(tenantID)}); err != nil {
 					return nil, fmt.Errorf("external-model Service selector: %w", err)
 				}
+				if err := setServingCertSecretName(external, PayloadProcessingExternalModelTLSSecretName(tenantID)); err != nil {
+					return nil, fmt.Errorf("external-model serving-cert: %w", err)
+				}
 				out = append(out, *external)
 			case u.GetKind() == "DestinationRule" && u.GetName() == PayloadProcessingServiceName(tenantID):
 				out = append(out, *u)
@@ -70,9 +74,11 @@ func SplitPostAuthResources(resources []unstructured.Unstructured, tenantID, gat
 					return nil, err
 				}
 				out = append(out, *u)
-			case u.GetKind() == "ClusterRoleBinding" && u.GetName() == PayloadProcessingReaderClusterRoleBindingNameForTenant(tenantID):
-				// Keep only the pre-auth binding. The post-auth account has no
-				// Kubernetes API permissions and must not inherit MaaS's reader role.
+			case u.GetKind() == "ClusterRoleBinding":
+				if isLegacyReaderClusterRoleBinding(u.GetName()) {
+					// Drop leftover reader bindings; ExtProc must not hold secrets get.
+					continue
+				}
 				out = append(out, *u)
 			default:
 				out = append(out, *u)
@@ -99,6 +105,9 @@ func SplitPostAuthResources(resources []unstructured.Unstructured, tenantID, gat
 			external.SetName(PayloadProcessingExternalModelServiceName(tenantID))
 			if err := setServiceSelector(external, map[string]string{"app": PayloadProcessingExternalModelName, LabelTenantInstance: PayloadProcessingExternalModelDeploymentName(tenantID)}); err != nil {
 				return nil, fmt.Errorf("external-model Service selector: %w", err)
+			}
+			if err := setServingCertSecretName(external, PayloadProcessingExternalModelTLSSecretName(tenantID)); err != nil {
+				return nil, fmt.Errorf("external-model serving-cert: %w", err)
 			}
 			out = append(out, *external)
 		case u.GetKind() == "DestinationRule" && u.GetName() == PayloadProcessingServiceName(tenantID):
@@ -138,17 +147,24 @@ func SplitPostAuthResources(resources []unstructured.Unstructured, tenantID, gat
 				return nil, fmt.Errorf("external-model EnvoyFilter: %w", err)
 			}
 			out = append(out, *u)
-		case u.GetKind() == "ClusterRoleBinding" && u.GetName() == PayloadProcessingReaderClusterRoleBindingNameForTenant(tenantID):
+		case u.GetKind() == "ClusterRoleBinding":
+			if isLegacyReaderClusterRoleBinding(u.GetName()) {
+				// Drop leftover reader bindings; ExtProc must not hold secrets get.
+				continue
+			}
 			out = append(out, *u)
-			// Do not bind the tenant-local ExternalModel ExtProc to the shared
-			// MaaS reader ClusterRole. MaaS installations may grant that role
-			// Secret access for the IPP workload. The ExternalModel workload has
-			// no Kubernetes API contract and must remain unable to read Secrets.
 		default:
 			out = append(out, *u)
 		}
 	}
 	return out, nil
+}
+
+// isLegacyReaderClusterRoleBinding reports whether name is a leftover
+// payload-processing-reader binding (possibly tenant-suffixed / -post).
+// Metrics-auth / metrics-reader bindings must be kept.
+func isLegacyReaderClusterRoleBinding(name string) bool {
+	return strings.HasPrefix(name, PayloadProcessingReaderClusterRoleBindingName)
 }
 
 // RemoveExternalModelResources removes the credential-bearing, tenant-local
@@ -215,6 +231,13 @@ func configureExternalModelDeployment(u *unstructured.Unstructured, tenantID str
 	}
 	if err := setConfigMapVolumeName(u, "plugins-config-volume", PayloadProcessingExternalModelPluginsConfigMapForTenant(tenantID)); err != nil {
 		return fmt.Errorf("ExternalModel ConfigMap volume: %w", err)
+	}
+	tlsSecret := PayloadProcessingExternalModelTLSSecretName(tenantID)
+	if err := setTLSSecretVolumeName(u, "tls", tlsSecret); err != nil {
+		return fmt.Errorf("ExternalModel TLS secret volume: %w", err)
+	}
+	if err := setReloaderSecretName(u, tlsSecret); err != nil {
+		return fmt.Errorf("ExternalModel reloader annotation: %w", err)
 	}
 	volumes, _, err := unstructured.NestedSlice(u.Object, "spec", "template", "spec", "volumes")
 	if err != nil {

@@ -210,6 +210,25 @@ func TestSplitPostAuthResourcesUsesResolvedTenantNamespace(t *testing.T) {
 			t.Fatal("post-auth ExtProc must not bind the shared MaaS reader ClusterRole")
 		}
 	}
+	metricsAuth := false
+	metricsReader := false
+	for _, resource := range resources {
+		if resource.GetKind() != "ClusterRoleBinding" {
+			continue
+		}
+		switch resource.GetName() {
+		case PayloadProcessingMetricsAuthClusterRoleBindingNameForTenant("tenant-a"):
+			metricsAuth = true
+		case PayloadProcessingMetricsReaderName:
+			metricsReader = true
+		case PayloadProcessingReaderClusterRoleBindingNameForTenant("tenant-a"),
+			PayloadProcessingReaderClusterRoleBindingPostNameForTenant("tenant-a"):
+			t.Fatalf("reader ClusterRoleBinding %q must be dropped", resource.GetName())
+		}
+	}
+	if !metricsAuth || !metricsReader {
+		t.Fatalf("metrics ClusterRoleBindings missing: auth=%t reader=%t", metricsAuth, metricsReader)
+	}
 }
 
 func TestRemoveExternalModelResourcesLeavesSharedKServeResources(t *testing.T) {

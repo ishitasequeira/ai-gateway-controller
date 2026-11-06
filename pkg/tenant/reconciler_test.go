@@ -1111,12 +1111,12 @@ func TestReconcileAppliesAndRequeuesResyncIntervalForNonDefaultTenant(t *testing
 	assertContains(t, names, "payload-processing-redteam")
 	assertContains(t, names, "payload-pre-processing-redteam")
 	assertContains(t, names, "payload-processing-plugins-redteam")
-	assertContains(t, names, "payload-processing-reader-redteam")
-	// The shared ClusterRole must NOT be tenant-suffixed.
-	assertContains(t, names, "payload-processing-reader")
 	for _, n := range names {
 		if n == "payload-processing" || n == "payload-pre-processing" {
 			t.Fatalf("found unsuffixed resource name %q while reconciling a non-default tenant", n)
+		}
+		if strings.Contains(n, "payload-processing-reader") {
+			t.Fatalf("ExtProc must not apply reader ClusterRole/Binding %q", n)
 		}
 	}
 }
@@ -1138,7 +1138,11 @@ func TestReconcileAppliesUnsuffixedNamesForDefaultTenant(t *testing.T) {
 	assertContains(t, names, "payload-processing")
 	assertContains(t, names, "payload-pre-processing")
 	assertContains(t, names, "payload-processing-plugins")
-	assertContains(t, names, "payload-processing-reader")
+	for _, n := range names {
+		if strings.Contains(n, "payload-processing-reader") {
+			t.Fatalf("ExtProc must not apply reader ClusterRole/Binding %q", n)
+		}
+	}
 	for _, kind := range rec.kindSnapshot() {
 		if kind == "HorizontalPodAutoscaler" {
 			t.Fatal("unexpected HPA apply when autoscaling is not configured")
@@ -1275,6 +1279,9 @@ func expectedCleanupNames(tenantID string) []string {
 		PayloadProcessingNetworkPolicyName(tenantID),
 		PayloadProcessingEnvoyFilterName(tenantID),
 		PayloadProcessingReaderClusterRoleBindingNameForTenant(tenantID),
+		PayloadProcessingMetricsAuthClusterRoleBindingNameForTenant(tenantID),
+		PayloadProcessingMetricsServiceNameForTenant(tenantID),
+		PayloadProcessingMetricsMonitorNameForTenant(tenantID),
 		PayloadProcessingHPAName(tenantID),
 		PayloadPreProcessingHPAName(tenantID),
 	}
@@ -1304,6 +1311,9 @@ func seedPraxisOwnedForCleanup(tenantID, namespace string) []client.Object {
 		mk(gvkDestinationRule, PayloadProcessingServiceName(tenantID), namespace),
 		mk(gvkDestinationRule, PayloadPreProcessingServiceName(tenantID), namespace),
 		mk(gvkClusterRoleBinding, PayloadProcessingReaderClusterRoleBindingNameForTenant(tenantID), ""),
+		mk(gvkClusterRoleBinding, PayloadProcessingMetricsAuthClusterRoleBindingNameForTenant(tenantID), ""),
+		mk(gvkService, PayloadProcessingMetricsServiceNameForTenant(tenantID), namespace),
+		mk(gvkServiceMonitor, PayloadProcessingMetricsMonitorNameForTenant(tenantID), namespace),
 		mk(gvkHPA, PayloadProcessingHPAName(tenantID), namespace),
 		mk(gvkHPA, PayloadPreProcessingHPAName(tenantID), namespace),
 	}

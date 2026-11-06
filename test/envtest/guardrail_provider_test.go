@@ -76,6 +76,45 @@ func nemoGuardrailsCRD() *apiextensionsv1.CustomResourceDefinition {
 	}
 }
 
+// siblingCRDName is a second kind in TrustyAI's group.
+const siblingCRDName = "trustyaiservices.trustyai.opendatahub.io"
+
+// trustyAIServiceCRD stands in for the other kinds TrustyAI ships alongside
+// NemoGuardrails, in the same group and version.
+//
+// Nothing reads it. It exists so a scenario can remove the NemoGuardrails CRD
+// and leave trustyai.opendatahub.io/v1alpha1 still served, which is what
+// uninstalling that one CRD looks like on a real cluster. With only the one
+// CRD in the group, deleting it takes the whole group/version with it, and the
+// controller's discovery check never has to find the Kind missing from a path
+// that still answers.
+func trustyAIServiceCRD() *apiextensionsv1.CustomResourceDefinition {
+	return &apiextensionsv1.CustomResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: siblingCRDName},
+		Spec: apiextensionsv1.CustomResourceDefinitionSpec{
+			Group: guardrail.NemoGuardrailsGVK.Group,
+			Scope: apiextensionsv1.NamespaceScoped,
+			Names: apiextensionsv1.CustomResourceDefinitionNames{
+				Plural:   "trustyaiservices",
+				Singular: "trustyaiservice",
+				Kind:     "TrustyAIService",
+				ListKind: "TrustyAIServiceList",
+			},
+			Versions: []apiextensionsv1.CustomResourceDefinitionVersion{{
+				Name:    guardrail.NemoGuardrailsGVK.Version,
+				Served:  true,
+				Storage: true,
+				Schema: &apiextensionsv1.CustomResourceValidation{
+					OpenAPIV3Schema: &apiextensionsv1.JSONSchemaProps{
+						Type:                   "object",
+						XPreserveUnknownFields: ptr.To(true),
+					},
+				},
+			}},
+		},
+	}
+}
+
 // providerOption edits a provider before it is created.
 type providerOption func(*unstructured.Unstructured)
 

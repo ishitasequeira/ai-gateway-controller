@@ -417,11 +417,11 @@ func TestRuntimeConfigHashPreservesScopedAnthropicHeaderWithNoHomeRoutes(t *test
 	}
 	complete := cloneCandidate(scoped)
 	complete.Credential.Header = "x-api-key"
-	wantHash, err := tenant.ExternalModelExtProcConfigHash(home.Namespace, []envelope.Candidate{complete}, true)
+	wantHash, err := tenant.ExternalModelExtProcConfigHash(home.Namespace, []envelope.Candidate{complete}, true, tenant.DefaultExtProcMaxBodyBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
-	withoutHeader, err := tenant.ExternalModelExtProcConfigHash(home.Namespace, []envelope.Candidate{scoped}, true)
+	withoutHeader, err := tenant.ExternalModelExtProcConfigHash(home.Namespace, []envelope.Candidate{scoped}, true, tenant.DefaultExtProcMaxBodyBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1249,7 +1249,7 @@ func seedSafeExternalModelRuntime(t *testing.T, r *Reconciler, tenantID, namespa
 			candidates = append(candidates, candidate)
 		}
 	}
-	config, configHash, err := tenant.ExternalModelExtProcConfig(namespace, candidates, apiTranslationEnabled)
+	config, configHash, err := tenant.ExternalModelExtProcConfig(namespace, candidates, apiTranslationEnabled, tenant.DefaultExtProcMaxBodyBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1316,7 +1316,7 @@ func markSafeExternalModelRuntimeCurrent(t *testing.T, r *Reconciler, tenantID, 
 	if err != nil {
 		t.Fatal(err)
 	}
-	config, hash, err := tenant.ExternalModelExtProcConfig(namespace, candidates, apiTranslationEnabled)
+	config, hash, err := tenant.ExternalModelExtProcConfig(namespace, candidates, apiTranslationEnabled, tenant.DefaultExtProcMaxBodyBytes)
 	if err != nil {
 		t.Fatalf("render serving ExtProc config from reduced overlay: %v", err)
 	}
@@ -1402,7 +1402,7 @@ func (r *Reconciler) deploymentHashForTest(t *testing.T, model *v1alpha1.Externa
 	if err != nil {
 		t.Fatal(err)
 	}
-	hash, err := tenant.ExternalModelExtProcConfigHash(model.Namespace, candidates, false)
+	hash, err := tenant.ExternalModelExtProcConfigHash(model.Namespace, candidates, false, tenant.DefaultExtProcMaxBodyBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1611,7 +1611,7 @@ func TestDeletingHomeBindingRetainsRuntimeProfileThroughDrain(t *testing.T) {
 				if err != nil || len(candidates) != 2 {
 					t.Fatalf("retained runtime candidates=%#v err=%v", candidates, err)
 				}
-				config, hash, err := tenant.ExternalModelExtProcConfig(model.Namespace, candidates, false)
+				config, hash, err := tenant.ExternalModelExtProcConfig(model.Namespace, candidates, false, tenant.DefaultExtProcMaxBodyBytes)
 				if err != nil || hash != beforeHash || !strings.Contains(config, "provider-provider") || !strings.Contains(config, "credentials") {
 					t.Fatalf("retained runtime hash=%s want=%s err=%v", hash, beforeHash, err)
 				}
