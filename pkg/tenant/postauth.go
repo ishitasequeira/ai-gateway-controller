@@ -18,7 +18,9 @@ package tenant
 
 import (
 	"context"
+	"fmt"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
@@ -30,8 +32,9 @@ import (
 type PostAuthFilterSource struct {
 	Object    client.Object
 	Predicate predicate.Predicate
-	// Tenants returns the tenant namespaces whose answer obj can change.
-	Tenants func(ctx context.Context, reader client.Reader, obj client.Object) []string
+	// Tenants returns the tenant namespaces whose answer obj can change. On
+	// error the namespaces already found are returned with it.
+	Tenants func(ctx context.Context, reader client.Reader, obj client.Object) ([]string, error)
 }
 
 // PostAuthFilterSources lists the resources a route reconciler must watch to
@@ -41,7 +44,7 @@ func PostAuthFilterSources() []PostAuthFilterSource {
 	return []PostAuthFilterSource{
 		{Object: &aigatewayv1alpha1.AIGuardrail{}, Predicate: nemoCalloutChanged(), Tenants: ownNamespace},
 		{Object: newMaaSSubscription(), Predicate: predicate.GenerationChangedPredicate{}, Tenants: ownNamespace},
-		{Object: newMaaSModelRef(), Predicate: predicate.GenerationChangedPredicate{}, Tenants: modelRefTenants},
+		{Object: newMaaSModelRef(), Predicate: predicate.GenerationChangedPredicate{}, Tenants: ModelRefTenants},
 	}
 }
 
@@ -52,25 +55,40 @@ func HasPostAuthFilters(ctx context.Context, reader client.Reader, tenantNamespa
 	return hasNemoCallouts(ctx, reader, tenantNamespace)
 }
 
-func ownNamespace(_ context.Context, _ client.Reader, obj client.Object) []string {
+func ownNamespace(_ context.Context, _ client.Reader, obj client.Object) ([]string, error) {
 	if obj.GetNamespace() == "" {
-		return nil
+		return nil, nil
 	}
-	return []string{obj.GetNamespace()}
+	return []string{obj.GetNamespace()}, nil
 }
 
-// modelRefTenants is the model ref's own namespace plus each namespace whose
-// subscriptions point at it.
-func modelRefTenants(ctx context.Context, reader client.Reader, obj client.Object) []string {
-	namespaces := ownNamespace(ctx, reader, obj)
-	naming, err := subscriptionNamespacesNaming(ctx, reader, obj.GetNamespace(), obj.GetName())
-	if err != nil {
-		return namespaces
-	}
-	for _, namespace := range naming {
-		if namespace != obj.GetNamespace() {
+// ModelRefTenants returns, once each, the tenant namespaces a MaaSModelRef
+// change can affect: its own namespace unless that namespace has no
+// MaasTenantConfig, and each namespace whose subscriptions point at it. A
+// model ref stored alongside the model, outside any tenant, reaches tenants
+// only through their subscriptions.
+func ModelRefTenants(ctx context.Context, reader client.Reader, obj client.Object) ([]string, error) {
+	key := client.ObjectKeyFromObject(obj)
+	seen := map[string]bool{}
+	var namespaces []string
+	add := func(namespace string) {
+		if namespace != "" && !seen[namespace] {
+			seen[namespace] = true
 			namespaces = append(namespaces, namespace)
 		}
 	}
-	return namespaces
+	if key.Namespace != "" {
+		err := reader.Get(ctx, client.ObjectKey{Namespace: key.Namespace, Name: MaasTenantConfigInstanceName}, NewMaasTenantConfig())
+		if !apierrors.IsNotFound(err) {
+			add(key.Namespace)
+		}
+	}
+	naming, err := subscriptionNamespacesNaming(ctx, reader, key.Namespace, key.Name)
+	if err != nil {
+		return namespaces, fmt.Errorf("list MaaSSubscriptions naming MaaSModelRef %s: %w", key, err)
+	}
+	for _, namespace := range naming {
+		add(namespace)
+	}
+	return namespaces, nil
 }

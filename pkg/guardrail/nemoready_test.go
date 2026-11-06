@@ -22,13 +22,22 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
-// nemoEndpoint is the Service URL of the standard fixture with auth on, the
-// form TrustyAI's controllers/nemo_guardrails/status.go formats.
-const nemoEndpoint = "https://" + nemoName + "." + providerNS + ".svc.cluster.local"
+// testInfraNS is the ODH AI Gateway infrastructure namespace, where the
+// fixtures' NeMo workloads run.
+const testInfraNS = "odh-ai-gateway-infra"
+
+// nemoServiceHost is the Service TrustyAI creates in testInfraNS for the
+// standard fixture, and nemoEndpoint its authenticated URL as
+// controllers/nemo_guardrails/status.go formats it.
+const (
+	nemoServiceHost = providerNS + "-" + nemoName + "." + testInfraNS + ".svc.cluster.local"
+	nemoEndpoint    = "https://" + nemoServiceHost
+)
 
 // TestEvaluateNemoReadyGatesOnTheDiscoveredEndpoint covers discovery:
-// status.workloadNamespace is the only status input, the auth annotation picks
-// the scheme, and everything else the CR reports is irrelevant to the verdict.
+// status.workloadNamespace is the only status input, it must be an AI Gateway
+// infrastructure namespace, the auth annotation picks the scheme, and
+// everything else the CR reports is irrelevant to the verdict.
 //
 // The two cases worth reading carefully are the crossed ones. A provider with
 // phase Ready and a True DeploymentReady condition but no workload namespace
@@ -77,46 +86,55 @@ func TestEvaluateNemoReadyGatesOnTheDiscoveredEndpoint(t *testing.T) {
 		},
 		{
 			name:         "auth on",
-			provider:     provider(auth, map[string]any{"workloadNamespace": providerNS, "phase": "Ready"}),
+			provider:     provider(auth, map[string]any{"workloadNamespace": testInfraNS, "phase": "Ready"}),
 			wantReady:    true,
 			wantEndpoint: nemoEndpoint,
 		},
 		{
 			// utils.RequiresAuth lowercases the value.
 			name:         "auth on, mixed case",
-			provider:     provider(map[string]string{nemoAuthAnnotation: "True"}, map[string]any{"workloadNamespace": providerNS}),
-			wantReady:    true,
-			wantEndpoint: nemoEndpoint,
-		},
-		{
-			// The inverse crossed case. TrustyAI publishes the workload
-			// namespace from its not-ready path too, so discovery succeeding
-			// while the server is still coming up is a state that genuinely
-			// occurs.
-			name:         "workload namespace published with no phase and a False DeploymentReady",
-			provider:     provider(auth, map[string]any{"workloadNamespace": providerNS, "conditions": []any{map[string]any{"type": "DeploymentReady", "status": "False"}}}),
+			provider:     provider(map[string]string{nemoAuthAnnotation: "True"}, map[string]any{"workloadNamespace": testInfraNS}),
 			wantReady:    true,
 			wantEndpoint: nemoEndpoint,
 		},
 		{
 			name:         "auth annotation absent",
-			provider:     provider(nil, map[string]any{"workloadNamespace": providerNS}),
+			provider:     provider(nil, map[string]any{"workloadNamespace": testInfraNS}),
 			wantReady:    true,
-			wantEndpoint: "http://" + nemoName + "." + providerNS + ".svc.cluster.local",
+			wantEndpoint: "http://" + nemoServiceHost,
 		},
 		{
 			name:         "auth annotation false",
-			provider:     provider(map[string]string{nemoAuthAnnotation: "false"}, map[string]any{"workloadNamespace": providerNS}),
+			provider:     provider(map[string]string{nemoAuthAnnotation: "false"}, map[string]any{"workloadNamespace": testInfraNS}),
 			wantReady:    true,
-			wantEndpoint: "http://" + nemoName + "." + providerNS + ".svc.cluster.local",
+			wantEndpoint: "http://" + nemoServiceHost,
 		},
 		{
-			// Outside its own namespace TrustyAI names the Service
-			// <custom-resource namespace>-<custom-resource name>.
-			name:         "workload in another namespace",
-			provider:     provider(auth, map[string]any{"workloadNamespace": "nemo-workloads"}),
+			name:         "workload in the RHOAI infrastructure namespace",
+			provider:     provider(auth, map[string]any{"workloadNamespace": "redhat-ai-gateway-infra"}),
 			wantReady:    true,
-			wantEndpoint: "https://" + providerNS + "-" + nemoName + ".nemo-workloads.svc.cluster.local",
+			wantEndpoint: "https://" + providerNS + "-" + nemoName + ".redhat-ai-gateway-infra.svc.cluster.local",
+		},
+		{
+			// TrustyAI names the Service for the bare custom resource name
+			// only when the custom resource is in the workload namespace.
+			name: "custom resource in the infrastructure namespace",
+			provider: func() *unstructured.Unstructured {
+				u := provider(auth, map[string]any{"workloadNamespace": testInfraNS})
+				u.SetNamespace(testInfraNS)
+				return u
+			}(),
+			wantReady:    true,
+			wantEndpoint: "https://" + nemoName + "." + testInfraNS + ".svc.cluster.local",
+		},
+		{
+			// The tenant compiler would open egress and write RBAC for it.
+			name:     "workload in the custom resource namespace",
+			provider: provider(auth, map[string]any{"workloadNamespace": providerNS}),
+		},
+		{
+			name:     "workload outside the infrastructure namespaces",
+			provider: provider(auth, map[string]any{"workloadNamespace": "kube-system"}),
 		},
 	}
 	for _, c := range cases {

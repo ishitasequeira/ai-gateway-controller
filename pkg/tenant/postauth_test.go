@@ -21,9 +21,11 @@ import (
 	"slices"
 	"testing"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 // TestModelRefEventsReachEverySubscribingTenant pins that a MaaSModelRef change
@@ -40,8 +42,12 @@ func TestModelRefEventsReachEverySubscribingTenant(t *testing.T) {
 		return u
 	}
 	granite := map[string]any{"name": "granite", "namespace": "models"}
+	modelsTenant := NewMaasTenantConfig()
+	modelsTenant.SetName(MaasTenantConfigInstanceName)
+	modelsTenant.SetNamespace("models")
 	reader := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(
 		model,
+		modelsTenant,
 		subscription("tenant-a", "team", granite),
 		subscription("tenant-b", "first", granite),
 		subscription("tenant-b", "second", map[string]any{"name": "other", "namespace": "models"}, granite),
@@ -53,19 +59,49 @@ func TestModelRefEventsReachEverySubscribingTenant(t *testing.T) {
 		subscription("tenant-d", "unrelated", map[string]any{"name": "other", "namespace": "models"}),
 	).Build()
 
-	var tenants func(context.Context, client.Reader, client.Object) []string
-	for _, src := range PostAuthFilterSources() {
-		if u, ok := src.Object.(*unstructured.Unstructured); ok && u.GroupVersionKind() == MaaSModelRefGVK {
-			tenants = src.Tenants
-		}
+	got, err := modelRefSource(t).Tenants(context.Background(), reader, model)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if tenants == nil {
-		t.Fatal("PostAuthFilterSources has no MaaSModelRef source")
-	}
-
-	got := tenants(context.Background(), reader, model)
 	slices.Sort(got)
 	if want := []string{"models", "tenant-a", "tenant-b"}; !slices.Equal(got, want) {
 		t.Fatalf("tenants = %v, want %v", got, want)
 	}
+}
+
+// TestModelRefTenantsReportsASubscriptionListFailure pins that a failed
+// subscription list is returned, so the caller reports it rather than
+// silently missing the subscribing tenants.
+func TestModelRefTenantsReportsASubscriptionListFailure(t *testing.T) {
+	mtc := NewMaasTenantConfig()
+	mtc.SetName(MaasTenantConfigInstanceName)
+	mtc.SetNamespace("tenant-a")
+	reader := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(mtc).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
+				return apierrors.NewServiceUnavailable("etcd is unavailable")
+			},
+		}).Build()
+
+	modelRef := newMaaSModelRef()
+	modelRef.SetNamespace("tenant-a")
+	modelRef.SetName("granite")
+	got, err := modelRefSource(t).Tenants(context.Background(), reader, modelRef)
+	if !apierrors.IsServiceUnavailable(err) {
+		t.Fatalf("err = %v, want the list failure", err)
+	}
+	if want := []string{"tenant-a"}; !slices.Equal(got, want) {
+		t.Fatalf("tenants = %v, want %v kept alongside the error", got, want)
+	}
+}
+
+func modelRefSource(t *testing.T) PostAuthFilterSource {
+	t.Helper()
+	for _, src := range PostAuthFilterSources() {
+		if u, ok := src.Object.(*unstructured.Unstructured); ok && u.GroupVersionKind() == MaaSModelRefGVK {
+			return src
+		}
+	}
+	t.Fatal("PostAuthFilterSources has no MaaSModelRef source")
+	return PostAuthFilterSource{}
 }

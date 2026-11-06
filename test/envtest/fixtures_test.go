@@ -23,7 +23,6 @@ import (
 	aigatewayv1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/aigateway/v1alpha1"
 	inferencev1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/envelope"
-	"github.com/opendatahub-io/ai-gateway-controller/pkg/guardrail"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/publisher"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/tenant"
 )
@@ -191,24 +190,16 @@ func awaitGuardrailEnforced(t *testing.T, c client.Client, namespace string) *un
 	subscription.SetNamespace(namespace)
 	require.NoError(t, c.Create(t.Context(), subscription))
 
+	// The provider the policy names. It sits in namespace because that is what
+	// the default allowedConsumers rule authorizes, and its workload runs in
+	// infraNamespace, the MaasTenantConfig's status.infraNamespace, which is the
+	// only place the tenant compiler calls NeMo. The controller owns the
+	// binding, so a hand-written accepted status is replaced by its own verdict.
+	createReadyProvider(t, c, nemoProvider(namespace, "guardrails", "safety", []string{"base-rails"}))
+
 	policy := aiGuardrail("safety", namespace)
 	require.NoError(t, c.Create(t.Context(), policy))
-	require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(policy), policy))
-	// The tenant compiler calls NeMo only in the MaasTenantConfig's
-	// status.infraNamespace, which these fixtures set to namespace.
-	policy.Status = aigatewayv1alpha1.AIGuardrailStatus{
-		BindingRevision:  "rev",
-		ProviderEndpoint: "http://guardrails." + namespace + ".svc",
-		Conditions: []metav1.Condition{{
-			Type:               guardrail.ConditionAccepted,
-			Status:             metav1.ConditionTrue,
-			Reason:             "Accepted",
-			Message:            "provider binding accepted",
-			ObservedGeneration: policy.Generation,
-			LastTransitionTime: metav1.Now(),
-		}},
-	}
-	require.NoError(t, c.Status().Update(t.Context(), policy))
+	awaitAcceptedReason(t, c, policy, reasonPolicyAccepted)
 
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
 		var config corev1.ConfigMap

@@ -17,10 +17,10 @@ limitations under the License.
 package guardrail
 
 import (
+	"fmt"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 // nemoReadiness is what reading a NemoGuardrails provider's status answers:
@@ -72,19 +72,33 @@ type nemoReadiness struct {
 // status.endpoint is not read. It is another controller's free-form URL, and
 // the tenant compiler opens egress and writes RBAC for whatever Service the
 // endpoint names, so the Service is derived instead, the way TrustyAI creates
-// it: in status.workloadNamespace, named for the custom resource in its own
-// namespace and <cr-namespace>-<cr-name> elsewhere, behind kube-rbac-proxy on
-// https when the custom resource carries nemoAuthAnnotation and plain http
-// otherwise.
+// it: NemoServiceFor status.workloadNamespace, which must be one of
+// NemoInfraNamespaces, behind kube-rbac-proxy on https when the custom
+// resource carries nemoAuthAnnotation and plain http otherwise.
 func evaluateNemoReady(nemo *unstructured.Unstructured) nemoReadiness {
-	service, ok := nemoService(nemo)
-	if !ok {
+	refuse := func(message string) nemoReadiness {
 		return nemoReadiness{
-			Reason: reasonEndpointDiscoveryUnavailable,
-			Message: "the referenced NemoGuardrails provider publishes no valid status.workloadNamespace, " +
-				"so no supported checks endpoint could be discovered",
+			Reason:  reasonEndpointDiscoveryUnavailable,
+			Message: message + ", so no supported checks endpoint could be discovered",
 		}
 	}
+	if nemo == nil {
+		return refuse("the referenced NemoGuardrails provider publishes no status.workloadNamespace")
+	}
+	workloadNamespace, _, _ := unstructured.NestedString(nemo.Object, "status", "workloadNamespace")
+	if workloadNamespace == "" {
+		return refuse("the referenced NemoGuardrails provider publishes no status.workloadNamespace")
+	}
+	if !IsNemoInfraNamespace(workloadNamespace) {
+		return refuse(fmt.Sprintf("the referenced NemoGuardrails provider runs its workload in namespace %q, "+
+			"not an AI Gateway infrastructure namespace %v", workloadNamespace, NemoInfraNamespaces))
+	}
+	service, err := NemoServiceFor(workloadNamespace, nemo.GetNamespace(), nemo.GetName())
+	if err != nil {
+		return refuse(fmt.Sprintf("the referenced NemoGuardrails provider's Service cannot be derived (%v)", err))
+	}
+	service.Authenticated = strings.EqualFold(nemo.GetAnnotations()[nemoAuthAnnotation], "true")
+
 	message := "referenced NemoGuardrails provider is reachable through its in-cluster http Service; " +
 		"this confirms discovery, not that the server is serving"
 	if service.Authenticated {
@@ -103,34 +117,3 @@ func evaluateNemoReady(nemo *unstructured.Unstructured) nemoReadiness {
 // (constants.AuthAnnotationKey). Set to "true" in any case, the server is
 // fronted by kube-rbac-proxy.
 const nemoAuthAnnotation = "security.opendatahub.io/enable-auth"
-
-// nemoService returns the server's in-cluster Service once
-// status.workloadNamespace is published.
-func nemoService(nemo *unstructured.Unstructured) (NemoService, bool) {
-	if nemo == nil {
-		return NemoService{}, false
-	}
-	workloadNamespace, _, err := unstructured.NestedString(nemo.Object, "status", "workloadNamespace")
-	name := nemo.GetName()
-	namespace := nemo.GetNamespace()
-	if err != nil || workloadNamespace == "" || name == "" || namespace == "" {
-		return NemoService{}, false
-	}
-	if errs := validation.IsDNS1123Label(workloadNamespace); len(errs) > 0 {
-		return NemoService{}, false
-	}
-	// TrustyAI's Service metadata.name. A custom resource name with a dot, or a
-	// join past 63 characters, is not a Service name, so discovery is refused.
-	service := NemoService{
-		Namespace:     workloadNamespace,
-		Name:          name,
-		Authenticated: strings.EqualFold(nemo.GetAnnotations()[nemoAuthAnnotation], "true"),
-	}
-	if workloadNamespace != namespace {
-		service.Name = namespace + "-" + name
-	}
-	if errs := validation.IsDNS1123Label(service.Name); len(errs) > 0 {
-		return NemoService{}, false
-	}
-	return service, true
-}
