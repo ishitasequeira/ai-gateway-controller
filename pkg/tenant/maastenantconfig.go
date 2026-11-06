@@ -17,10 +17,13 @@ limitations under the License.
 package tenant
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // NewMaasTenantConfig returns an empty unstructured object with the
@@ -79,6 +82,26 @@ func APITranslationEnabled(mtc *unstructured.Unstructured) (bool, error) {
 		return false, fmt.Errorf("spec.apiTranslation.enabled must be a boolean, got %T", enabled)
 	}
 	return flag, nil
+}
+
+// OutputChecksUnsupported returns why the tenant configured in namespace
+// cannot enforce Output-phase guardrail checks, or "" if it can. With API
+// translation enabled the shared post-auth ExtProc streams responses, and the
+// shipped Praxis image skips response checks in that mode.
+func OutputChecksUnsupported(ctx context.Context, reader client.Reader, namespace string) (string, error) {
+	mtc := NewMaasTenantConfig()
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: MaasTenantConfigInstanceName}, mtc); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("get MaasTenantConfig %s/%s: %w", namespace, MaasTenantConfigInstanceName, err)
+	}
+	translated, err := APITranslationEnabled(mtc)
+	if err != nil || !translated {
+		return "", err
+	}
+	return "API translation is enabled for this tenant, so its ExtProc streams responses, which the current " +
+		"Praxis release does not check; use Input-phase checks only, or disable API translation", nil
 }
 
 // IdentifierFor derives the per-tenant resource-naming identifier from

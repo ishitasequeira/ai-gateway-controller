@@ -18,6 +18,7 @@ package main
 
 import (
 	"cmp"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -234,6 +235,10 @@ func main() {
 		ResyncInterval: resyncInterval,
 		Log:            ctrl.Log.WithName("aiguardrail"),
 		Recorder:       mgr.GetEventRecorder("aiguardrail"),
+		OutputChecksUnsupported: func(ctx context.Context, namespace string) (string, error) {
+			return tenant.OutputChecksUnsupported(ctx, mgr.GetAPIReader(), namespace)
+		},
+		TenantConfig: tenant.NewMaasTenantConfig(),
 	}
 	if err := guardrailReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to set up AIGuardrail reconciler")

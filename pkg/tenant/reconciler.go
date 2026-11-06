@@ -293,32 +293,16 @@ func (r *Reconciler) maasTenantConfigForNamespace(_ context.Context, obj client.
 // A model ref in the tenant namespace updates that tenant. One stored with the model
 // updates each tenant whose subscription points at it, not a tenant config in the model namespace.
 func (r *Reconciler) enqueueMaasTenantConfigForModelRef(ctx context.Context, obj client.Object) []reconcile.Request {
-	seen := map[string]bool{}
-	var requests []reconcile.Request
-	add := func(namespace string) {
-		if namespace == "" || seen[namespace] {
-			return
-		}
-		seen[namespace] = true
+	namespaces, err := ModelRefTenants(ctx, r.Client, obj)
+	if err != nil {
+		r.Log.Error(err, "resolve tenants for MaaSModelRef watch; subscribing tenants were not enqueued")
+	}
+	requests := make([]reconcile.Request, 0, len(namespaces))
+	for _, namespace := range namespaces {
 		requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{
 			Namespace: namespace,
 			Name:      MaasTenantConfigInstanceName,
 		}})
-	}
-	if obj.GetNamespace() != "" {
-		mtc := NewMaasTenantConfig()
-		err := r.Client.Get(ctx, client.ObjectKey{Namespace: obj.GetNamespace(), Name: MaasTenantConfigInstanceName}, mtc)
-		if err == nil || !apierrors.IsNotFound(err) {
-			add(obj.GetNamespace())
-		}
-	}
-	naming, err := subscriptionNamespacesNaming(ctx, r.Client, obj.GetNamespace(), obj.GetName())
-	if err != nil {
-		r.Log.Error(err, "list MaaSSubscriptions for MaaSModelRef watch")
-		return requests
-	}
-	for _, namespace := range naming {
-		add(namespace)
 	}
 	return requests
 }
@@ -431,14 +415,16 @@ func (r *Reconciler) gatewayExists(ctx context.Context, namespace, name string) 
 // it must requeue.
 //
 // It returns false (transient ⇒ requeue, not an error) when, read live, the
-// AITenant: is gone; has a different metadata.uid than wantUID; no longer binds
+// AITenant: is gone; has a different metadata.uid than wantUID; has a
+// different metadata.generation than wantGeneration; no longer binds
 // this MaasTenantConfig (status.tenantNamespace); no longer publishes the same
 // status.gatewayRef this reconcile rendered against; or has a non-zero
 // deletionTimestamp (delete already in flight). An empty wantUID disables the
-// check, so a live object always carries a UID and only tests can opt out.
+// check, so a live object always carries a UID and only tests can opt out;
+// a zero wantGeneration opts out of the generation check the same way.
 // This guards the apply path only: delete/cleanup must run regardless of
 // identity (see resolveOwnedAITenant).
-func (r *Reconciler) aiTenantStillValidForApply(ctx context.Context, mtc *unstructured.Unstructured, wantUID types.UID, wantGatewayName, wantGatewayNamespace string) (bool, error) {
+func (r *Reconciler) aiTenantStillValidForApply(ctx context.Context, mtc *unstructured.Unstructured, wantUID types.UID, wantGeneration int64, wantGatewayName, wantGatewayNamespace string) (bool, error) {
 	if wantUID == "" {
 		return true, nil
 	}
@@ -466,6 +452,15 @@ func (r *Reconciler) aiTenantStillValidForApply(ctx context.Context, mtc *unstru
 	}
 	// Identity: the same object, not a delete+recreate that reused the name.
 	if aitenant.GetUID() != wantUID {
+		return false, nil
+	}
+	// The same spec. DeployReady below rejects a status that is behind the
+	// spec, but it passes once maas re-stamps the condition at the newer
+	// generation -- and by then the resolved copy this reconcile rendered
+	// from is the stale one. spec.guardrails is read on that copy, so a
+	// generation that moved means the check tree about to be written is not
+	// the one the live spec asks for.
+	if wantGeneration != 0 && aitenant.GetGeneration() != wantGeneration {
 		return false, nil
 	}
 	// Ownership bind still holds live (anti-spoof): re-checked because the
@@ -635,7 +630,7 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		labels[managedByLabel] = render.FieldOwner
 		resources[i].SetLabels(labels)
 	}
-	callouts, err := acceptedNemoCallouts(ctx, r.Client, tenantNamespace)
+	callouts, err := acceptedNemoCallouts(ctx, r.Client, tenantNamespace, apiTranslation)
 	if errors.Is(err, errStaleBinding) {
 		log.Info("guardrail status is behind its spec; keeping the checks already published", "error", err)
 		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
@@ -676,7 +671,7 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 	// resolved copy, so if the live object no longer matches on identity,
 	// ownership, readiness, generation, or gateway, it must not be applied
 	// (RHAI-2514 apply-path fence). Transient ⇒ requeue.
-	if valid, err := r.aiTenantStillValidForApply(ctx, mtc, aitenant.GetUID(), gatewayName, gatewayNamespace); err != nil {
+	if valid, err := r.aiTenantStillValidForApply(ctx, mtc, aitenant.GetUID(), aitenant.GetGeneration(), gatewayName, gatewayNamespace); err != nil {
 		return ctrl.Result{}, err
 	} else if !valid {
 		log.Info("owning AITenant changed (uid, ownership, readiness, generation, or gatewayRef) before praxis-extproc apply; will re-resolve")

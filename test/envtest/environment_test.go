@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -61,6 +62,10 @@ func startEnvironment(t *testing.T, setupControllers func(ctrl.Manager)) client.
 			filepath.Join(repoRoot, "config/crd/bases"),
 		},
 		ErrorIfCRDPathMissing: true,
+		// Installed before the manager starts, because the guardrail
+		// reconciler only registers its provider watch when the CRD already
+		// resolves.
+		CRDs: []*apiextensionsv1.CustomResourceDefinition{nemoGuardrailsCRD()},
 	}
 	apiServer := environment.ControlPlane.GetAPIServer().Configure()
 	apiServer.Set("authorization-mode", "RBAC")
@@ -74,6 +79,9 @@ func startEnvironment(t *testing.T, setupControllers func(ctrl.Manager)) client.
 		clientgoscheme.AddToScheme,
 		inferencev1alpha1.AddToScheme,
 		aigatewayv1alpha1.AddToScheme,
+		// So a scenario can remove and reinstall the provider CRD and watch
+		// the controller recover.
+		apiextensionsv1.AddToScheme,
 	)
 	require.NoError(t, schemeBuilder.AddToScheme(scheme))
 	admin, err := client.New(config, client.Options{Scheme: scheme})
