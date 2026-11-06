@@ -116,6 +116,11 @@ const reasonPolicyAccepted = "PolicyAccepted"
 // and rejects zero, so rendering the duration would stall the post-auth rollout.
 const reasonTimeoutBelowMinimum = "TimeoutBelowMinimum"
 
+// reasonOutputChecksUnsupported refuses a policy with Output-phase checks in a
+// tenant whose ExtProc cannot run them, so it is not accepted while its
+// response checks are skipped.
+const reasonOutputChecksUnsupported = "OutputChecksUnsupported"
+
 // providerIndexKey indexes each AIGuardrail by the NemoGuardrails it
 // references, formatted as "<namespace>/<name>".
 //

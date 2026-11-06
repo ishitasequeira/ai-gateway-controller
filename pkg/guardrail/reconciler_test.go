@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -107,7 +108,7 @@ func newNemo(namespace, name string, namespacesPolicy map[string]any) *unstructu
 	// something other than readiness reaches the verdict it is written for.
 	// withoutNemoEndpoint takes it back off.
 	u.SetAnnotations(map[string]string{nemoAuthAnnotation: "true"})
-	if err := unstructured.SetNestedField(u.Object, namespace, "status", "workloadNamespace"); err != nil {
+	if err := unstructured.SetNestedField(u.Object, testInfraNS, "status", "workloadNamespace"); err != nil {
 		panic(err)
 	}
 	return withNemoConfigs(u, guardrailConfig)
@@ -635,7 +636,7 @@ func TestReconcileRepublishesTheBindingRevisionWhenDependenciesMove(t *testing.T
 			mutate: func(t *testing.T, f *fixture) {
 				t.Helper()
 				mutateLiveProvider(t, f, func(u *unstructured.Unstructured) {
-					if err := unstructured.SetNestedField(u.Object, "relocated", "status", "workloadNamespace"); err != nil {
+					if err := unstructured.SetNestedField(u.Object, "redhat-ai-gateway-infra", "status", "workloadNamespace"); err != nil {
 						t.Fatalf("set status.workloadNamespace: %v", err)
 					}
 				})
@@ -804,6 +805,83 @@ func TestReconcileRefusesSubMillisecondTimeout(t *testing.T) {
 	requireCondition(t, got, ConditionAccepted, metav1.ConditionTrue, reasonPolicyAccepted)
 	if got.Status.ProviderEndpoint == "" {
 		t.Fatal("1ms timeout was refused")
+	}
+}
+
+// TestReconcileRefusesOutputChecksTheTenantCannotEnforce pins that a policy
+// with an Output check is refused where the tenant cannot run response
+// checks, rather than accepted while they are skipped, and that Input-only
+// policies and tenants that can run them are unaffected.
+func TestReconcileRefusesOutputChecksTheTenantCannotEnforce(t *testing.T) {
+	for _, c := range []struct {
+		name        string
+		phases      []aigatewayv1alpha1.GuardrailPhase
+		unsupported bool
+		wantReason  string
+	}{
+		{"output check, tenant cannot enforce it", []aigatewayv1alpha1.GuardrailPhase{aigatewayv1alpha1.GuardrailPhaseInput, aigatewayv1alpha1.GuardrailPhaseOutput}, true, reasonOutputChecksUnsupported},
+		{"input check, tenant cannot enforce output", []aigatewayv1alpha1.GuardrailPhase{aigatewayv1alpha1.GuardrailPhaseInput}, true, reasonPolicyAccepted},
+		{"output check, tenant can enforce it", []aigatewayv1alpha1.GuardrailPhase{aigatewayv1alpha1.GuardrailPhaseOutput}, false, reasonPolicyAccepted},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			guardrail := newGuardrail(consumerNS, nemoName, providerNS)
+			guardrail.Spec.Checks[0].Phases = c.phases
+			f := newStandardFixture(guardrail, newNemo(providerNS, nemoName, map[string]any{"from": "All"}))
+			var asked []string
+			f.reconciler.OutputChecksUnsupported = func(_ context.Context, namespace string) (string, error) {
+				asked = append(asked, namespace)
+				if c.unsupported {
+					return "the tenant streams responses", nil
+				}
+				return "", nil
+			}
+
+			f.reconcile(t, consumerNS)
+			got := f.reload(t, consumerNS)
+			if c.wantReason == reasonPolicyAccepted {
+				requireCondition(t, got, ConditionAccepted, metav1.ConditionTrue, reasonPolicyAccepted)
+				return
+			}
+			requireCondition(t, got, ConditionAccepted, metav1.ConditionFalse, c.wantReason)
+			if message := apimeta.FindStatusCondition(got.Status.Conditions, ConditionAccepted).Message; !strings.Contains(message, "the tenant streams responses") {
+				t.Fatalf("Accepted message %q does not carry the tenant's reason", message)
+			}
+			if got.Status.BindingRevision != "" || got.Status.ProviderEndpoint != "" {
+				t.Fatalf("revision %q endpoint %q, want both empty on a refusal", got.Status.BindingRevision, got.Status.ProviderEndpoint)
+			}
+			if len(asked) != 1 || asked[0] != consumerNS {
+				t.Fatalf("asked about %v, want the policy's own namespace %q", asked, consumerNS)
+			}
+		})
+	}
+}
+
+// TestReconcileKeepsTheVerdictWhenTheTenantReadFails pins that a failed
+// tenant read backs off instead of publishing a verdict.
+func TestReconcileKeepsTheVerdictWhenTheTenantReadFails(t *testing.T) {
+	guardrail := newGuardrail(consumerNS, nemoName, providerNS)
+	guardrail.Spec.Checks[0].Phases = []aigatewayv1alpha1.GuardrailPhase{aigatewayv1alpha1.GuardrailPhaseOutput}
+	f := newStandardFixture(guardrail, newNemo(providerNS, nemoName, map[string]any{"from": "All"}))
+	f.reconciler.OutputChecksUnsupported = func(context.Context, string) (string, error) {
+		return "", errors.New("etcd is unavailable")
+	}
+	if _, err := f.reconciler.Reconcile(context.Background(), guardrailRequest(consumerNS)); err == nil {
+		t.Fatal("Reconcile succeeded on a failed tenant read")
+	}
+	if got := f.reload(t, consumerNS); apimeta.FindStatusCondition(got.Status.Conditions, ConditionAccepted) != nil {
+		t.Fatalf("published %v on a failed tenant read", got.Status.Conditions)
+	}
+}
+
+func TestGuardrailsBesideTenantConfigEnqueuesItsNamespace(t *testing.T) {
+	here := newGuardrail(consumerNS, nemoName, "")
+	elsewhere := newGuardrail(providerNS, nemoName, "")
+	f := newFixture(fixtureOptions{cacheObjects: []client.Object{here, elsewhere}})
+	config := &unstructured.Unstructured{}
+	config.SetNamespace(consumerNS)
+	got := f.reconciler.guardrailsBesideTenantConfig(context.Background(), config)
+	if want := []ctrl.Request{guardrailRequest(consumerNS)}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("enqueued %v, want %v", got, want)
 	}
 }
 

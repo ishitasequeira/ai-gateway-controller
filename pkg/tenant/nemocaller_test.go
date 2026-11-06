@@ -81,11 +81,11 @@ func TestConfigureNemoCalloutsCompilesAcceptedEndpoint(t *testing.T) {
 	resources := nemoCalloutFixtures("red", "gw")
 	callouts := []nemoCallout{
 		{name: "zeta", endpoint: "http://zeta.other.svc", serviceNamespace: "other", checks: []nemoCheck{{configID: "zeta-v1", header: "h-zeta", response: true}}},
-		{name: "alpha", endpoint: "http://nemo.infra.svc.cluster.local", serviceNamespace: "infra", timeout: 5 * time.Second, checks: []nemoCheck{
+		{name: "alpha", endpoint: "http://tenant-a-nemo.odh-ai-gateway-infra.svc.cluster.local", serviceNamespace: "odh-ai-gateway-infra", timeout: 5 * time.Second, checks: []nemoCheck{
 			{configID: "pii-v1", header: "h-pii", request: true},
 			{configID: "jailbreak-v1", header: "h-jailbreak", request: true},
 		}},
-		{name: "beta", endpoint: "http://nemo.infra.svc.cluster.local/v1/checks", serviceNamespace: "infra", checks: []nemoCheck{
+		{name: "beta", endpoint: "http://tenant-a-nemo.odh-ai-gateway-infra.svc.cluster.local/v1/checks", serviceNamespace: "odh-ai-gateway-infra", checks: []nemoCheck{
 			{configID: "toxicity-v1", header: "h-toxicity", request: true, response: true},
 		}},
 	}
@@ -108,7 +108,7 @@ func TestConfigureNemoCalloutsCompilesAcceptedEndpoint(t *testing.T) {
 	if first, _ := filters[0].(map[string]any); first["filter"] != "request_id" {
 		t.Fatalf("request_id is no longer the first filter:\n%s", config)
 	}
-	const infra = "http://nemo.infra.svc.cluster.local/v1/checks"
+	const infra = "http://tenant-a-nemo.odh-ai-gateway-infra.svc.cluster.local/v1/checks"
 	type compiledCheck struct {
 		configID, endpoint, header string
 		request, response          bool
@@ -194,7 +194,7 @@ func TestConfigureNemoCalloutsCompilesAcceptedEndpoint(t *testing.T) {
 		}
 		namespaces = append(namespaces, labels["kubernetes.io/metadata.name"])
 	}
-	if len(namespaces) != 2 || namespaces[0] != "infra" || namespaces[1] != "other" {
+	if len(namespaces) != 2 || namespaces[0] != "odh-ai-gateway-infra" || namespaces[1] != "other" {
 		t.Fatalf("NeMo egress namespaces = %v, want [infra other]", namespaces)
 	}
 
@@ -212,7 +212,7 @@ func TestConfigureNemoCalloutsCompilesAcceptedEndpoint(t *testing.T) {
 func TestConfigureNemoCalloutsWithoutNetworkPolicy(t *testing.T) {
 	resources := nemoCalloutFixtures("red", "gw")
 	resources = append(resources[:2], resources[3])
-	callouts := []nemoCallout{{name: "safety", endpoint: "http://nemo.infra.svc", serviceNamespace: "infra", checks: []nemoCheck{{configID: "pii-v1", request: true}}}}
+	callouts := []nemoCallout{{name: "safety", endpoint: "http://tenant-a-nemo.odh-ai-gateway-infra.svc", serviceNamespace: "odh-ai-gateway-infra", checks: []nemoCheck{{configID: "pii-v1", request: true}}}}
 	if _, err := configureNemoCallouts(resources, "red", "gw", "red", callouts); err != nil {
 		t.Fatalf("configureNemoCallouts without a NetworkPolicy: %v", err)
 	}
@@ -240,7 +240,7 @@ func TestClosedCheckRejectsItsSelection(t *testing.T) {
 func TestNemoEgressUsesServicePodSelector(t *testing.T) {
 	resources := nemoCalloutFixtures("red", "gw")
 	callouts := []nemoCallout{{
-		name: "safety", endpoint: "http://nemo.infra.svc", serviceNamespace: "infra",
+		name: "safety", endpoint: "http://tenant-a-nemo.odh-ai-gateway-infra.svc", serviceNamespace: "odh-ai-gateway-infra",
 		podLabels: map[string]string{"app": "nemo"},
 		checks:    []nemoCheck{{configID: "pii-v1", header: "h", request: true}},
 	}}
@@ -260,7 +260,7 @@ func TestNemoEgressUsesServicePodSelector(t *testing.T) {
 		t.Fatalf("pod selector = %v, err = %v, want app=nemo", labels, err)
 	}
 	ns, _, _ := unstructured.NestedStringMap(peer, "namespaceSelector", "matchLabels")
-	if ns["kubernetes.io/metadata.name"] != "infra" {
+	if ns["kubernetes.io/metadata.name"] != "odh-ai-gateway-infra" {
 		t.Fatalf("namespace selector = %v, want infra", ns)
 	}
 }
@@ -271,13 +271,13 @@ func TestBindNemoPodSelectorsCopiesServiceSelector(t *testing.T) {
 		t.Fatal(err)
 	}
 	svc := &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{Name: "nemo", Namespace: "infra"},
+		ObjectMeta: metav1.ObjectMeta{Name: "nemo", Namespace: "odh-ai-gateway-infra"},
 		Spec:       corev1.ServiceSpec{Selector: map[string]string{"app": "nemo"}},
 	}
 	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(svc).Build()
 	callouts := []nemoCallout{
-		{serviceName: "nemo", serviceNamespace: "infra"},
-		{serviceName: "missing", serviceNamespace: "infra"},
+		{serviceName: "nemo", serviceNamespace: "odh-ai-gateway-infra"},
+		{serviceName: "missing", serviceNamespace: "odh-ai-gateway-infra"},
 	}
 	bindNemoPodSelectors(context.Background(), reader, callouts)
 	if callouts[0].podLabels["app"] != "nemo" {
@@ -300,13 +300,34 @@ func TestAcceptedNemoCalloutsUsesCrossNamespaceServiceName(t *testing.T) {
 }
 
 func TestAcceptedNemoCalloutsAcceptsHTTPSEndpoint(t *testing.T) {
-	policy := acceptedPolicy("safety", 3, 3, "https://nemo.infra.svc.cluster.local")
+	policy := acceptedPolicy("safety", 3, 3, "https://tenant-a-nemo.odh-ai-gateway-infra.svc.cluster.local")
 	callouts, err := calloutsFor(t, policy)
 	if err != nil {
 		t.Fatalf("acceptedNemoCallouts: %v", err)
 	}
-	if len(callouts) != 1 || !callouts[0].authenticated || callouts[0].serviceNamespace != "infra" || callouts[0].serviceName != "nemo" || callouts[0].endpoint != policy.Status.ProviderEndpoint {
-		t.Fatalf("callouts = %#v, want the authenticated nemo Service in infra", callouts)
+	if len(callouts) != 1 || !callouts[0].authenticated || callouts[0].serviceNamespace != "odh-ai-gateway-infra" || callouts[0].serviceName != "tenant-a-nemo" || callouts[0].endpoint != policy.Status.ProviderEndpoint {
+		t.Fatalf("callouts = %#v, want the authenticated tenant-a-nemo Service in odh-ai-gateway-infra", callouts)
+	}
+}
+
+// TestCalloutInTheOtherInfraNamespaceIsReported pins the composition
+// reconcilePraxis runs. The guardrail reconciler accepts a NeMo Service in
+// either AI Gateway infrastructure namespace, so acceptedNemoCallouts must
+// compile it and leave rejecting it to pinNemoCalloutsToInfra, which is what
+// hands it to reportNemoOutsideInfra. Closing it any earlier would reject the
+// policy's requests with nothing on the AIGuardrail to say why.
+func TestCalloutInTheOtherInfraNamespaceIsReported(t *testing.T) {
+	policy := acceptedPolicy("safety", 3, 3, "https://tenant-a-nemo.redhat-ai-gateway-infra.svc.cluster.local")
+	callouts, err := calloutsFor(t, policy)
+	if err != nil || len(callouts) != 1 || callouts[0].closed {
+		t.Fatalf("callouts = %#v, %v; want the policy compiled", callouts, err)
+	}
+	outside := pinNemoCalloutsToInfra(callouts, "odh-ai-gateway-infra")
+	if !callouts[0].closed {
+		t.Fatalf("callout = %#v, want it closed outside the tenant's infrastructure namespace", callouts[0])
+	}
+	if len(outside) != 1 || outside[0].name != "safety" || outside[0].serviceNamespace != "redhat-ai-gateway-infra" {
+		t.Fatalf("outside = %#v, want safety reported in redhat-ai-gateway-infra", outside)
 	}
 }
 
@@ -389,7 +410,7 @@ func TestReportNemoOutsideInfraEventsOnlyOnChange(t *testing.T) {
 }
 
 func TestCompileNemoExtprocRequiresRequestIDFilter(t *testing.T) {
-	callouts := []nemoCallout{{name: "safety", endpoint: "http://nemo.infra.svc", checks: []nemoCheck{{configID: "pii-v1", request: true}}}}
+	callouts := []nemoCallout{{name: "safety", endpoint: "http://tenant-a-nemo.odh-ai-gateway-infra.svc", checks: []nemoCheck{{configID: "pii-v1", request: true}}}}
 	if _, err := compileNemoExtproc("filter_chains:\n  - name: ipp\n    filters: []\n", callouts); err == nil {
 		t.Fatal("compiled checks into a chain with no request_id anchor")
 	}
@@ -399,7 +420,7 @@ func TestCompileNemoExtprocRequiresRequestIDFilter(t *testing.T) {
 }
 
 func TestNemoCalloutChangedIgnoresConditionChurn(t *testing.T) {
-	before := acceptedPolicy("safety", 3, 3, "http://nemo.infra.svc")
+	before := acceptedPolicy("safety", 3, 3, "http://tenant-a-nemo.odh-ai-gateway-infra.svc")
 	after := before.DeepCopy()
 	after.Status.Conditions[0].LastTransitionTime = metav1.Now()
 	after.Status.Conditions = append(after.Status.Conditions, metav1.Condition{Type: guardrail.ConditionProviderReady, Status: metav1.ConditionTrue})
@@ -473,10 +494,10 @@ func TestNemoCalloutContract(t *testing.T) {
 }
 
 func TestAcceptedNemoCalloutsSkipsStalePolicy(t *testing.T) {
-	current := acceptedPolicy("current", 3, 3, "http://nemo.infra.svc.cluster.local")
-	refused := acceptedPolicy("refused", 3, 3, "http://nemo.infra.svc.cluster.local")
+	current := acceptedPolicy("current", 3, 3, "http://tenant-a-nemo.odh-ai-gateway-infra.svc.cluster.local")
+	refused := acceptedPolicy("refused", 3, 3, "http://tenant-a-nemo.odh-ai-gateway-infra.svc.cluster.local")
 	refused.Status.Conditions[0].Status = metav1.ConditionFalse
-	deleting := acceptedPolicy("deleting", 3, 3, "http://nemo.infra.svc.cluster.local")
+	deleting := acceptedPolicy("deleting", 3, 3, "http://tenant-a-nemo.odh-ai-gateway-infra.svc.cluster.local")
 	now := metav1.Now()
 	deleting.DeletionTimestamp = &now
 	deleting.Finalizers = []string{"aigateway.opendatahub.io/cleanup"}
@@ -487,8 +508,8 @@ func TestAcceptedNemoCalloutsSkipsStalePolicy(t *testing.T) {
 	if len(callouts) != 3 || callouts[0].name != "current" || callouts[0].closed || len(callouts[0].checks) != 1 || !callouts[0].checks[0].request || callouts[0].checks[0].response {
 		t.Fatalf("callouts = %#v, want the current policy first", callouts)
 	}
-	if callouts[0].serviceNamespace != "infra" || callouts[0].serviceName != "nemo" || callouts[0].authenticated {
-		t.Fatalf("callout = %#v, want the auth-off nemo Service in infra", callouts[0])
+	if callouts[0].serviceNamespace != "odh-ai-gateway-infra" || callouts[0].serviceName != "tenant-a-nemo" || callouts[0].authenticated {
+		t.Fatalf("callout = %#v, want the auth-off tenant-a-nemo Service in odh-ai-gateway-infra", callouts[0])
 	}
 	if callouts[1].name != "deleting" || !callouts[1].closed || callouts[2].name != "refused" || !callouts[2].closed {
 		t.Fatalf("callouts = %#v, want deleting and refused to reject their selection", callouts)
@@ -498,9 +519,9 @@ func TestAcceptedNemoCalloutsSkipsStalePolicy(t *testing.T) {
 		t.Fatalf("refused config = %s, err = %v, want the selection rejected", compiled, err)
 	}
 
-	stale := acceptedPolicy("stale", 4, 3, "http://nemo.infra.svc.cluster.local")
+	stale := acceptedPolicy("stale", 4, 3, "http://tenant-a-nemo.odh-ai-gateway-infra.svc.cluster.local")
 	reader := attachedReader(current, stale)
-	_, err = acceptedNemoCallouts(context.Background(), reader, "tenant-a")
+	_, err = acceptedNemoCallouts(context.Background(), reader, "tenant-a", false)
 	if !errors.Is(err, errStaleBinding) {
 		t.Fatalf("acceptedNemoCallouts error = %v, want the stale policy to block publishing", err)
 	}
@@ -513,7 +534,7 @@ func TestAcceptedNemoCalloutsSkipsStalePolicy(t *testing.T) {
 // keyed by the shared x-aigateway-guardrail-<id> header for its namespace,
 // AIGuardrail name and check name, not its NeMo config ID.
 func TestAcceptedNemoCalloutsUseCheckSelectionHeader(t *testing.T) {
-	policy := acceptedPolicy("safety", 3, 3, "http://nemo.infra.svc")
+	policy := acceptedPolicy("safety", 3, 3, "http://tenant-a-nemo.odh-ai-gateway-infra.svc")
 	callouts, err := calloutsFor(t, policy)
 	if err != nil {
 		t.Fatalf("acceptedNemoCallouts: %v", err)
@@ -532,25 +553,28 @@ func TestAcceptedNemoCalloutsUseCheckSelectionHeader(t *testing.T) {
 // TestAcceptedNemoCalloutsIsolatesBrokenPolicy pins that one policy that
 // cannot be compiled is left out instead of failing the whole tenant.
 func TestAcceptedNemoCalloutsIsolatesBrokenPolicy(t *testing.T) {
-	good := acceptedPolicy("good", 3, 3, "http://nemo.infra.svc")
+	good := acceptedPolicy("good", 3, 3, "http://tenant-a-nemo.odh-ai-gateway-infra.svc")
 	broken := map[string]string{
 		"external-host":  "http://attacker.example",
-		"other-service":  "http://other.infra.svc",
+		"other-service":  "http://other.odh-ai-gateway-infra.svc",
 		"bad-namespace":  "http://nemo.in_fra.svc",
-		"wrong-port":     "http://nemo.infra.svc:8443",
-		"pathed":         "http://nemo.infra.svc/proxy",
-		"query":          "http://nemo.infra.svc/?x=1",
-		"other-scheme":   "ftp://nemo.infra.svc",
-		"https-port":     "https://nemo.infra.svc:8443",
-		"https-other":    "https://other.infra.svc",
+		"tenant-ns":      "http://nemo.tenant-a.svc",
+		"system-ns":      "http://tenant-a-nemo.kube-system.svc",
+		"bare-name":      "http://nemo.odh-ai-gateway-infra.svc",
+		"wrong-port":     "http://tenant-a-nemo.odh-ai-gateway-infra.svc:8443",
+		"pathed":         "http://tenant-a-nemo.odh-ai-gateway-infra.svc/proxy",
+		"query":          "http://tenant-a-nemo.odh-ai-gateway-infra.svc/?x=1",
+		"other-scheme":   "ftp://tenant-a-nemo.odh-ai-gateway-infra.svc",
+		"https-port":     "https://tenant-a-nemo.odh-ai-gateway-infra.svc:8443",
+		"https-other":    "https://other.odh-ai-gateway-infra.svc",
 		"not-a-svc-name": "http://nemo.infra.pod",
 	}
-	broken["userinfo"] = "http://user:pw@nemo.infra.svc"
+	broken["userinfo"] = "http://user:pw@nemo.odh-ai-gateway-infra.svc"
 	policies := []*aigatewayv1alpha1.AIGuardrail{good}
 	for name, endpoint := range broken {
 		policies = append(policies, acceptedPolicy(name, 3, 3, endpoint))
 	}
-	noConfig := acceptedPolicy("no-config", 3, 3, "http://nemo.infra.svc")
+	noConfig := acceptedPolicy("no-config", 3, 3, "http://tenant-a-nemo.odh-ai-gateway-infra.svc")
 	noConfig.Spec.Checks[0].ConfigID = ""
 	policies = append(policies, noConfig)
 	callouts, err := calloutsFor(t, policies...)
@@ -587,9 +611,9 @@ func TestAcceptedNemoCalloutsIsolatesBrokenPolicy(t *testing.T) {
 // timeout_ms 0, which Praxis rejects, so that policy rejects its own selection
 // and the sibling is still called.
 func TestAcceptedNemoCalloutsRejectsSubMillisecondTimeout(t *testing.T) {
-	ready := acceptedPolicy("ready", 3, 3, "http://nemo.infra.svc.cluster.local")
+	ready := acceptedPolicy("ready", 3, 3, "http://tenant-a-nemo.odh-ai-gateway-infra.svc.cluster.local")
 	ready.Spec.Provider.Timeout.Duration = time.Millisecond
-	fine := acceptedPolicy("fine", 3, 3, "http://nemo.infra.svc.cluster.local")
+	fine := acceptedPolicy("fine", 3, 3, "http://tenant-a-nemo.odh-ai-gateway-infra.svc.cluster.local")
 	fine.Spec.Provider.Timeout.Duration = 500 * time.Microsecond
 	callouts, err := calloutsFor(t, ready, fine)
 	if !errors.Is(err, errUncompilableCallout) {
@@ -613,11 +637,49 @@ func TestAcceptedNemoCalloutsRejectsSubMillisecondTimeout(t *testing.T) {
 	}
 }
 
+// TestAcceptedNemoCalloutsClosesOutputChecksItCannotEnforce pins that, where the
+// tenant cannot run response checks, an accepted policy with an Output check
+// rejects its selection instead of compiling a response hook that would be
+// skipped, and that Input-only policies still compile.
+func TestTenantNemoCalloutsClosesOutputChecksItCannotEnforce(t *testing.T) {
+	input := acceptedPolicy("input", 3, 3, "http://tenant-a-nemo.odh-ai-gateway-infra.svc.cluster.local")
+	output := acceptedPolicy("output", 3, 3, "http://tenant-a-nemo.odh-ai-gateway-infra.svc.cluster.local")
+	output.Spec.Checks[0].Phases = []aigatewayv1alpha1.GuardrailPhase{aigatewayv1alpha1.GuardrailPhaseInput, aigatewayv1alpha1.GuardrailPhaseOutput}
+	reader := attachedReader(input, output)
+
+	callouts, err := acceptedNemoCallouts(context.Background(), reader, "tenant-a", true)
+	if !errors.Is(err, errUncompilableCallout) {
+		t.Fatalf("error = %v, want %v", err, errUncompilableCallout)
+	}
+	if len(callouts) != 2 || callouts[0].name != "input" || callouts[0].closed || callouts[1].name != "output" || !callouts[1].closed {
+		t.Fatalf("callouts = %#v, want the Input policy compiled and a closed stand-in for the Output one", callouts)
+	}
+
+	callouts, err = acceptedNemoCallouts(context.Background(), reader, "tenant-a", false)
+	if err != nil || len(callouts) != 2 || callouts[1].closed || !callouts[1].checks[0].response {
+		t.Fatalf("callouts = %#v, %v; want the Output check compiled where the tenant can enforce it", callouts, err)
+	}
+}
+
+func TestOutputChecksUnsupportedFollowsAPITranslation(t *testing.T) {
+	enabled := tenantConfigWithGuardrails(nil)
+	enabled.Object["spec"] = map[string]any{"apiTranslation": map[string]any{"enabled": true}}
+	disabled := tenantConfigWithGuardrails(nil)
+	disabled.SetNamespace("tenant-b")
+	reader := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(enabled, disabled).Build()
+	for namespace, want := range map[string]bool{"tenant-a": true, "tenant-b": false, "not-a-tenant": false} {
+		why, err := OutputChecksUnsupported(context.Background(), reader, namespace)
+		if err != nil || (why != "") != want {
+			t.Errorf("OutputChecksUnsupported(%s) = %q, %v; want unsupported %v", namespace, why, err, want)
+		}
+	}
+}
+
 // TestAcceptedNemoCalloutsSkipsEmptyEndpoint pins that an accepted policy
 // with no providerEndpoint cannot be called. It rejects its own selection.
 // That is not a compile failure of the policies that do publish an endpoint.
 func TestAcceptedNemoCalloutsSkipsEmptyEndpoint(t *testing.T) {
-	ready := acceptedPolicy("ready", 3, 3, "http://nemo.infra.svc.cluster.local")
+	ready := acceptedPolicy("ready", 3, 3, "http://tenant-a-nemo.odh-ai-gateway-infra.svc.cluster.local")
 	empty := acceptedPolicy("empty", 3, 3, "")
 	callouts, err := calloutsFor(t, ready, empty)
 	if err != nil {
@@ -647,7 +709,7 @@ func parseCompiled(t *testing.T, config string) (map[string]any, []any) {
 // through the tenant config.
 func calloutsFor(t *testing.T, policies ...*aigatewayv1alpha1.AIGuardrail) ([]nemoCallout, error) {
 	t.Helper()
-	callouts, err := acceptedNemoCallouts(context.Background(), attachedReader(policies...), "tenant-a")
+	callouts, err := acceptedNemoCallouts(context.Background(), attachedReader(policies...), "tenant-a", false)
 	if err != nil && !softCalloutErr(err) {
 		t.Fatalf("acceptedNemoCallouts: %v", err)
 	}
@@ -689,15 +751,15 @@ func tenantConfigWithGuardrails(entries []any) *unstructured.Unstructured {
 // a non-empty checks list selects only the named checks, and a policy applies
 // only while something attaches it.
 func TestCatalogCompilesOnlyAttachedChecks(t *testing.T) {
-	policy := acceptedPolicy("safety", 3, 3, "http://nemo.infra.svc")
+	policy := acceptedPolicy("safety", 3, 3, "http://tenant-a-nemo.odh-ai-gateway-infra.svc")
 	policy.Spec.Checks = []aigatewayv1alpha1.AIGuardrailCheck{
 		{Name: "pii", ConfigID: "pii-v1", Phases: []aigatewayv1alpha1.GuardrailPhase{aigatewayv1alpha1.GuardrailPhaseInput}},
 		{Name: "jail", ConfigID: "jail-v1", Phases: []aigatewayv1alpha1.GuardrailPhase{aigatewayv1alpha1.GuardrailPhaseInput}},
 	}
-	unattached := acceptedPolicy("unattached", 3, 3, "http://nemo.infra.svc")
-	refused := acceptedPolicy("refused", 3, 3, "http://nemo.infra.svc")
+	unattached := acceptedPolicy("unattached", 3, 3, "http://tenant-a-nemo.odh-ai-gateway-infra.svc")
+	refused := acceptedPolicy("refused", 3, 3, "http://tenant-a-nemo.odh-ai-gateway-infra.svc")
 	refused.Status.Conditions[0].Status = metav1.ConditionFalse
-	stale := acceptedPolicy("stale", 4, 3, "http://nemo.infra.svc")
+	stale := acceptedPolicy("stale", 4, 3, "http://tenant-a-nemo.odh-ai-gateway-infra.svc")
 	ait := &unstructured.Unstructured{Object: map[string]any{
 		"spec": map[string]any{"guardrails": []any{
 			map[string]any{"ref": map[string]any{"name": "safety"}, "checks": []any{"pii"}},
@@ -711,7 +773,7 @@ func TestCatalogCompilesOnlyAttachedChecks(t *testing.T) {
 	mtc.SetAnnotations(map[string]string{AnnotationAITenantName: "red", AnnotationAITenantNamespace: "ai-tenants"})
 
 	reader := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(policy, unattached, refused, stale, ait, mtc).Build()
-	callouts, err := acceptedNemoCallouts(context.Background(), reader, "tenant-a")
+	callouts, err := acceptedNemoCallouts(context.Background(), reader, "tenant-a", false)
 	if err != nil {
 		t.Fatalf("acceptedNemoCallouts: %v; an unattached stale policy must not block publishing", err)
 	}
@@ -719,8 +781,13 @@ func TestCatalogCompilesOnlyAttachedChecks(t *testing.T) {
 		t.Fatalf("callouts = %#v, want only safety/pii; jail is not selected and the others are not attached", callouts)
 	}
 
-	detached := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(policy, unattached, mtc).Build()
-	callouts, err = acceptedNemoCallouts(context.Background(), detached, "tenant-a")
+	// The AITenant stays and drops its list: the attachment is what goes
+	// away. An owner that is named but missing is a baseline that cannot be
+	// read, and that attaches every policy rather than none.
+	emptied := ait.DeepCopy()
+	unstructured.RemoveNestedField(emptied.Object, "spec", "guardrails")
+	detached := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(policy, unattached, emptied, mtc).Build()
+	callouts, err = acceptedNemoCallouts(context.Background(), detached, "tenant-a", false)
 	if err != nil || len(callouts) != 0 {
 		t.Fatalf("callouts = %#v, err = %v; want none once the last attachment is removed", callouts, err)
 	}
@@ -737,7 +804,7 @@ func TestCatalogCompilesOnlyAttachedChecks(t *testing.T) {
 // selects some of a policy's checks compiles only those, and a tenant policy
 // nobody attaches is not compiled.
 func TestCatalogFollowsGuardrailArrays(t *testing.T) {
-	endpoint := "http://nemo.infra.svc"
+	endpoint := "http://tenant-a-nemo.odh-ai-gateway-infra.svc"
 	zebra := acceptedPolicy("zebra", 3, 3, endpoint)
 	zebra.Spec.Checks = []aigatewayv1alpha1.AIGuardrailCheck{
 		{Name: "pii", ConfigID: "pii-v1", Phases: []aigatewayv1alpha1.GuardrailPhase{aigatewayv1alpha1.GuardrailPhaseInput}},
@@ -832,7 +899,7 @@ func TestCatalogFollowsGuardrailArrays(t *testing.T) {
 	for _, policy := range policies {
 		builder = builder.WithObjects(policy)
 	}
-	callouts, err := acceptedNemoCallouts(context.Background(), builder.Build(), "tenant-a")
+	callouts, err := acceptedNemoCallouts(context.Background(), builder.Build(), "tenant-a", false)
 	if err != nil {
 		t.Fatalf("acceptedNemoCallouts: %v", err)
 	}
@@ -880,7 +947,7 @@ func TestCatalogFollowsGuardrailArrays(t *testing.T) {
 func TestMalformedAttachmentFailsClosed(t *testing.T) {
 	ctx := context.Background()
 	twoChecks := func(name string) *aigatewayv1alpha1.AIGuardrail {
-		policy := acceptedPolicy(name, 1, 1, "http://nemo.infra.svc")
+		policy := acceptedPolicy(name, 1, 1, "http://tenant-a-nemo.odh-ai-gateway-infra.svc")
 		policy.Spec.Checks = []aigatewayv1alpha1.AIGuardrailCheck{
 			{Name: "pii", ConfigID: "pii-v1", Phases: []aigatewayv1alpha1.GuardrailPhase{aigatewayv1alpha1.GuardrailPhaseInput}},
 			{Name: "jail", ConfigID: "jail-v1", Phases: []aigatewayv1alpha1.GuardrailPhase{aigatewayv1alpha1.GuardrailPhaseInput}},
@@ -934,7 +1001,7 @@ func TestMalformedAttachmentFailsClosed(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			reader := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).
 				WithObjects(twoChecks("named"), twoChecks("other"), mtcWith(tc.guardrails)).Build()
-			callouts, err := acceptedNemoCallouts(ctx, reader, "tenant-a")
+			callouts, err := acceptedNemoCallouts(ctx, reader, "tenant-a", false)
 			if !errors.Is(err, errMalformedAttachment) || !softCalloutErr(err) {
 				t.Fatalf("acceptedNemoCallouts error = %v, want a soft malformed attachment", err)
 			}
@@ -949,7 +1016,7 @@ func TestMalformedAttachmentFailsClosed(t *testing.T) {
 }
 
 func TestMalformedAttachmentDoesNotDropTheCatalog(t *testing.T) {
-	policy := acceptedPolicy("ok", 1, 1, "http://nemo.infra.svc")
+	policy := acceptedPolicy("ok", 1, 1, "http://tenant-a-nemo.odh-ai-gateway-infra.svc")
 	mtc := NewMaasTenantConfig()
 	mtc.SetName(MaasTenantConfigInstanceName)
 	mtc.SetNamespace("tenant-a")
@@ -965,13 +1032,241 @@ func TestMalformedAttachmentDoesNotDropTheCatalog(t *testing.T) {
 		}},
 	})
 	client := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(policy, mtc, sub).Build()
-	callouts, err := acceptedNemoCallouts(context.Background(), client, "tenant-a")
+	callouts, err := acceptedNemoCallouts(context.Background(), client, "tenant-a", false)
 	if !errors.Is(err, errMalformedAttachment) {
 		t.Fatalf("acceptedNemoCallouts error = %v, want malformed attachment", err)
 	}
 	if len(callouts) != 1 || callouts[0].name != "ok" || len(callouts[0].checks) != 1 {
 		t.Fatalf("callouts = %+v, want the readable ok/pii attachment", callouts)
 	}
+}
+
+// TestBaselineSurvivesANarrowerAttachment pins that a narrower list cannot
+// shrink the baseline. The subscription re-attaches the baseline policy
+// asking for one of its checks; the baseline already took both, so the
+// subscription's entry contributes nothing and jail still runs.
+func TestBaselineSurvivesANarrowerAttachment(t *testing.T) {
+	endpoint := "http://tenant-a-nemo.odh-ai-gateway-infra.svc"
+	safety := policyWithChecks("safety", endpoint, "pii", "jail")
+	aitenant, mtc := baselineTenant([]any{attachEntry("safety")}, nil)
+	team := subscriptionWithGuardrails("team", []any{attachEntry("safety", "pii")}, nil)
+
+	callouts := tenantCatalog(t, []client.Object{aitenant, mtc, team}, safety)
+	assertCatalog(t, flattenChecks(callouts), []placedCheck{
+		{"safety", "pii"}, {"safety", "jail"},
+	})
+}
+
+// TestBaselineOrderIgnoresAttachmentOrder pins that a narrower list cannot
+// reorder the baseline. The subscription asks for jail before pii, and for a
+// policy of its own. The baseline took both checks in policy order, so that
+// is the order they run in, and the subscription's own policy runs after
+// them.
+func TestBaselineOrderIgnoresAttachmentOrder(t *testing.T) {
+	endpoint := "http://tenant-a-nemo.odh-ai-gateway-infra.svc"
+	safety := policyWithChecks("safety", endpoint, "pii", "jail")
+	extra := policyWithChecks("extra", endpoint, "toxicity")
+	aitenant, mtc := baselineTenant([]any{attachEntry("safety")}, nil)
+	team := subscriptionWithGuardrails("team", []any{
+		attachEntry("safety", "jail", "pii"),
+		attachEntry("extra"),
+	}, nil)
+
+	callouts := tenantCatalog(t, []client.Object{aitenant, mtc, team}, safety, extra)
+	assertCatalog(t, flattenChecks(callouts), []placedCheck{
+		{"safety", "pii"}, {"safety", "jail"}, {"extra", "toxicity"},
+	})
+}
+
+// TestBaselineCheckIsNotReplacedByASameName pins that a tenant policy
+// declaring a check the baseline already runs adds a second check rather
+// than taking the baseline's place. A check is identified by its policy and
+// its name, so the baseline keeps its own configuration and runs first.
+func TestBaselineCheckIsNotReplacedByASameName(t *testing.T) {
+	endpoint := "http://tenant-a-nemo.odh-ai-gateway-infra.svc"
+	safety := policyWithChecks("safety", endpoint, "pii")
+	lax := policyWithChecks("lax", endpoint, "pii")
+	aitenant, mtc := baselineTenant([]any{attachEntry("safety")}, nil)
+	team := subscriptionWithGuardrails("team", []any{attachEntry("lax")}, nil)
+
+	callouts := tenantCatalog(t, []client.Object{aitenant, mtc, team}, safety, lax)
+	assertCatalog(t, flattenChecks(callouts), []placedCheck{
+		{"safety", "pii"}, {"lax", "pii"},
+	})
+	if got := callouts[0].checks[0].configID; got != "safety-pii" {
+		t.Fatalf("baseline check runs configuration %q, want safety-pii", got)
+	}
+}
+
+// TestBaselineDigestIgnoresAnOverrideAttempt compiles the same baseline with
+// and without attachments that re-select it, and pins that the post-auth
+// Deployment's config digest is unchanged. Dropping a check from the
+// baseline moves it, so the first comparison is reading a digest that does
+// track the catalog.
+func TestBaselineDigestIgnoresAnOverrideAttempt(t *testing.T) {
+	endpoint := "http://tenant-a-nemo.odh-ai-gateway-infra.svc"
+	safety := policyWithChecks("safety", endpoint, "pii", "jail")
+
+	aitenant, mtc := baselineTenant([]any{attachEntry("safety")}, nil)
+	alone := nemoConfigDigest(t, tenantCatalog(t, []client.Object{aitenant, mtc}, safety))
+
+	reselected, reselectedMTC := baselineTenant(
+		[]any{attachEntry("safety")},
+		[]any{attachEntry("safety", "pii")},
+	)
+	team := subscriptionWithGuardrails("team", []any{attachEntry("safety", "jail", "pii")}, nil)
+	attempted := nemoConfigDigest(t, tenantCatalog(t, []client.Object{reselected, reselectedMTC, team}, safety))
+	if attempted != alone {
+		t.Fatalf("attachments that only re-select baseline checks changed the digest\nbaseline alone = %s\nwith attachments = %s", alone, attempted)
+	}
+
+	narrowed, narrowedMTC := baselineTenant([]any{attachEntry("safety", "pii")}, nil)
+	dropped := nemoConfigDigest(t, tenantCatalog(t, []client.Object{narrowed, narrowedMTC}, safety))
+	if dropped == alone {
+		t.Fatalf("dropping jail from the baseline left the digest at %s", alone)
+	}
+}
+
+// TestUnreadableBaselineAttachesEveryPolicy pins the baseline's fail-closed
+// path. A config naming an owning AITenant this catalog cannot read has a
+// baseline it cannot see, and an unseen baseline must not compile the same
+// as an empty one. Every tenant policy runs instead, in policy name order.
+func TestUnreadableBaselineAttachesEveryPolicy(t *testing.T) {
+	endpoint := "http://tenant-a-nemo.odh-ai-gateway-infra.svc"
+	foreign, _ := baselineTenant([]any{attachEntry("safety")}, nil)
+	_ = unstructured.SetNestedField(foreign.Object, "other-tenant", "status", "tenantNamespace")
+
+	for _, tc := range []struct {
+		name  string
+		owner []client.Object
+	}{
+		{"owning AITenant is gone", nil},
+		{"owning AITenant binds another config", []client.Object{foreign}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, mtc := baselineTenant([]any{attachEntry("safety")}, nil)
+			builder := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).
+				WithObjects(append([]client.Object{mtc}, tc.owner...)...).
+				WithObjects(policyWithChecks("safety", endpoint, "pii"), policyWithChecks("other", endpoint, "toxicity"))
+			callouts, err := acceptedNemoCallouts(context.Background(), builder.Build(), "tenant-a", false)
+			if !errors.Is(err, errMalformedAttachment) {
+				t.Fatalf("acceptedNemoCallouts error = %v, want malformed attachment", err)
+			}
+			assertCatalog(t, flattenChecks(callouts), []placedCheck{
+				{"other", "toxicity"}, {"safety", "pii"},
+			})
+		})
+	}
+}
+
+// placedCheck is one compiled check, named by the policy it came from.
+type placedCheck struct{ policy, check string }
+
+// flattenChecks reads a catalog as the checks it runs, in order.
+func flattenChecks(callouts []nemoCallout) []placedCheck {
+	var placed []placedCheck
+	for _, callout := range callouts {
+		for _, check := range callout.checks {
+			placed = append(placed, placedCheck{callout.name, check.name})
+		}
+	}
+	return placed
+}
+
+func assertCatalog(t *testing.T, got, want []placedCheck) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("checks = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("check %d = %v, want %v\nfull = %v", i, got[i], want[i], got)
+		}
+	}
+}
+
+// baselineTenant builds the AITenant carrying the platform baseline and the
+// MaasTenantConfig it owns.
+func baselineTenant(baseline, config []any) (aitenant, mtc *unstructured.Unstructured) {
+	aitenant = &unstructured.Unstructured{Object: map[string]any{
+		"spec":   map[string]any{"guardrails": baseline},
+		"status": map[string]any{"tenantNamespace": "tenant-a"},
+	}}
+	aitenant.SetGroupVersionKind(AITenantGVK)
+	aitenant.SetName("red")
+	aitenant.SetNamespace("ai-tenants")
+
+	mtc = NewMaasTenantConfig()
+	mtc.SetName(MaasTenantConfigInstanceName)
+	mtc.SetNamespace("tenant-a")
+	mtc.SetAnnotations(map[string]string{
+		AnnotationAITenantName:      "red",
+		AnnotationAITenantNamespace: "ai-tenants",
+	})
+	if config != nil {
+		_ = unstructured.SetNestedSlice(mtc.Object, config, "spec", "guardrails")
+	}
+	return aitenant, mtc
+}
+
+// attachEntry is one entry in a guardrails list. No checks selects the whole
+// policy.
+func attachEntry(name string, checks ...string) map[string]any {
+	entry := map[string]any{"ref": map[string]any{"name": name}}
+	if len(checks) > 0 {
+		selected := make([]any, 0, len(checks))
+		for _, check := range checks {
+			selected = append(selected, check)
+		}
+		entry["checks"] = selected
+	}
+	return entry
+}
+
+// policyWithChecks is an accepted policy whose checks run on input, in the
+// order given. Each check names its own configuration, so a test can tell
+// two same-named checks apart.
+func policyWithChecks(name, endpoint string, checks ...string) *aigatewayv1alpha1.AIGuardrail {
+	policy := acceptedPolicy(name, 3, 3, endpoint)
+	policy.Spec.Checks = nil
+	for _, check := range checks {
+		policy.Spec.Checks = append(policy.Spec.Checks, aigatewayv1alpha1.AIGuardrailCheck{
+			Name:     check,
+			ConfigID: name + "-" + check,
+			Phases:   []aigatewayv1alpha1.GuardrailPhase{aigatewayv1alpha1.GuardrailPhaseInput},
+		})
+	}
+	return policy
+}
+
+func tenantCatalog(t *testing.T, objects []client.Object, policies ...*aigatewayv1alpha1.AIGuardrail) []nemoCallout {
+	t.Helper()
+	builder := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(objects...)
+	for _, policy := range policies {
+		builder = builder.WithObjects(policy)
+	}
+	callouts, err := acceptedNemoCallouts(context.Background(), builder.Build(), "tenant-a", false)
+	if err != nil {
+		t.Fatalf("acceptedNemoCallouts: %v", err)
+	}
+	return callouts
+}
+
+// nemoConfigDigest compiles the catalog into the post-auth config and
+// returns the digest the Deployment carries.
+func nemoConfigDigest(t *testing.T, callouts []nemoCallout) string {
+	t.Helper()
+	resources := nemoCalloutFixtures("red", "gw")
+	resources, err := configureNemoCallouts(resources, "red", "gw", "red", callouts)
+	if err != nil {
+		t.Fatalf("configureNemoCallouts: %v", err)
+	}
+	deployment := findResource(resources, "Deployment", PayloadProcessingDeploymentName("red"), "gw")
+	digest, found, err := unstructured.NestedString(deployment.Object, "spec", "template", "metadata", "annotations", nemoCalloutConfigAnnotation)
+	if err != nil || !found {
+		t.Fatalf("read %s: found=%v err=%v", nemoCalloutConfigAnnotation, found, err)
+	}
+	return digest
 }
 
 func subscriptionWithGuardrails(name string, guardrails, modelRefs []any) *unstructured.Unstructured {

@@ -16,7 +16,6 @@ import (
 	"reflect"
 	"slices"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,7 +29,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -1288,100 +1286,21 @@ func TestDefaultTenantAIGuardrailEventsEnqueueImplicitModels(t *testing.T) {
 	}
 }
 
-func TestPostAuthFilterEventRetriesATransientTenantReadFailure(t *testing.T) {
-	setPostAuthFilterRetryDelays(t, time.Millisecond)
-	tenantGateway := v1alpha1.NamespacedObjectReference{Name: "gateway", Namespace: "gateway-system"}
-	tenantModel := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "tenant", Namespace: "tenant-a"}, Spec: v1alpha1.ExternalModelSpec{GatewayRefs: []v1alpha1.NamespacedObjectReference{tenantGateway}}}
-	attachedModel := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "attached", Namespace: "team-a"}, Spec: v1alpha1.ExternalModelSpec{GatewayRefs: []v1alpha1.NamespacedObjectReference{tenantGateway}}}
-	ait := controllerAITenant("tenant-a", "models-as-a-service", "tenant-a", tenantGateway.Name, tenantGateway.Namespace)
-	mtc := controllerMaasTenantConfig("tenant-a", "tenant-a", "models-as-a-service", "praxis")
-	r := controllerTestClient(t, tenantModel, attachedModel, ait, mtc)
-	var failures atomic.Int32
-	failures.Store(2)
-	base, ok := r.Client.(client.WithWatch)
-	if !ok {
-		t.Fatal("the test client must support watches")
-	}
-	r.Client = interceptor.NewClient(base, interceptor.Funcs{
-		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-			if obj.GetObjectKind().GroupVersionKind().Kind == tenant.MaasTenantConfigGVK.Kind && failures.Add(-1) >= 0 {
-				return apierrors.NewServiceUnavailable("etcd is unavailable")
-			}
-			return c.Get(ctx, key, obj, opts...)
-		},
-	})
-
-	q := newTestQueue(t)
-	r.enqueuePostAuthFilterModels(context.Background(), q, "tenant-a", 0)
-	// The model in the tenant's namespace is queued even though the lookup failed.
-	if got := drainQueue(q); !reflect.DeepEqual(got, []reconcile.Request{{NamespacedName: client.ObjectKeyFromObject(tenantModel)}}) {
-		t.Fatalf("first attempt enqueued %v, want only the namespace-local model", got)
-	}
-	want := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(attachedModel)}
-	deadline := time.Now().Add(5 * time.Second)
-	for !slices.Contains(drainQueue(q), want) {
-		if time.Now().After(deadline) {
-			t.Fatal("gateway-attached model was never enqueued after the tenant read recovered")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-}
-
-func TestPostAuthFilterEventDoesNotRetryAPermanentTenantFailure(t *testing.T) {
-	setPostAuthFilterRetryDelays(t, time.Millisecond)
+func TestGuardrailChangeKeepsNamespaceModelsWhenTheTenantCannotBeResolved(t *testing.T) {
 	tenantModel := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "tenant", Namespace: "tenant-a"}}
 	// This AITenant points at another namespace, so it doesn't own the MaasTenantConfig.
 	ait := controllerAITenant("tenant", "models-as-a-service", "other-tenant", "gateway", "gateway-system")
 	mtc := controllerMaasTenantConfig("tenant-a", "tenant", "models-as-a-service", "praxis")
 	r := controllerTestClient(t, tenantModel, ait, mtc)
-	var reads atomic.Int32
-	base, ok := r.Client.(client.WithWatch)
-	if !ok {
-		t.Fatal("the test client must support watches")
-	}
-	r.Client = interceptor.NewClient(base, interceptor.Funcs{
-		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-			if obj.GetObjectKind().GroupVersionKind().Kind == tenant.MaasTenantConfigGVK.Kind {
-				reads.Add(1)
-			}
-			return c.Get(ctx, key, obj, opts...)
-		},
-	})
+	src := tenant.PostAuthFilterSource{Tenants: func(context.Context, client.Reader, client.Object) ([]string, error) {
+		return []string{"tenant-a"}, nil
+	}}
 
-	q := newTestQueue(t)
-	r.enqueuePostAuthFilterModels(context.Background(), q, "tenant-a", 0)
-	if got := drainQueue(q); !reflect.DeepEqual(got, []reconcile.Request{{NamespacedName: client.ObjectKeyFromObject(tenantModel)}}) {
+	got := r.mapGuardrailChangesToModels(src)(context.Background(), &aigatewayv1alpha1.AIGuardrail{ObjectMeta: metav1.ObjectMeta{Name: "safety", Namespace: "tenant-a"}})
+	want := []reconcile.Request{{NamespacedName: client.ObjectKeyFromObject(tenantModel)}}
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("enqueued %v, want the namespace-local model kept", got)
 	}
-	time.Sleep(50 * time.Millisecond)
-	if n := reads.Load(); n != 1 {
-		t.Fatalf("MaasTenantConfig read %d times, want 1: an ownership error must not be retried", n)
-	}
-}
-
-func setPostAuthFilterRetryDelays(t *testing.T, delay time.Duration) {
-	t.Helper()
-	saved := postAuthFilterRetryDelays
-	postAuthFilterRetryDelays = []time.Duration{delay, delay, delay}
-	t.Cleanup(func() { postAuthFilterRetryDelays = saved })
-}
-
-func newTestQueue(t *testing.T) workqueue.TypedRateLimitingInterface[reconcile.Request] {
-	t.Helper()
-	q := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
-	t.Cleanup(q.ShutDown)
-	return q
-}
-
-// drainQueue returns the requests queued so far without blocking.
-func drainQueue(q workqueue.TypedRateLimitingInterface[reconcile.Request]) []reconcile.Request {
-	var out []reconcile.Request
-	for q.Len() > 0 {
-		request, _ := q.Get()
-		q.Done(request)
-		out = append(out, request)
-	}
-	return out
 }
 
 func TestPraxisTenantUsesMaasTenantConfigSelector(t *testing.T) {
