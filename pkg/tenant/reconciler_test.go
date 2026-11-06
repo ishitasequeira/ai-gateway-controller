@@ -829,12 +829,59 @@ func TestAITenantStillValidForApply(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(c.objects...).Build()
 			r := &Reconciler{Client: fakeClient, APIReader: fakeClient}
-			got, err := r.aiTenantStillValidForApply(context.Background(), c.mtc, c.wantUID, "my-gateway", "tenant-ns")
+			got, err := r.aiTenantStillValidForApply(context.Background(), c.mtc, c.wantUID, 0, "my-gateway", "tenant-ns")
 			if err != nil {
 				t.Fatalf("aiTenantStillValidForApply: %v", err)
 			}
 			if got != c.want {
 				t.Fatalf("aiTenantStillValidForApply = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestAITenantGenerationFenceForApply covers the spec-currency half of the
+// apply-path fence. DeployReady alone rejects only a status that is behind
+// its spec; once maas re-stamps the Ready condition at the newer generation,
+// every other signal reads healthy again while the copy this reconcile
+// rendered from -- and read spec.guardrails off -- is the older one. The
+// generation resolved at has to match the live one.
+func TestAITenantGenerationFenceForApply(t *testing.T) {
+	scheme := mtcSchemeForTests()
+	mtc := newMTC("tenant-ns", "redteam", PayloadProcessingBackendPraxis, "redteam", "ai-tenants")
+	// Ready is stamped at the object's own generation, so DeployReady holds
+	// at any of them and only the fence can reject.
+	owner := func(generation int64) *unstructured.Unstructured {
+		u := newAITenantOwner("redteam", "ai-tenants", AITenantPhaseActive, "my-gateway", "tenant-ns", "tenant-ns")
+		u.SetUID("uid-1")
+		u.SetGeneration(generation)
+		_ = unstructured.SetNestedSlice(u.Object, []any{map[string]any{
+			"type":               AITenantConditionReady,
+			"status":             "True",
+			"observedGeneration": generation,
+		}}, "status", "conditions")
+		return u
+	}
+	cases := []struct {
+		name           string
+		live           int64
+		wantGeneration int64
+		valid          bool
+	}{
+		{"generation matches the resolved copy", 7, 7, true},
+		{"spec moved after the resolve and status caught up", 8, 7, false},
+		{"zero wantGeneration disables the check", 8, 0, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, owner(c.live)).Build()
+			r := &Reconciler{Client: fakeClient, APIReader: fakeClient}
+			got, err := r.aiTenantStillValidForApply(context.Background(), mtc, "uid-1", c.wantGeneration, "my-gateway", "tenant-ns")
+			if err != nil {
+				t.Fatalf("aiTenantStillValidForApply: %v", err)
+			}
+			if got != c.valid {
+				t.Fatalf("aiTenantStillValidForApply = %v, want %v", got, c.valid)
 			}
 		})
 	}

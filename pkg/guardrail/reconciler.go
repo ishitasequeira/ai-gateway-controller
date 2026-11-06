@@ -19,6 +19,7 @@ package guardrail
 import (
 	"context"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -66,6 +67,15 @@ type Reconciler struct {
 	// reconcile so a policy recovers once TrustyAI appears, rather than
 	// waiting for this controller to restart.
 	RESTMapper apimeta.RESTMapper
+
+	// OutputChecksUnsupported returns why the tenant in a policy's namespace
+	// cannot enforce Output-phase checks, or "" if it can, so such a policy is
+	// refused instead of accepted and silently skipped. Nil means every tenant
+	// can. It is injected because the tenant package imports this one.
+	OutputChecksUnsupported func(ctx context.Context, namespace string) (string, error)
+	// TenantConfig is the object OutputChecksUnsupported reads. When set it is
+	// watched, so a change to it re-evaluates the policies in its namespace.
+	TenantConfig client.Object
 }
 
 // refuseAction is the machine-readable action every Event this controller
@@ -153,6 +163,10 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// without it every Namespace write in the cluster would fan out.
 		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.guardrailsInNamespace),
 			builder.WithPredicates(predicate.LabelChangedPredicate{}))
+	if r.TenantConfig != nil {
+		b = b.Watches(r.TenantConfig, handler.EnqueueRequestsFromMapFunc(r.guardrailsBesideTenantConfig),
+			builder.WithPredicates(predicate.GenerationChangedPredicate{}))
+	}
 
 	if installed {
 		// The provider owns the authorization rule, so an edit to
@@ -200,6 +214,17 @@ func (r *Reconciler) guardrailsInNamespace(ctx context.Context, obj client.Objec
 	var inNamespace aigatewayv1alpha1.AIGuardrailList
 	if err := r.Client.List(ctx, &inNamespace, client.InNamespace(obj.GetName())); err != nil {
 		r.Log.Error(err, "list AIGuardrails for Namespace event", "namespace", obj.GetName())
+		return nil
+	}
+	return guardrailRequests(inNamespace.Items)
+}
+
+// guardrailsBesideTenantConfig maps a tenant configuration change to every
+// AIGuardrail in the same namespace.
+func (r *Reconciler) guardrailsBesideTenantConfig(ctx context.Context, obj client.Object) []reconcile.Request {
+	var inNamespace aigatewayv1alpha1.AIGuardrailList
+	if err := r.Client.List(ctx, &inNamespace, client.InNamespace(obj.GetNamespace())); err != nil {
+		r.Log.Error(err, "list AIGuardrails for tenant configuration event", "namespace", obj.GetNamespace())
 		return nil
 	}
 	return guardrailRequests(inNamespace.Items)
@@ -266,6 +291,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		log.Info("AIGuardrail timeout is below 1ms", "timeout", guardrail.Spec.Provider.Timeout.Duration)
 		return r.refuse(ctx, &guardrail, original, reasonTimeoutBelowMinimum,
 			"timeout must be at least 1ms; Praxis records provider timeouts in whole milliseconds and rejects zero")
+	}
+
+	if r.OutputChecksUnsupported != nil && hasOutputCheck(&guardrail) {
+		why, err := r.OutputChecksUnsupported(ctx, guardrail.Namespace)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("checking whether %s can enforce Output checks: %w", guardrail.Namespace, err)
+		}
+		if why != "" {
+			log.Info("AIGuardrail has Output checks on a tenant that cannot enforce them", "reason", why)
+			return r.refuse(ctx, &guardrail, original, reasonOutputChecksUnsupported,
+				"Output-phase checks cannot be enforced: "+why)
+		}
 	}
 
 	// The same resolution the field index uses, so a provider event and this
@@ -374,9 +411,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		Message:            compat.Message,
 	})
 
-	// Provider readiness resolves the provider's published checks endpoint,
-	// never inferring one from the NeMo CR's status.phase or from its name
-	// (see evaluateNemoReady).
+	// Provider readiness derives the provider's checks endpoint in an AI
+	// Gateway infrastructure namespace, never inferring one from the NeMo CR's
+	// status.phase (see evaluateNemoReady).
 	readiness := evaluateNemoReady(nemo)
 	readyStatus := metav1.ConditionFalse
 	if readiness.Ready {
@@ -443,6 +480,15 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	log.Info("reconciled AIGuardrail", "generation", guardrail.Generation, "provider", provider)
 	return ctrl.Result{RequeueAfter: r.ResyncInterval}, nil
+}
+
+func hasOutputCheck(guardrail *aigatewayv1alpha1.AIGuardrail) bool {
+	for _, check := range guardrail.Spec.Checks {
+		if slices.Contains(check.Phases, aigatewayv1alpha1.GuardrailPhaseOutput) {
+			return true
+		}
+	}
+	return false
 }
 
 // denyBinding publishes an unresolved or unauthorized provider binding.

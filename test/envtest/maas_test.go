@@ -70,6 +70,9 @@ type maasFixture struct {
 	client client.Client
 }
 
+// infraNamespace is the infrastructure namespace every fixture tenant publishes.
+const infraNamespace = "odh-ai-gateway-infra"
+
 // existingPraxisTenant establishes the currently supported selection precondition.
 // Backend opt-in and migration are outside the model-publication scenario.
 func (m maasFixture) existingPraxisTenant(t *testing.T, namespace string) {
@@ -128,12 +131,14 @@ func (m maasFixture) existingPraxisTenant(t *testing.T, namespace string) {
 	// The praxis reconcile waits for the infrastructure namespace before
 	// rendering: maas-controller publishes it early in tenant bring-up, and
 	// the EnvoyFilter's maas-api route-name matches are qualified with it.
-	// The tenant controller can add its finalizer between the create and
-	// this status update, so retry on conflict with the latest object.
+	// NeMo Services are only accepted in an AI Gateway infrastructure
+	// namespace, so the tenant publishes the ODH one. The tenant controller
+	// can add its finalizer between the create and this status update, so
+	// retry on conflict with the latest object.
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
 		latest := tenant.NewMaasTenantConfig()
 		require.NoError(collect, m.client.Get(t.Context(), client.ObjectKeyFromObject(mtc), latest))
-		latest.Object["status"] = map[string]any{"infraNamespace": namespace}
+		latest.Object["status"] = map[string]any{"infraNamespace": infraNamespace}
 		require.NoError(collect, m.client.Status().Update(t.Context(), latest))
 	}, 10*time.Second, time.Second, "publish status.infraNamespace on the MaasTenantConfig")
 }
