@@ -29,6 +29,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -66,7 +67,17 @@ type Reconciler struct {
 	// SetupWithManager fills it from the manager; it is re-read on every
 	// reconcile so a policy recovers once TrustyAI appears, rather than
 	// waiting for this controller to restart.
+	//
+	// It answers that in one direction only. The mapper reloads discovery on
+	// a miss, so a CRD that appears is noticed, while one that is uninstalled
+	// leaves a resolved mapping behind that nothing invalidates.
 	RESTMapper apimeta.RESTMapper
+	// Discovery answers the same question live, for the one path where the
+	// mapper's stale "present" would be published as a verdict. Kept separate
+	// rather than replacing RESTMapper because the mapper is the cheap check
+	// every reconcile makes, and this is a round trip per refusal.
+	// SetupWithManager fills it from the manager.
+	Discovery serverResourceLister
 
 	// OutputChecksUnsupported returns why the tenant in a policy's namespace
 	// cannot enforce Output-phase checks, or "" if it can, so such a policy is
@@ -142,6 +153,16 @@ func indexGuardrailByProvider(obj client.Object) []string {
 // there still has to be told on its own status why it is not enforcing.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.RESTMapper = mgr.GetRESTMapper()
+
+	// Built on the manager's own config and transport, so this shares the
+	// connection pool and credentials the rest of the controller uses rather
+	// than opening a second client to the same API server.
+	discoveryClient, err := discovery.NewDiscoveryClientForConfigAndClient(mgr.GetConfig(), mgr.GetHTTPClient())
+	if err != nil {
+		return fmt.Errorf("building the discovery client for %s: %w", NemoGuardrailsGVK, err)
+	}
+	r.Discovery = discoveryClient
+
 	installed, err := providerCRDInstalled(r.RESTMapper)
 	if err != nil {
 		return err
@@ -324,7 +345,30 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			// same choice the CRD check above makes.
 			return ctrl.Result{}, fmt.Errorf("reading NemoGuardrails %s: %w", provider, err)
 		}
-		// Absence, unlike a failed read, is an answer.
+		// Absence, unlike a failed read, is an answer -- but not yet which of
+		// the two refusals it is. A provider that cannot be read is also what
+		// an uninstalled CRD looks like from here, and the check above cannot
+		// tell them apart once its mapping has resolved, so this is the point
+		// the question is put to discovery.
+		served, err := providerCRDServed(ctx, r.Discovery)
+		if err != nil {
+			// Same reasoning as the two reads above: back off rather than
+			// attribute a refusal on a lookup that did not complete. Logged
+			// rather than left to the controller's generic error handling,
+			// because the visible effect is a policy whose status simply does
+			// not move, and the reason for that belongs where an operator
+			// looking at this policy will find it.
+			log.Error(err, "cannot tell a missing provider from a missing CRD; leaving the verdict unpublished",
+				"provider", provider, "crd", NemoGuardrailsGVK.String())
+			return ctrl.Result{}, fmt.Errorf("checking whether %s is still served: %w", NemoGuardrailsGVK, err)
+		}
+		if !served {
+			log.Info("NemoGuardrails CRD is no longer served; refusing AIGuardrail",
+				"crd", NemoGuardrailsGVK.String(), "provider", provider)
+			return r.denyBinding(ctx, &guardrail, original, reasonProviderCRDNotInstalled,
+				"TrustyAI's NemoGuardrails CRD is not installed on this cluster, so no guardrail provider can be resolved")
+		}
+
 		log.Info("AIGuardrail provider unresolved", "provider", provider, "reason", reasonProviderNotFound)
 		return r.denyBinding(ctx, &guardrail, original, reasonProviderNotFound,
 			"referenced NemoGuardrails provider does not exist")

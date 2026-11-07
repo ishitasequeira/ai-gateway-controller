@@ -160,8 +160,17 @@ func assertNemoAuthMounted(t *testing.T, deployment *unstructured.Unstructured) 
 		t.Fatal("payload-processing has no containers")
 	}
 	mounts, _, _ := unstructured.NestedSlice(testObject(t, containers[0]), "volumeMounts")
-	if len(mounts) != 2 || testObject(t, mounts[1])["mountPath"] != nemoAuthMountPath {
-		t.Fatalf("volumeMounts = %v, want the praxis config and %s", mounts, nemoAuthMountPath)
+	hasPraxis, hasNemo := false, false
+	for _, mount := range mounts {
+		switch testObject(t, mount)["mountPath"] {
+		case "/etc/praxis":
+			hasPraxis = true
+		case nemoAuthMountPath:
+			hasNemo = true
+		}
+	}
+	if !hasPraxis || !hasNemo {
+		t.Fatalf("volumeMounts = %v, want /etc/praxis and %s (TLS mount may also be present)", mounts, nemoAuthMountPath)
 	}
 }
 
