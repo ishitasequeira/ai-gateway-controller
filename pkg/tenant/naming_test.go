@@ -64,6 +64,16 @@ func TestPerResourceNamingFunctions(t *testing.T) {
 			PayloadProcessingReaderClusterRoleBindingNameForTenant(tenantID),
 			"payload-processing-reader-redteam",
 		},
+		{
+			"PayloadProcessingMetricsAuthClusterRoleBindingNameForTenant",
+			PayloadProcessingMetricsAuthClusterRoleBindingNameForTenant(tenantID),
+			"payload-processing-metrics-auth-redteam",
+		},
+		{
+			"PayloadProcessingMetricsServiceNameForTenant",
+			PayloadProcessingMetricsServiceNameForTenant(tenantID),
+			"payload-processing-metrics-redteam",
+		},
 	}
 
 	for _, c := range cases {

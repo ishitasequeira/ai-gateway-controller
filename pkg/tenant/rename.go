@@ -33,13 +33,12 @@ import (
 // DestinationRule host/sni, ClusterRoleBinding subject) that would otherwise
 // still point at the unsuffixed names.
 //
-// The shared "payload-processing-reader" ClusterRole is intentionally left
-// untouched: every tenant's ClusterRoleBinding binds to that one shared
-// role, only the binding (and its subject) is per-tenant, mirroring
-// maas-controller's own IPP ClusterRole/ClusterRoleBinding split.
+// ExtProc must not inherit the legacy payload-processing-reader API grants.
+// The shared/pre-auth ServiceAccount does keep the metrics-auth binding
+// (TokenReview / SubjectAccessReview) so authenticated /metrics scrapes work.
 //
 // Next to the shared ServiceAccount it adds the post-auth ExtProc's own
-// ServiceAccount, which nothing binds.
+// ServiceAccount, which nothing binds (no API token, no ClusterRoleBinding).
 //
 // It does not mutate the input slice.
 func Rename(resources []unstructured.Unstructured, tenantID, namespace string) ([]unstructured.Unstructured, error) {
@@ -92,8 +91,6 @@ func renameOne(u *unstructured.Unstructured, tenantID, namespace string) error {
 		return setName(u, PayloadProcessingServiceAccountName(tenantID))
 	case kind == "NetworkPolicy" && name == PayloadProcessingName:
 		return renamePayloadProcessingNetworkPolicy(u, tenantID)
-	case kind == "ClusterRoleBinding" && name == PayloadProcessingReaderClusterRoleBindingName:
-		return renamePayloadProcessingReaderClusterRoleBinding(u, tenantID)
 	case kind == "EnvoyFilter" && name == PayloadProcessingName:
 		return renamePayloadProcessingEnvoyFilter(u, tenantID, namespace)
 	case kind == "EnvoyFilter" && name == PayloadProcessingExternalModelFilterName:
@@ -102,9 +99,76 @@ func renameOne(u *unstructured.Unstructured, tenantID, namespace string) error {
 		return renamePayloadDestinationRule(u, PayloadProcessingServiceName(tenantID), namespace)
 	case kind == "DestinationRule" && name == PayloadPreProcessingName:
 		return renamePayloadDestinationRule(u, PayloadPreProcessingServiceName(tenantID), namespace)
+	case kind == "Service" && name == PayloadProcessingMetricsServiceName:
+		return renamePayloadProcessingMetricsService(u, tenantID)
+	case kind == "ServiceMonitor" && name == PayloadProcessingMetricsMonitorName:
+		return renamePayloadProcessingMetricsMonitor(u, tenantID)
+	case kind == "ClusterRoleBinding" && name == PayloadProcessingMetricsAuthName:
+		return renamePayloadProcessingMetricsAuthBinding(u, tenantID)
 	}
-	// Everything else (notably the shared ClusterRole) passes through
-	// unchanged.
+	// Everything else (shared ClusterRoles, metrics-reader binding) passes
+	// through unchanged. Legacy payload-processing-reader bindings are dropped
+	// later in SplitPostAuthResources / cleanup.
+	return nil
+}
+
+func renamePayloadProcessingMetricsService(u *unstructured.Unstructured, tenantID string) error {
+	if err := setName(u, PayloadProcessingMetricsServiceNameForTenant(tenantID)); err != nil {
+		return err
+	}
+	deploymentName := PayloadProcessingDeploymentName(tenantID)
+	if err := setObjectLabel(u, LabelTenantInstance, deploymentName); err != nil {
+		return fmt.Errorf("tenant-instance label: %w", err)
+	}
+	if err := setServiceSelector(u, map[string]string{
+		"app":               PayloadProcessingName,
+		LabelTenantInstance: deploymentName,
+	}); err != nil {
+		return fmt.Errorf("selector: %w", err)
+	}
+	return nil
+}
+
+func renamePayloadProcessingMetricsMonitor(u *unstructured.Unstructured, tenantID string) error {
+	if err := setName(u, PayloadProcessingMetricsMonitorNameForTenant(tenantID)); err != nil {
+		return err
+	}
+	deploymentName := PayloadProcessingDeploymentName(tenantID)
+	if err := setObjectLabel(u, LabelTenantInstance, deploymentName); err != nil {
+		return fmt.Errorf("tenant-instance label: %w", err)
+	}
+	if err := unstructured.SetNestedStringMap(u.Object, map[string]string{
+		"app":                         PayloadProcessingName,
+		"app.kubernetes.io/component": "monitoring",
+		LabelTenantInstance:           deploymentName,
+	}, "spec", "selector", "matchLabels"); err != nil {
+		return fmt.Errorf("selector.matchLabels: %w", err)
+	}
+	return nil
+}
+
+func renamePayloadProcessingMetricsAuthBinding(u *unstructured.Unstructured, tenantID string) error {
+	if err := setName(u, PayloadProcessingMetricsAuthClusterRoleBindingNameForTenant(tenantID)); err != nil {
+		return err
+	}
+	subjects, found, err := unstructured.NestedSlice(u.Object, "subjects")
+	if err != nil {
+		return fmt.Errorf("read subjects: %w", err)
+	}
+	if !found || len(subjects) == 0 {
+		return errors.New("subjects are missing")
+	}
+	subject, ok := subjects[0].(map[string]any)
+	if !ok {
+		return errors.New("subject is malformed")
+	}
+	// Bind the shared/pre-auth SA (token automount stays enabled upstream for
+	// metrics auth). Post-auth and ExternalModel SAs intentionally stay unbound.
+	subject["name"] = PayloadProcessingServiceAccountName(tenantID)
+	subjects[0] = subject
+	if err := unstructured.SetNestedSlice(u.Object, subjects, "subjects"); err != nil {
+		return fmt.Errorf("write subjects: %w", err)
+	}
 	return nil
 }
 
@@ -151,6 +215,13 @@ func renamePayloadProcessingDeployment(u *unstructured.Unstructured, tenantID st
 	if err := setConfigMapVolumeName(u, "plugins-config-volume", PayloadProcessingPluginsConfigMapForTenant(tenantID)); err != nil {
 		return fmt.Errorf("plugins ConfigMap volume: %w", err)
 	}
+	tlsSecret := PayloadProcessingTLSSecretName(tenantID)
+	if err := setTLSSecretVolumeName(u, "tls", tlsSecret); err != nil {
+		return fmt.Errorf("tls secret volume: %w", err)
+	}
+	if err := setReloaderSecretName(u, tlsSecret); err != nil {
+		return fmt.Errorf("reloader annotation: %w", err)
+	}
 	return nil
 }
 
@@ -182,6 +253,13 @@ func renamePayloadPreProcessingDeployment(u *unstructured.Unstructured, tenantID
 	if err := setConfigMapVolumeName(u, "plugins-config-volume", PayloadProcessingPluginsConfigMapForTenant(tenantID)); err != nil {
 		return fmt.Errorf("plugins ConfigMap volume: %w", err)
 	}
+	tlsSecret := PayloadPreProcessingTLSSecretName(tenantID)
+	if err := setTLSSecretVolumeName(u, "tls", tlsSecret); err != nil {
+		return fmt.Errorf("tls secret volume: %w", err)
+	}
+	if err := setReloaderSecretName(u, tlsSecret); err != nil {
+		return fmt.Errorf("reloader annotation: %w", err)
+	}
 	return nil
 }
 
@@ -193,6 +271,9 @@ func renamePayloadProcessingService(u *unstructured.Unstructured, tenantID strin
 	if err := setServiceSelector(u, map[string]string{"app": PayloadProcessingName, LabelTenantInstance: deploymentName}); err != nil {
 		return fmt.Errorf("selector: %w", err)
 	}
+	if err := setServingCertSecretName(u, PayloadProcessingTLSSecretName(tenantID)); err != nil {
+		return fmt.Errorf("serving-cert annotation: %w", err)
+	}
 	return nil
 }
 
@@ -203,6 +284,9 @@ func renamePayloadPreProcessingService(u *unstructured.Unstructured, tenantID st
 	deploymentName := PayloadPreProcessingDeploymentName(tenantID)
 	if err := setServiceSelector(u, map[string]string{"app": PayloadPreProcessingName, LabelTenantInstance: deploymentName}); err != nil {
 		return fmt.Errorf("selector: %w", err)
+	}
+	if err := setServingCertSecretName(u, PayloadPreProcessingTLSSecretName(tenantID)); err != nil {
+		return fmt.Errorf("serving-cert annotation: %w", err)
 	}
 	return nil
 }
@@ -234,29 +318,6 @@ func renamePayloadProcessingNetworkPolicy(u *unstructured.Unstructured, tenantID
 	return nil
 }
 
-func renamePayloadProcessingReaderClusterRoleBinding(u *unstructured.Unstructured, tenantID string) error {
-	if err := setName(u, PayloadProcessingReaderClusterRoleBindingNameForTenant(tenantID)); err != nil {
-		return err
-	}
-	subjects, found, err := unstructured.NestedSlice(u.Object, "subjects")
-	if err != nil {
-		return fmt.Errorf("read subjects: %w", err)
-	}
-	if !found || len(subjects) == 0 {
-		return errors.New("subjects not found")
-	}
-	subject, ok := subjects[0].(map[string]any)
-	if !ok {
-		return errors.New("subjects[0] is not an object")
-	}
-	subject["name"] = PayloadProcessingServiceAccountName(tenantID)
-	subjects[0] = subject
-	if err := unstructured.SetNestedSlice(u.Object, subjects, "subjects"); err != nil {
-		return fmt.Errorf("write subjects: %w", err)
-	}
-	return nil
-}
-
 func renamePayloadDestinationRule(u *unstructured.Unstructured, serviceName, namespace string) error {
 	if err := setName(u, serviceName); err != nil {
 		return err
@@ -267,6 +328,9 @@ func renamePayloadDestinationRule(u *unstructured.Unstructured, serviceName, nam
 	}
 	if err := unstructured.SetNestedField(u.Object, fqdn, "spec", "trafficPolicy", "tls", "sni"); err != nil {
 		return fmt.Errorf("sni: %w", err)
+	}
+	if err := unstructured.SetNestedStringSlice(u.Object, []string{fqdn}, "spec", "trafficPolicy", "tls", "subjectAltNames"); err != nil {
+		return fmt.Errorf("subjectAltNames: %w", err)
 	}
 	return nil
 }
@@ -379,6 +443,31 @@ func renamePayloadProcessingExternalModelFilter(u *unstructured.Unstructured, te
 func setClusterUpstreamAddress(value map[string]any, fqdn string) error {
 	if err := unstructured.SetNestedField(value, fqdn, "transport_socket", "typed_config", "sni"); err != nil {
 		return fmt.Errorf("sni: %w", err)
+	}
+	sans, found, err := unstructured.NestedSlice(value,
+		"transport_socket", "typed_config", "common_tls_context", "validation_context",
+		"match_typed_subject_alt_names")
+	if err != nil {
+		return fmt.Errorf("read san matchers: %w", err)
+	}
+	if !found || len(sans) == 0 {
+		return errors.New("match_typed_subject_alt_names is required (fail-closed TLS SAN verification)")
+	}
+	san0, ok := sans[0].(map[string]any)
+	if !ok {
+		return errors.New("match_typed_subject_alt_names[0] is not an object")
+	}
+	matcher, ok := san0["matcher"].(map[string]any)
+	if !ok {
+		return errors.New("san matcher is not an object")
+	}
+	matcher["exact"] = fqdn
+	san0["matcher"] = matcher
+	sans[0] = san0
+	if err := unstructured.SetNestedSlice(value, sans,
+		"transport_socket", "typed_config", "common_tls_context", "validation_context",
+		"match_typed_subject_alt_names"); err != nil {
+		return fmt.Errorf("write san matchers: %w", err)
 	}
 
 	loadAssignment, ok := value["load_assignment"].(map[string]any)
@@ -493,4 +582,54 @@ func setConfigMapVolumeName(u *unstructured.Unstructured, volumeName, configMapN
 		return nil
 	}
 	return fmt.Errorf("volume %q not found", volumeName)
+}
+
+func setTLSSecretVolumeName(u *unstructured.Unstructured, volumeName, secretName string) error {
+	volumes, found, err := unstructured.NestedSlice(u.Object, "spec", "template", "spec", "volumes")
+	if err != nil {
+		return fmt.Errorf("read volumes: %w", err)
+	}
+	if !found {
+		return errors.New("volumes not found")
+	}
+	for i, raw := range volumes {
+		vol, ok := raw.(map[string]any)
+		if !ok || vol["name"] != volumeName {
+			continue
+		}
+		secret, ok := vol["secret"].(map[string]any)
+		if !ok {
+			return fmt.Errorf("volume %q has no secret", volumeName)
+		}
+		secret["secretName"] = secretName
+		vol["secret"] = secret
+		volumes[i] = vol
+		if err := unstructured.SetNestedSlice(u.Object, volumes, "spec", "template", "spec", "volumes"); err != nil {
+			return fmt.Errorf("write volumes: %w", err)
+		}
+		return nil
+	}
+	return fmt.Errorf("volume %q not found", volumeName)
+}
+
+func setServingCertSecretName(u *unstructured.Unstructured, secretName string) error {
+	annotations := u.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	annotations[servingCertSecretAnnotation] = secretName
+	u.SetAnnotations(annotations)
+	return nil
+}
+
+// setReloaderSecretName points Reloader at the OpenShift serving-cert Secret so
+// pod rollouts track service-ca rotation for tenant-renamed TLS secret names.
+func setReloaderSecretName(u *unstructured.Unstructured, secretName string) error {
+	annotations := u.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	annotations[reloaderSecretAnnotation] = secretName
+	u.SetAnnotations(annotations)
+	return nil
 }

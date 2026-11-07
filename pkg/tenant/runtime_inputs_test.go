@@ -62,7 +62,7 @@ func TestRuntimeRetainsDeletingHomeBindingUntilAppliedRouteIsPruned(t *testing.T
 			if err != nil || len(candidates) != 1 || candidates[0].Credential == nil || candidates[0].Credential.Header != "x-api-key" || candidates[0].TargetModel != "claude" {
 				t.Fatalf("retained runtime=%#v err=%v", candidates, err)
 			}
-			config, _, err := ExternalModelExtProcConfig(model.Namespace, candidates, true)
+			config, _, err := ExternalModelExtProcConfig(model.Namespace, candidates, true, DefaultExtProcMaxBodyBytes)
 			if err != nil || !strings.Contains(config, "x-api-key") || !strings.Contains(config, "provider-key") {
 				t.Fatalf("retained Anthropic configuration err=%v", err)
 			}

@@ -188,9 +188,13 @@ func newFixture(opts fixtureOptions) *fixture {
 			Scheme:         scheme,
 			ResyncInterval: time.Minute,
 			Recorder:       recorder,
-			// What SetupWithManager fills in from the manager. A nil mapper
-			// is not a usable Reconciler, so it is stated rather than assumed.
+			// What SetupWithManager fills in from the manager. Neither is
+			// optional on a usable Reconciler, so both are stated rather than
+			// assumed. Together they model the ordinary cluster: the CRD is
+			// installed and served, so a provider that cannot be read is a
+			// missing object rather than a missing platform.
 			RESTMapper: mapperWithNemo(),
+			Discovery:  stubDiscovery{kinds: []string{NemoGuardrailsGVK.Kind}},
 		},
 		cache:  cache,
 		live:   live,
@@ -1085,6 +1089,49 @@ func TestReconcileRefusesEveryPolicyWhenTheProviderCRDIsAbsent(t *testing.T) {
 	requireCondition(t, got, ConditionAccepted, metav1.ConditionFalse, reasonProviderCRDNotInstalled)
 	requireCondition(t, got, ConditionCompatible, metav1.ConditionUnknown, reasonProviderCRDNotInstalled)
 	requireCondition(t, got, ConditionProviderReady, metav1.ConditionUnknown, reasonProviderCRDNotInstalled)
+}
+
+// TestReconcileRefusesAsCRDAbsentWhenTheCRDIsUninstalledUnderARunningController
+// covers the direction the RESTMapper cannot report. Uninstalling TrustyAI
+// takes the CRD and every provider object with it, but the mapper reloads
+// discovery only when a lookup misses, so a mapping that already resolved
+// keeps answering "installed".
+//
+// Left to the mapper alone, the policy falls through to ProviderNotFound and
+// tells the operator to fix a provider reference that is perfectly correct.
+// The fixture holds the mapper at its stale answer deliberately: that is the
+// state the running controller is actually in.
+func TestReconcileRefusesAsCRDAbsentWhenTheCRDIsUninstalledUnderARunningController(t *testing.T) {
+	// No provider object, because deleting the CRD deleted it. Discovery
+	// still serves the group/version, which is the shape a real cluster has:
+	// TrustyAI's other kinds keep it answering.
+	f := newStandardFixture(newGuardrail(consumerNS, nemoName, providerNS))
+	f.reconciler.Discovery = stubDiscovery{kinds: []string{"TrustyAIService"}}
+
+	res := f.reconcile(t, consumerNS)
+	requireDenied(t, f, res, consumerNS, reasonProviderCRDNotInstalled)
+}
+
+// TestReconcileReportsDiscoveryFailureRatherThanAttributingTheRefusal keeps a
+// broken discovery from being read as a missing CRD. The provider is genuinely
+// absent here, so there is a refusal to publish either way -- but publishing
+// the wrong one names a platform component that is installed.
+func TestReconcileReportsDiscoveryFailureRatherThanAttributingTheRefusal(t *testing.T) {
+	f := newStandardFixture(newGuardrail(consumerNS, nemoName, providerNS))
+	f.reconciler.Discovery = stubDiscovery{err: errors.New("discovery unavailable")}
+
+	_, err := f.reconciler.Reconcile(t.Context(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: consumerNS, Name: guardrailName},
+	})
+	if err == nil {
+		t.Fatal("Reconcile succeeded with discovery broken, want the error so the reconcile is retried")
+	}
+
+	got := f.reload(t, consumerNS)
+	if len(got.Status.Conditions) != 0 {
+		t.Fatalf("status carries conditions %v; a refusal must not be attributed on a lookup that did not complete",
+			got.Status.Conditions)
+	}
 }
 
 // TestReconcileRecoversWhenTheProviderCRDIsInstalledLater is the reason the

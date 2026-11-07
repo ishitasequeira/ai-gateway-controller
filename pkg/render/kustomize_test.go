@@ -77,14 +77,15 @@ func TestRenderKustomizeBuildsVendoredOverlay(t *testing.T) {
 
 	wantKinds := map[string]int{
 		"ServiceAccount":     1,
-		"ClusterRole":        1,
-		"ClusterRoleBinding": 1,
+		"ClusterRole":        2,
+		"ClusterRoleBinding": 2,
 		"ConfigMap":          1,
-		"Service":            2,
+		"Service":            3,
 		"Deployment":         2,
 		"DestinationRule":    2,
 		"EnvoyFilter":        2,
 		"NetworkPolicy":      1,
+		"ServiceMonitor":     1,
 	}
 	gotKinds := map[string]int{}
 	for _, r := range resources {
