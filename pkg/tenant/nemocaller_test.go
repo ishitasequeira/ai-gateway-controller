@@ -96,24 +96,83 @@ func TestConfigureNemoCalloutsCompilesAcceptedEndpoint(t *testing.T) {
 	if len(resources) != 4 {
 		t.Fatalf("resources = %d, want no NeMo RBAC for auth-off providers", len(resources))
 	}
-	if volumes, _, _ := unstructured.NestedSlice(resources[0].Object, "spec", "template", "spec", "volumes"); len(volumes) != 1 {
-		t.Fatalf("volumes = %v, want no NeMo auth volume for auth-off providers", volumes)
+	volumes, _, _ := unstructured.NestedSlice(resources[0].Object, "spec", "template", "spec", "volumes")
+	if len(volumes) != 2 {
+		t.Fatalf("volumes = %v, want plugins + TLS only (no NeMo auth volume for auth-off providers)", volumes)
+	}
+	for _, volume := range volumes {
+		v, ok := volume.(map[string]any)
+		if !ok {
+			t.Fatalf("volume = %T, want object", volume)
+		}
+		if name, _, _ := unstructured.NestedString(v, "name"); name == nemoAuthVolumeName {
+			t.Fatalf("volumes = %v, want no NeMo auth volume for auth-off providers", volumes)
+		}
 	}
 	data, _, _ := unstructured.NestedStringMap(findResource(resources, "ConfigMap", PayloadProcessingPluginsConfigMapForTenant("red"), "gw").Object, "data")
 	config := data["extproc.yaml"]
 	if data["pre-extproc.yaml"] != "pre" {
 		t.Fatal("pre-auth config was rewritten")
 	}
+	assertCompiledNemoAcceptedEndpoint(t, config)
+
+	egress, _, _ := unstructured.NestedSlice(findResource(resources, "NetworkPolicy", PayloadProcessingNetworkPolicyName("red"), "gw").Object, "spec", "egress")
+	if len(egress) != 2 {
+		t.Fatalf("egress = %v, want the rendered rule plus one NeMo rule", egress)
+	}
+	rule, ok := egress[1].(map[string]any)
+	if !ok {
+		t.Fatalf("NeMo egress rule = %v, want a map", egress[1])
+	}
+	ports, _ := rule["ports"].([]any)
+	port, _ := ports[0].(map[string]any)
+	if len(ports) != 1 || port["port"] != nemoServerPort || port["protocol"] != "TCP" {
+		t.Fatalf("NeMo egress ports = %v, want TCP %d", ports, nemoServerPort)
+	}
+	var namespaces []string
+	peers, _ := rule["to"].([]any)
+	for _, peer := range peers {
+		peerMap, ok := peer.(map[string]any)
+		if !ok {
+			t.Fatalf("egress peer = %v, want a map", peer)
+		}
+		labels, _, err := unstructured.NestedStringMap(peerMap, "namespaceSelector", "matchLabels")
+		if err != nil {
+			t.Fatalf("egress peer labels: %v", err)
+		}
+		namespaces = append(namespaces, labels["kubernetes.io/metadata.name"])
+	}
+	if len(namespaces) != 2 || namespaces[0] != "odh-ai-gateway-infra" || namespaces[1] != "other" {
+		t.Fatalf("NeMo egress namespaces = %v, want [odh-ai-gateway-infra other]", namespaces)
+	}
+
+	hash, _, _ := unstructured.NestedString(findResource(resources, "Deployment", PayloadProcessingDeploymentName("red"), "gw").Object,
+		"spec", "template", "metadata", "annotations", nemoCalloutConfigAnnotation)
+	if hash == "" {
+		t.Fatal("post-auth pod template has no config hash; Praxis would keep the old extproc.yaml")
+	}
+	if _, found, _ := unstructured.NestedString(findResource(resources, "Deployment", PayloadPreProcessingDeploymentName("red"), "gw").Object,
+		"spec", "template", "metadata", "annotations", nemoCalloutConfigAnnotation); found {
+		t.Fatal("pre-auth pod was annotated")
+	}
+}
+
+type compiledNemoCheck struct {
+	configID, endpoint, header string
+	request, response          bool
+}
+
+// assertCompiledNemoAcceptedEndpoint checks the compiled NeMo filter chain for
+// TestConfigureNemoCalloutsCompilesAcceptedEndpoint. Extracted so the parent
+// test stays under the gocyclo limit.
+func assertCompiledNemoAcceptedEndpoint(t *testing.T, config string) {
+	t.Helper()
 	doc, filters := parseCompiled(t, config)
 	if first, _ := filters[0].(map[string]any); first["filter"] != "request_id" {
 		t.Fatalf("request_id is no longer the first filter:\n%s", config)
 	}
 	const infra = "http://tenant-a-nemo.odh-ai-gateway-infra.svc.cluster.local/v1/checks"
-	type compiledCheck struct {
-		configID, endpoint, header string
-		request, response          bool
-	}
-	want := []compiledCheck{
+	want := []compiledNemoCheck{
 		{"pii-v1", infra, "h-pii", true, false},
 		{"jailbreak-v1", infra, "h-jailbreak", true, false},
 		{"toxicity-v1", infra, "h-toxicity", true, false},
@@ -166,46 +225,6 @@ func TestConfigureNemoCalloutsCompilesAcceptedEndpoint(t *testing.T) {
 	insecure, _ := doc["insecure_options"].(map[string]any)
 	if insecure["allow_private_upstreams"] != true || insecure["allow_unbounded_body"] != true {
 		t.Fatalf("insecure_options = %v, want private upstreams added and unbounded body kept", insecure)
-	}
-
-	egress, _, _ := unstructured.NestedSlice(findResource(resources, "NetworkPolicy", PayloadProcessingNetworkPolicyName("red"), "gw").Object, "spec", "egress")
-	if len(egress) != 2 {
-		t.Fatalf("egress = %v, want the rendered rule plus one NeMo rule", egress)
-	}
-	rule, ok := egress[1].(map[string]any)
-	if !ok {
-		t.Fatalf("NeMo egress rule = %v, want a map", egress[1])
-	}
-	ports, _ := rule["ports"].([]any)
-	port, _ := ports[0].(map[string]any)
-	if len(ports) != 1 || port["port"] != nemoServerPort || port["protocol"] != "TCP" {
-		t.Fatalf("NeMo egress ports = %v, want TCP %d", ports, nemoServerPort)
-	}
-	var namespaces []string
-	peers, _ := rule["to"].([]any)
-	for _, peer := range peers {
-		peerMap, ok := peer.(map[string]any)
-		if !ok {
-			t.Fatalf("egress peer = %v, want a map", peer)
-		}
-		labels, _, err := unstructured.NestedStringMap(peerMap, "namespaceSelector", "matchLabels")
-		if err != nil {
-			t.Fatalf("egress peer labels: %v", err)
-		}
-		namespaces = append(namespaces, labels["kubernetes.io/metadata.name"])
-	}
-	if len(namespaces) != 2 || namespaces[0] != "odh-ai-gateway-infra" || namespaces[1] != "other" {
-		t.Fatalf("NeMo egress namespaces = %v, want [infra other]", namespaces)
-	}
-
-	hash, _, _ := unstructured.NestedString(findResource(resources, "Deployment", PayloadProcessingDeploymentName("red"), "gw").Object,
-		"spec", "template", "metadata", "annotations", nemoCalloutConfigAnnotation)
-	if hash == "" {
-		t.Fatal("post-auth pod template has no config hash; Praxis would keep the old extproc.yaml")
-	}
-	if _, found, _ := unstructured.NestedString(findResource(resources, "Deployment", PayloadPreProcessingDeploymentName("red"), "gw").Object,
-		"spec", "template", "metadata", "annotations", nemoCalloutConfigAnnotation); found {
-		t.Fatal("pre-auth pod was annotated")
 	}
 }
 

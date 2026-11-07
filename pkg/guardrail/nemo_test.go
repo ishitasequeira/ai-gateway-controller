@@ -17,10 +17,13 @@ limitations under the License.
 package guardrail
 
 import (
+	"context"
 	"errors"
 	"testing"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
@@ -103,6 +106,84 @@ func TestProviderCRDInstalled(t *testing.T) {
 		}
 		if installed {
 			t.Fatal("providerCRDInstalled = true for a different Kind in the same group, want false")
+		}
+	})
+}
+
+// stubDiscovery answers one group/version lookup with a fixed result, standing
+// in for the API server's /apis/<group>/<version> endpoint.
+type stubDiscovery struct {
+	kinds []string
+	err   error
+}
+
+func (s stubDiscovery) ServerResourcesForGroupVersionWithContext(_ context.Context, groupVersion string) (*metav1.APIResourceList, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	list := &metav1.APIResourceList{GroupVersion: groupVersion}
+	for _, kind := range s.kinds {
+		list.APIResources = append(list.APIResources, metav1.APIResource{Kind: kind})
+	}
+	return list, nil
+}
+
+// discoveryNotFound is what a group/version nothing serves returns: the REST
+// client turns the API server's 404 into a NotFound status error.
+func discoveryNotFound() error {
+	return apierrors.NewGenericServerResponse(404, "get", schema.GroupResource{}, "", "not found", 0, false)
+}
+
+func TestProviderCRDServed(t *testing.T) {
+	t.Run("served when the group/version carries the Kind", func(t *testing.T) {
+		served, err := providerCRDServed(t.Context(), stubDiscovery{
+			kinds: []string{"TrustyAIService", NemoGuardrailsGVK.Kind},
+		})
+		if err != nil {
+			t.Fatalf("providerCRDServed: %v", err)
+		}
+		if !served {
+			t.Fatal("providerCRDServed = false with the Kind in discovery, want true")
+		}
+	})
+
+	t.Run("not served when the group/version is gone", func(t *testing.T) {
+		// Removing the only CRD that defined the group/version takes the whole
+		// path with it, which is what envtest does.
+		served, err := providerCRDServed(t.Context(), stubDiscovery{err: discoveryNotFound()})
+		if err != nil {
+			t.Fatalf("providerCRDServed returned an error for an absent group/version: %v", err)
+		}
+		if served {
+			t.Fatal("providerCRDServed = true for a group/version nothing serves, want false")
+		}
+	})
+
+	t.Run("not served when the group/version outlives the Kind", func(t *testing.T) {
+		// The real-cluster case: TrustyAI's other kinds keep
+		// trustyai.opendatahub.io/v1alpha1 answering after NemoGuardrails is
+		// uninstalled, so a check that trusted the path would report it
+		// present and send an operator to fix the provider reference.
+		served, err := providerCRDServed(t.Context(), stubDiscovery{
+			kinds: []string{"TrustyAIService", "LMEvalJob"},
+		})
+		if err != nil {
+			t.Fatalf("providerCRDServed: %v", err)
+		}
+		if served {
+			t.Fatal("providerCRDServed = true with the Kind absent from discovery, want false")
+		}
+	})
+
+	t.Run("a broken discovery is an error, not an absence", func(t *testing.T) {
+		// Reporting absence here would retract a working binding and blame a
+		// missing CRD for an API server blip.
+		served, err := providerCRDServed(t.Context(), stubDiscovery{err: errors.New("discovery unavailable")})
+		if err == nil {
+			t.Fatal("providerCRDServed succeeded on a discovery failure, want an error")
+		}
+		if served {
+			t.Fatal("providerCRDServed = true alongside an error, want false")
 		}
 	})
 }
