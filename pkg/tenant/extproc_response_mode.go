@@ -31,6 +31,15 @@ var allowedExtProcResponseBodyModes = map[string]struct{}{
 	"BUFFERED": {},
 }
 
+// extProcResponseBodyModeAnnotation returns the raw annotation value used by
+// watch predicates so annotation-only flips enqueue a reconcile.
+func extProcResponseBodyModeAnnotation(mtc *unstructured.Unstructured) string {
+	if mtc == nil {
+		return ""
+	}
+	return mtc.GetAnnotations()[AnnotationExtProcResponseBodyMode]
+}
+
 // resolveExtProcResponseBodyMode reads AnnotationExtProcResponseBodyMode from
 // the MaasTenantConfig. Absent or invalid values fall back to
 // DefaultExtProcResponseBodyMode; invalid values also log a warning.
@@ -51,5 +60,56 @@ func resolveExtProcResponseBodyMode(mtc *unstructured.Unstructured, log logr.Log
 		)
 		return DefaultExtProcResponseBodyMode
 	}
+	if value != DefaultExtProcResponseBodyMode {
+		log.Info("Applying a non-default ExtProc response body mode",
+			"annotation", AnnotationExtProcResponseBodyMode,
+			"value", value,
+		)
+	}
 	return value
+}
+
+// ExtProcResponseBodyModeBuffered is the Envoy BodySendMode Praxis needs to
+// evaluate Output-phase AIGuardrail checks (StreamBuffer on the response path).
+const ExtProcResponseBodyModeBuffered = "BUFFERED"
+
+// constrainExtProcResponseBodyMode adjusts an resolved response body mode when
+// a stronger requirement applies:
+//   - Output-phase callouts force BUFFERED (not the STREAMED default): Praxis
+//     only runs Output guards on a buffered body. The tenant-wide default
+//     remains STREAMED; BUFFERED is applied only while those callouts remain
+//     after infra pinning. With apiTranslation enabled, Output checks are
+//     unsupported and should not reach this path.
+//   - NONE with apiTranslation falls back to DefaultExtProcResponseBodyMode
+//     (STREAMED) so Messages SSE translation still receives response chunks.
+func constrainExtProcResponseBodyMode(mode string, apiTranslation, needsResponseBody bool, log logr.Logger) string {
+	if needsResponseBody && mode != ExtProcResponseBodyModeBuffered {
+		log.Info("Forcing BUFFERED ExtProc response body mode: Output-phase guardrail checks require a buffered body",
+			"annotation", AnnotationExtProcResponseBodyMode,
+			"requested", mode,
+			"effective", ExtProcResponseBodyModeBuffered,
+		)
+		return ExtProcResponseBodyModeBuffered
+	}
+	if mode == "NONE" && apiTranslation {
+		log.Info("Ignoring NONE ExtProc response body mode: API translation requires response body callbacks",
+			"annotation", AnnotationExtProcResponseBodyMode,
+			"default", DefaultExtProcResponseBodyMode,
+		)
+		return DefaultExtProcResponseBodyMode
+	}
+	return mode
+}
+
+// calloutsNeedResponseBody reports whether any accepted callout still has an
+// Output-phase check after infra pinning (closed stand-ins are request-only).
+func calloutsNeedResponseBody(callouts []nemoCallout) bool {
+	for _, c := range callouts {
+		for _, check := range c.checks {
+			if check.response {
+				return true
+			}
+		}
+	}
+	return false
 }

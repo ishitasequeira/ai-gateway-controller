@@ -1976,6 +1976,138 @@ def sse_events(raw):
     return events
 
 
+RESPONSE_BODY_MODE_ANNOTATION = "maas.opendatahub.io/experimental-extproc-response-body-mode"
+SHARED_IPP_FILTER_NAME = "envoy.filters.http.ext_proc.ipp"
+
+
+def shared_envoyfilter():
+    return json.loads(kubectl(
+        "-n", "maas-system", "get", "envoyfilter", "payload-processing", "-o", "json").stdout)
+
+
+def shared_ipp_response_body_mode(envoy_filter=None):
+    document = envoy_filter if envoy_filter is not None else shared_envoyfilter()
+    for patch in document.get("spec", {}).get("configPatches", []):
+        value = ((patch or {}).get("patch") or {}).get("value") or {}
+        if value.get("name") == SHARED_IPP_FILTER_NAME:
+            return ((value.get("typed_config") or {}).get("processing_mode") or {}).get(
+                "response_body_mode")
+    return None
+
+
+def wait_shared_ipp_response_body_mode(want, *, timeout=45):
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        last = shared_ipp_response_body_mode()
+        if last == want:
+            return last
+        time.sleep(1)
+    return last
+
+
+def response_body_mode_annotation_value():
+    mtc = json.loads(kubectl(
+        "-n", NAMESPACE, "get", "maastenantconfig", "default-tenant", "-o", "json").stdout)
+    return (mtc.get("metadata", {}).get("annotations") or {}).get(RESPONSE_BODY_MODE_ANNOTATION)
+
+
+def set_response_body_mode_annotation(value):
+    if value is None:
+        # Idempotent: already-absent annotations are success, not a kubectl error.
+        if response_body_mode_annotation_value() is None:
+            return
+        result = kubectl("-n", NAMESPACE, "annotate", "maastenantconfig", "default-tenant",
+                         f"{RESPONSE_BODY_MODE_ANNOTATION}-", check=False)
+        remaining = response_body_mode_annotation_value()
+        if remaining is not None:
+            raise RuntimeError(
+                f"failed to remove {RESPONSE_BODY_MODE_ANNOTATION}: still {remaining!r} "
+                f"(annotate rc={result.returncode})")
+        return
+    kubectl("-n", NAMESPACE, "annotate", "maastenantconfig", "default-tenant",
+            f"{RESPONSE_BODY_MODE_ANNOTATION}={value}", "--overwrite")
+
+
+def qualify_shared_extproc_response_body_mode_overrides():
+    """Prove annotation-only response-mode flips reconcile, and NONE+apiTranslation is constrained."""
+    try:
+        baseline_filter = shared_envoyfilter()
+        baseline_mode = shared_ipp_response_body_mode(baseline_filter)
+        record("shared_ipp_response_body_mode_default_streamed_with_api_translation",
+               baseline_mode == "STREAMED",
+               {"mode": baseline_mode,
+                "envoyfilter_generation": baseline_filter.get("metadata", {}).get("generation")})
+
+        before_mtc = json.loads(kubectl(
+            "-n", NAMESPACE, "get", "maastenantconfig", "default-tenant", "-o", "json").stdout)
+        before_mtc_gen = before_mtc.get("metadata", {}).get("generation")
+        before_ef_gen = baseline_filter.get("metadata", {}).get("generation")
+        started = time.monotonic()
+        set_response_body_mode_annotation("BUFFERED")
+        after_mtc = json.loads(kubectl(
+            "-n", NAMESPACE, "get", "maastenantconfig", "default-tenant", "-o", "json").stdout)
+        after_mtc_gen = after_mtc.get("metadata", {}).get("generation")
+        buffered_mode = wait_shared_ipp_response_body_mode("BUFFERED")
+        after_ef = shared_envoyfilter()
+        record("shared_ipp_response_body_mode_annotation_only_buffered_reconciles",
+               after_mtc_gen == before_mtc_gen and buffered_mode == "BUFFERED",
+               {"mtc_generation_before": before_mtc_gen,
+                "mtc_generation_after": after_mtc_gen,
+                "generation_unchanged": after_mtc_gen == before_mtc_gen,
+                "mode": buffered_mode,
+                "elapsed_s": round(time.monotonic() - started, 1),
+                "envoyfilter_generation_before": before_ef_gen,
+                "envoyfilter_generation_after": after_ef.get("metadata", {}).get("generation"),
+                "annotation": after_mtc.get("metadata", {}).get("annotations", {}).get(
+                    RESPONSE_BODY_MODE_ANNOTATION)})
+
+        started = time.monotonic()
+        set_response_body_mode_annotation("NONE")
+        # apiTranslation is enabled in this phase: NONE must fall back to STREAMED.
+        constrained_mode = wait_shared_ipp_response_body_mode("STREAMED")
+        none_mtc = json.loads(kubectl(
+            "-n", NAMESPACE, "get", "maastenantconfig", "default-tenant", "-o", "json").stdout)
+        record("shared_ipp_response_body_mode_none_rejected_with_api_translation",
+               constrained_mode == "STREAMED",
+               {"requested": "NONE",
+                "effective": constrained_mode,
+                "annotation": none_mtc.get("metadata", {}).get("annotations", {}).get(
+                    RESPONSE_BODY_MODE_ANNOTATION),
+                "elapsed_s": round(time.monotonic() - started, 1)})
+
+        started = time.monotonic()
+        set_response_body_mode_annotation(None)
+        # STREAMED alone is insufficient: apiTranslation already forces STREAMED
+        # under NONE, so prove the annotation itself was removed.
+        cleared_annotation = response_body_mode_annotation_value()
+        cleared_mode = wait_shared_ipp_response_body_mode("STREAMED")
+        record("shared_ipp_response_body_mode_annotation_cleared_to_streamed",
+               cleared_annotation is None and cleared_mode == "STREAMED",
+               {"mode": cleared_mode,
+                "annotation": cleared_annotation,
+                "annotation_removed": cleared_annotation is None,
+                "elapsed_s": round(time.monotonic() - started, 1)})
+        save_json(EVIDENCE / "shared-ipp-response-body-mode-overrides.json", {
+            "baseline": baseline_mode,
+            "buffered": buffered_mode,
+            "none_with_api_translation": constrained_mode,
+            "cleared": cleared_mode,
+            "cleared_annotation": cleared_annotation,
+        })
+    finally:
+        try:
+            set_response_body_mode_annotation(None)
+        except Exception as exc:
+            CLEANUP_FAILURES.append(
+                f"clear {RESPONSE_BODY_MODE_ANNOTATION}: {redact_text(str(exc))}")
+        restored = wait_shared_ipp_response_body_mode("STREAMED", timeout=45)
+        if restored != "STREAMED":
+            CLEANUP_FAILURES.append(
+                "shared ipp response_body_mode cleanup timed out: "
+                f"want STREAMED, got {restored!r}")
+
+
 def capture_shared_runtime(label):
     config = json.loads(kubectl("-n", "maas-system", "get", "configmap", "payload-processing-plugins",
                                 "-o", "json").stdout)
@@ -5807,6 +5939,8 @@ def cleanup():
         kubectl("-n", NAMESPACE, "patch", "externalmodel", "demo-model", "--type=merge", "-p",
                 json.dumps({"spec": {"externalProviderRefs": EXTERNAL_MODEL_ORIGINAL_REFS}}), check=False)
     if MTC_CAPTURED:
+        kubectl("-n", NAMESPACE, "annotate", "maastenantconfig", "default-tenant",
+                f"{RESPONSE_BODY_MODE_ANNOTATION}-", check=False)
         if not MTC_HAD_TRANSLATION:
             kubectl("-n", NAMESPACE, "patch", "maastenantconfig", "default-tenant", "--type=json",
                     "-p", '[{"op":"remove","path":"/spec/apiTranslation"}]', check=False)
@@ -6909,6 +7043,10 @@ def main():
             "first_event_latency_ms": round(stream_first_ms, 1),
             "total_response_ms": round(stream_total_ms, 1),
             "progressive_delivery_gap_ms": round(stream_total_ms - stream_first_ms, 1)})
+
+    # Annotation-only response_body_mode flips must reconcile (predicate), and
+    # NONE must stay rejected while apiTranslation is enabled.
+    qualify_shared_extproc_response_body_mode_overrides()
 
     openai_body = {"model": "demo", "messages": [{"role": "user", "content": "openai-route-regression"}], "stream": True}
     rc, openai_status, openai_raw, openai_first_ms, openai_total_ms, openai_content_type = progressive_stream_request(
