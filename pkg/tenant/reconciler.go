@@ -580,7 +580,8 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		return ctrl.Result{}, fmt.Errorf("read authoritative MaaS apiTranslation setting: %w", err)
 	}
 	extProcMaxBodyBytes := resolveExtProcMaxBodyBytes(mtc, log)
-	if err := configureSharedExtProc(resources, tenantID, gatewayNamespace, apiTranslation, extProcMaxBodyBytes); err != nil {
+	extProcResponseBodyMode := resolveExtProcResponseBodyMode(mtc, log)
+	if err := configureSharedExtProc(resources, tenantID, gatewayNamespace, apiTranslation, extProcMaxBodyBytes, extProcResponseBodyMode); err != nil {
 		return ctrl.Result{}, fmt.Errorf("configure shared ExtProc: %w", err)
 	}
 	tenantNamespace := mtc.GetNamespace()

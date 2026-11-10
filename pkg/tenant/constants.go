@@ -151,6 +151,20 @@ const (
 	// framing so tonic rejects oversized ExtProc messages before allocation.
 	MaxExtProcMaxBodyBytes int64 = 33554432
 
+	// AnnotationExtProcResponseBodyMode overrides the shared post-auth ExtProc
+	// (ipp) Envoy response_body_mode for this tenant. Allowed values:
+	// STREAMED, NONE, BUFFERED. Default (absent/invalid) is
+	// DefaultExtProcResponseBodyMode. Annotation rather than CRD field: same
+	// experimental-* rationale as AnnotationExtProcMaxRequests.
+	AnnotationExtProcResponseBodyMode = "maas.opendatahub.io/experimental-extproc-response-body-mode"
+
+	// DefaultExtProcResponseBodyMode is the shared ipp response_body_mode when
+	// AnnotationExtProcResponseBodyMode is absent. STREAMED keeps SSE
+	// progressive for clients while still delivering body chunks to response-
+	// path plugins (e.g. external metering). BUFFERED defeats SSE; NONE skips
+	// ExtProc response bodies and breaks those plugins.
+	DefaultExtProcResponseBodyMode = "STREAMED"
+
 	// LabelManagedByAITenant and LabelTenantName mirror maas-controller's
 	// tenantreconcile.LabelManagedByAITenant / LabelTenantName, set by
 	// AITenantReconciler.applyAITenantMetadata. Used to derive the per-tenant

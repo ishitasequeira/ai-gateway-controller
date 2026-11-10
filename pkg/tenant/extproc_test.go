@@ -473,7 +473,7 @@ func TestConfigureSharedExtProcDoesNotRewriteExternalModelResources(t *testing.T
 			"data":     map[string]any{"extproc.yaml": "external-model-chain"},
 		}},
 	}
-	if err := configureSharedExtProc(resources, tenantID, gatewayNamespace, true, DefaultExtProcMaxBodyBytes); err != nil {
+	if err := configureSharedExtProc(resources, tenantID, gatewayNamespace, true, DefaultExtProcMaxBodyBytes, DefaultExtProcResponseBodyMode); err != nil {
 		t.Fatal(err)
 	}
 	data, _, err := unstructured.NestedStringMap(resources[0].Object, "data")
@@ -517,10 +517,10 @@ func TestConfigureSharedExtProcKeepsDefaultResponseModeWhenTranslationIsOff(t *t
 		}},
 		sharedEnvoyFilterFixture(tenantID, gatewayNamespace),
 	}
-	if err := configureSharedExtProc(resources, tenantID, gatewayNamespace, false, DefaultExtProcMaxBodyBytes); err != nil {
+	if err := configureSharedExtProc(resources, tenantID, gatewayNamespace, false, DefaultExtProcMaxBodyBytes, DefaultExtProcResponseBodyMode); err != nil {
 		t.Fatal(err)
 	}
-	assertSharedResponseMode(t, resources[2], "BUFFERED", false)
+	assertSharedResponseMode(t, resources[2], "STREAMED", false)
 }
 
 func TestTranslationSettingsToggleWithoutStaleRenderedState(t *testing.T) {
@@ -558,13 +558,13 @@ func TestTranslationSettingsToggleWithoutStaleRenderedState(t *testing.T) {
 	}
 	candidates := []envelope.Candidate{{Cluster: "provider-openai"}}
 	for _, enabled := range []bool{false, true, false} {
-		if err := configureSharedExtProc(resources, tenantID, gatewayNamespace, enabled, DefaultExtProcMaxBodyBytes); err != nil {
+		if err := configureSharedExtProc(resources, tenantID, gatewayNamespace, enabled, DefaultExtProcMaxBodyBytes, DefaultExtProcResponseBodyMode); err != nil {
 			t.Fatalf("configure shared ExtProc with translation=%t: %v", enabled, err)
 		}
 		if err := configureExternalModelExtProc(resources, tenantID, "tenant-a", candidates, enabled, DefaultExtProcMaxBodyBytes); err != nil {
 			t.Fatalf("configure ExternalModel ExtProc with translation=%t: %v", enabled, err)
 		}
-		assertSharedResponseMode(t, resources[2], map[bool]string{true: "STREAMED", false: "BUFFERED"}[enabled], enabled)
+		assertSharedResponseMode(t, resources[2], "STREAMED", enabled)
 		sharedData, _, err := unstructured.NestedStringMap(resources[0].Object, "data")
 		if err != nil {
 			t.Fatal(err)
