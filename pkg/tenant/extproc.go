@@ -189,6 +189,16 @@ func sharedExtProcConfig(apiTranslation bool, maxBodyBytes int64) string {
 	b.WriteString("  grpc_address: \"0.0.0.0:9004\"\n")
 	b.WriteString("  health_address: \"0.0.0.0:50052\"\n")
 	b.WriteString("  metrics_address: \"0.0.0.0:9090\"\n")
+	// Metrics auth must stay off for this chain. This deployment runs as the
+	// post-auth ServiceAccount with automountServiceAccountToken: false (see
+	// pkg/tenant/rename.go), so Praxis cannot build the TokenReview/SAR client:
+	// with the upstream default (enabled: true) it exits at startup before the
+	// gRPC listener opens, and the pod CrashLoops, taking tenant inference
+	// down. The pre-auth chain keeps auth enabled from the vendored
+	// pre-extproc.yaml because it uses the shared, bound ServiceAccount. Do not
+	// "fix" this by binding the post-auth ServiceAccount - it must hold no API
+	// permissions.
+	b.WriteString("  metrics_auth:\n    enabled: false\n")
 	// Bound every buffered body at the server, matching the vendored ODH
 	// ConfigMap. Do not set insecure_options.allow_unbounded_body: after
 	// RHOAIENG-102139 that flag leaves streamed bodies uncapped.
@@ -532,6 +542,10 @@ func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extpro
 	var b strings.Builder
 	b.WriteString("server:\n  grpc_address: \"0.0.0.0:9004\"\n  health_address: \"0.0.0.0:50052\"\n")
 	b.WriteString("  metrics_address: \"0.0.0.0:9090\"\n")
+	// Same reasoning as sharedExtProcConfig: this config runs in a pod that
+	// does not mount a ServiceAccount token, so Praxis must not try to
+	// TokenReview-authenticate /metrics - it would exit before serving gRPC.
+	b.WriteString("  metrics_auth:\n    enabled: false\n")
 	// Always bound at the server (ODH 10 MiB default / tenant annotation).
 	// Translation keeps a small overhead above the request budget for
 	// model-rewrite copies. Never emit allow_unbounded_body (RHOAIENG-102139).

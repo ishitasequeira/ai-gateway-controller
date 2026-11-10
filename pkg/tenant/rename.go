@@ -212,6 +212,15 @@ func renamePayloadProcessingDeployment(u *unstructured.Unstructured, tenantID st
 	if err := setServiceAccountName(u, PayloadProcessingPostServiceAccountName(tenantID)); err != nil {
 		return fmt.Errorf("serviceAccountName: %w", err)
 	}
+	// The shipped ODH overlay mounts a token because the pre-auth pod needs one
+	// for TokenReview-authenticated /metrics scrapes. That pod uses the shared
+	// ServiceAccount; this one never calls the API, so drop the token at pod
+	// level (pod-level wins over the ServiceAccount's own setting) and keep
+	// metrics_auth disabled in the generated extproc.yaml - see
+	// sharedExtProcConfig.
+	if err := setPodAutomountServiceAccountToken(u, false); err != nil {
+		return fmt.Errorf("automountServiceAccountToken: %w", err)
+	}
 	if err := setConfigMapVolumeName(u, "plugins-config-volume", PayloadProcessingPluginsConfigMapForTenant(tenantID)); err != nil {
 		return fmt.Errorf("plugins ConfigMap volume: %w", err)
 	}
@@ -552,6 +561,13 @@ func setServiceSelector(u *unstructured.Unstructured, labels map[string]string) 
 func setServiceAccountName(u *unstructured.Unstructured, name string) error {
 	if err := unstructured.SetNestedField(u.Object, name, "spec", "template", "spec", "serviceAccountName"); err != nil {
 		return fmt.Errorf("write serviceAccountName: %w", err)
+	}
+	return nil
+}
+
+func setPodAutomountServiceAccountToken(u *unstructured.Unstructured, automount bool) error {
+	if err := unstructured.SetNestedField(u.Object, automount, "spec", "template", "spec", "automountServiceAccountToken"); err != nil {
+		return fmt.Errorf("write automountServiceAccountToken: %w", err)
 	}
 	return nil
 }

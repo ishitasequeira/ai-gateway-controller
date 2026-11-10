@@ -87,6 +87,11 @@ func TestRenameDefaultTenantDoesNotMutateDeploymentSelector(t *testing.T) {
 	if podLabels[LabelTenantInstance] != PayloadProcessingName {
 		t.Fatalf("pod template tenant-instance label = %q, want %q", podLabels[LabelTenantInstance], PayloadProcessingName)
 	}
+	// The default tenant's pod uses the same post-auth ServiceAccount, so it
+	// must not automount a token either.
+	if automount, found, _ := unstructured.NestedBool(out[0].Object, "spec", "template", "spec", "automountServiceAccountToken"); !found || automount {
+		t.Fatalf("pod automountServiceAccountToken = %v (found=%t), want false", automount, found)
+	}
 }
 
 func TestRenameNonDefaultTenantPayloadProcessingDeployment(t *testing.T) {
@@ -115,6 +120,15 @@ func TestRenameNonDefaultTenantPayloadProcessingDeployment(t *testing.T) {
 	sa, _, _ := unstructured.NestedString(out[0].Object, "spec", "template", "spec", "serviceAccountName")
 	if want := "payload-processing-post-redteam"; sa != want {
 		t.Fatalf("serviceAccountName = %q, want the dedicated post-auth %q", sa, want)
+	}
+
+	// The shipped overlay automounts a token for the pre-auth pod; this pod
+	// never calls the API, and the generated extproc.yaml disables metrics
+	// auth to match. A token here would re-grant API access the post-auth
+	// ServiceAccount must not have.
+	automount, found, _ := unstructured.NestedBool(out[0].Object, "spec", "template", "spec", "automountServiceAccountToken")
+	if !found || automount {
+		t.Fatalf("pod automountServiceAccountToken = %v (found=%t), want false", automount, found)
 	}
 
 	volumes, _, _ := unstructured.NestedSlice(out[0].Object, "spec", "template", "spec", "volumes")
