@@ -140,6 +140,24 @@ func TestMaasTenantConfigPredicate(t *testing.T) {
 			admit: true,
 		},
 		{
+			name: "response body mode annotation flip admits",
+			old: func(u *unstructured.Unstructured) {
+				u.SetAnnotations(map[string]string{AnnotationExtProcResponseBodyMode: "STREAMED"})
+			},
+			new: func(u *unstructured.Unstructured) {
+				u.SetAnnotations(map[string]string{AnnotationExtProcResponseBodyMode: "BUFFERED"})
+			},
+			admit: true,
+		},
+		{
+			name: "response body mode annotation clear admits",
+			old: func(u *unstructured.Unstructured) {
+				u.SetAnnotations(map[string]string{AnnotationExtProcResponseBodyMode: "BUFFERED"})
+			},
+			new:   func(u *unstructured.Unstructured) { u.SetAnnotations(map[string]string{}) },
+			admit: true,
+		},
+		{
 			name: "status-only update is dropped",
 			old:  func(*unstructured.Unstructured) {},
 			new: func(u *unstructured.Unstructured) {
