@@ -139,6 +139,8 @@ func TestExternalModelConfigMatchesMainWhenTranslationIsOff(t *testing.T) {
   grpc_address: "0.0.0.0:9004"
   health_address: "0.0.0.0:50052"
   metrics_address: "0.0.0.0:9090"
+  metrics_auth:
+    enabled: false
   max_body_bytes: 10485760
   tls:
     mode: provided
@@ -332,6 +334,33 @@ func TestSharedExtProcConfigDefaultOff(t *testing.T) {
 	if !strings.Contains(config, "  max_body_bytes: 10485760\n") || strings.Contains(config, "allow_unbounded_body") {
 		t.Fatalf("default shared chain must keep the ODH server body bound:\n%s", config)
 	}
+}
+
+// TestGeneratedExtProcConfigsDisableMetricsAuth pins the pairing with the pod
+// change in rename.go: the post-auth Deployment runs without a mounted
+// ServiceAccount token, so Praxis must not try to TokenReview /metrics. With
+// the upstream default (enabled: true) it exits before opening the gRPC
+// listener, which takes all tenant inference down.
+func TestGeneratedExtProcConfigsDisableMetricsAuth(t *testing.T) {
+	want := "  metrics_auth:\n    enabled: false\n"
+	for _, apiTranslation := range []bool{false, true} {
+		t.Run(fmt.Sprintf("shared/apiTranslation=%t", apiTranslation), func(t *testing.T) {
+			config := sharedExtProcConfig(apiTranslation, DefaultExtProcMaxBodyBytes)
+			if !strings.Contains(config, want) {
+				t.Fatalf("shared chain must disable metrics auth:\n%s", config)
+			}
+			if strings.Contains(config, "metrics_auth:\n    enabled: true") {
+				t.Fatalf("shared chain re-enabled metrics auth:\n%s", config)
+			}
+		})
+	}
+
+	t.Run("post-auth", func(t *testing.T) {
+		config := extprocPostAuthConfig(nil, nil, false, DefaultExtProcMaxBodyBytes)
+		if !strings.Contains(config, want) {
+			t.Fatalf("post-auth chain must disable metrics auth:\n%s", config)
+		}
+	})
 }
 
 // TestSharedExtProcConfigHasHeadersGuard verifies that API translation does
