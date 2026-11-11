@@ -144,6 +144,64 @@ func renamePayloadProcessingMetricsMonitor(u *unstructured.Unstructured, tenantI
 	}, "spec", "selector", "matchLabels"); err != nil {
 		return fmt.Errorf("selector.matchLabels: %w", err)
 	}
+	// This tenant copy targets the post-auth metrics Service, whose Praxis
+	// config disables metrics_auth (see sharedExtProcConfig) because that pod
+	// runs with automountServiceAccountToken: false. Prometheus resolves
+	// bearerTokenFile inside its own container, so keeping it would send
+	// prometheus-k8s's own ServiceAccount token - a cluster-wide reader - over
+	// plain HTTP to a pod that handles untrusted inference traffic and ignores
+	// the credential. Strip the whole credential family rather than just the
+	// deprecated file form, so a vendor sync migrating to
+	// authorization.credentials cannot quietly reintroduce it. The vendored
+	// shared manifest keeps its token for standalone overlay installs, where
+	// the post-auth pod does mount one and the shared ServiceAccount stays
+	// bound.
+	if err := stripServiceMonitorCredentials(u); err != nil {
+		return fmt.Errorf("spec.endpoints credentials: %w", err)
+	}
+	return nil
+}
+
+// serviceMonitorCredentialFields are the per-endpoint fields that make
+// Prometheus send a credential to the scraped target. bearerTokenFile is the
+// legacy file form the vendored manifest uses; the rest are the current
+// secret- and block-based forms, stripped too so the invariant survives a
+// manifest sync. Non-credential fields (path, port, interval, scrapeTimeout,
+// tlsConfig) are left untouched.
+var serviceMonitorCredentialFields = []string{
+	"bearerTokenFile",
+	"bearerTokenSecret",
+	"authorization",
+	"basicAuth",
+	"oauth2",
+}
+
+// stripServiceMonitorCredentials removes every scrape credential from a
+// ServiceMonitor's endpoints. It is a no-op when the fields are absent.
+func stripServiceMonitorCredentials(u *unstructured.Unstructured) error {
+	endpoints, found, err := unstructured.NestedSlice(u.Object, "spec", "endpoints")
+	if err != nil {
+		return fmt.Errorf("read spec.endpoints: %w", err)
+	}
+	if !found {
+		return nil
+	}
+	for i, raw := range endpoints {
+		endpoint, ok := raw.(map[string]any)
+		if !ok {
+			return fmt.Errorf("endpoint %d is malformed", i)
+		}
+		if len(endpoint) == 0 {
+			continue
+		}
+		for _, field := range serviceMonitorCredentialFields {
+			delete(endpoint, field)
+		}
+		endpoints[i] = endpoint
+	}
+	if err := unstructured.SetNestedSlice(u.Object, endpoints, "spec", "endpoints"); err != nil {
+		return fmt.Errorf("write spec.endpoints: %w", err)
+	}
 	return nil
 }
 
@@ -211,6 +269,15 @@ func renamePayloadProcessingDeployment(u *unstructured.Unstructured, tenantID st
 	}
 	if err := setServiceAccountName(u, PayloadProcessingPostServiceAccountName(tenantID)); err != nil {
 		return fmt.Errorf("serviceAccountName: %w", err)
+	}
+	// The shipped ODH overlay mounts a token because the pre-auth pod needs one
+	// for TokenReview-authenticated /metrics scrapes. That pod uses the shared
+	// ServiceAccount; this one never calls the API, so drop the token at pod
+	// level (pod-level wins over the ServiceAccount's own setting) and keep
+	// metrics_auth disabled in the generated extproc.yaml - see
+	// sharedExtProcConfig.
+	if err := setPodAutomountServiceAccountToken(u, false); err != nil {
+		return fmt.Errorf("automountServiceAccountToken: %w", err)
 	}
 	if err := setConfigMapVolumeName(u, "plugins-config-volume", PayloadProcessingPluginsConfigMapForTenant(tenantID)); err != nil {
 		return fmt.Errorf("plugins ConfigMap volume: %w", err)
@@ -552,6 +619,13 @@ func setServiceSelector(u *unstructured.Unstructured, labels map[string]string) 
 func setServiceAccountName(u *unstructured.Unstructured, name string) error {
 	if err := unstructured.SetNestedField(u.Object, name, "spec", "template", "spec", "serviceAccountName"); err != nil {
 		return fmt.Errorf("write serviceAccountName: %w", err)
+	}
+	return nil
+}
+
+func setPodAutomountServiceAccountToken(u *unstructured.Unstructured, automount bool) error {
+	if err := unstructured.SetNestedField(u.Object, automount, "spec", "template", "spec", "automountServiceAccountToken"); err != nil {
+		return fmt.Errorf("write automountServiceAccountToken: %w", err)
 	}
 	return nil
 }
