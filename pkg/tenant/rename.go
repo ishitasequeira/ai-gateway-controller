@@ -68,7 +68,7 @@ func newPostAuthServiceAccount(tenantID, namespace string) unstructured.Unstruct
 			"name":      PayloadProcessingPostServiceAccountName(tenantID),
 			"namespace": namespace,
 		},
-		"automountServiceAccountToken": false,
+		"automountServiceAccountToken": postAuthChain.MountsServiceAccountToken,
 	}}
 }
 
@@ -155,9 +155,11 @@ func renamePayloadProcessingMetricsMonitor(u *unstructured.Unstructured, tenantI
 	// authorization.credentials cannot quietly reintroduce it. The vendored
 	// shared manifest keeps its token for standalone overlay installs, where
 	// the post-auth pod does mount one and the shared ServiceAccount stays
-	// bound.
-	if err := stripServiceMonitorCredentials(u); err != nil {
-		return fmt.Errorf("spec.endpoints credentials: %w", err)
+	// bound. AuthenticatesMetrics is the descriptor fact this follows from.
+	if !postAuthChain.AuthenticatesMetrics {
+		if err := stripServiceMonitorCredentials(u); err != nil {
+			return fmt.Errorf("spec.endpoints credentials: %w", err)
+		}
 	}
 	return nil
 }
@@ -222,7 +224,12 @@ func renamePayloadProcessingMetricsAuthBinding(u *unstructured.Unstructured, ten
 	}
 	// Bind the shared/pre-auth SA (token automount stays enabled upstream for
 	// metrics auth). Post-auth and ExternalModel SAs intentionally stay unbound.
-	subject["name"] = PayloadProcessingServiceAccountName(tenantID)
+	// The subject comes from the chain descriptor: a binding that names the
+	// chain which authenticates, and no other.
+	if !preAuthChain.MetricsAuthBinding {
+		return errors.New("the pre-auth chain is declared without a metrics-auth binding")
+	}
+	subject["name"] = preAuthChain.ServiceAccountName(tenantID)
 	subjects[0] = subject
 	if err := unstructured.SetNestedSlice(u.Object, subjects, "subjects"); err != nil {
 		return fmt.Errorf("write subjects: %w", err)
@@ -275,8 +282,9 @@ func renamePayloadProcessingDeployment(u *unstructured.Unstructured, tenantID st
 	// ServiceAccount; this one never calls the API, so drop the token at pod
 	// level (pod-level wins over the ServiceAccount's own setting) and keep
 	// metrics_auth disabled in the generated extproc.yaml - see
-	// sharedExtProcConfig.
-	if err := setPodAutomountServiceAccountToken(u, false); err != nil {
+	// sharedExtProcConfig. The value comes from the chain descriptor so the
+	// pod, its ServiceAccount, its config and its (absent) binding cannot drift.
+	if err := setPodAutomountServiceAccountToken(u, postAuthChain.MountsServiceAccountToken); err != nil {
 		return fmt.Errorf("automountServiceAccountToken: %w", err)
 	}
 	if err := setConfigMapVolumeName(u, "plugins-config-volume", PayloadProcessingPluginsConfigMapForTenant(tenantID)); err != nil {
