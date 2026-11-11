@@ -804,7 +804,7 @@ ai-gateway-controller/
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--image` | `quay.io/opendatahub/odh-praxis-extproc@sha256:a67be44e530961ca7e6dc453220ebe11a6641a2003577f3c4ddb1f426555b874` | Replaces the `praxis-extproc:dev` placeholder image |
+| `--image` | `quay.io/opendatahub/odh-praxis-extproc@sha256:6beb7981e3d126b038e7d5a7fb52ba16fa73aebb97cd495ba274791c053e82f7` | Replaces the `praxis-extproc:dev` placeholder image |
 | `--manifest-path` | `/config/manifests/external-model/overlays/odh` | controller-owned kustomize entrypoint composing pinned upstream manifests and ExternalModel patches |
 | `--maas-api-route-name` | `maas-api-route` | Base name; suffixed per tenant like every other resource. Best-effort — exact fidelity depends on maas-api's real HTTPRoute name and Istio's route-naming scheme |
 | `--resync-interval` | `5m` | `RequeueAfter` once a tenant's resources are applied, so drift gets corrected periodically even without a new `AITenant` watch event |

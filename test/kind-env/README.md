@@ -508,7 +508,7 @@ CLUSTER="anthropic-published-$(date -u +%Y%m%dT%H%M%SZ | tr '[:upper:]' '[:lower
 export PROVIDER_RECORDER_IMAGE="provider-recorder:$CLUSTER"
 unset PRAXIS_AI_REPO
 EXT_SOURCE_SHA=cffd4219f080348176d3bfdbc99028372dec7e50
-EXT_IMAGE='quay.io/opendatahub/odh-praxis-extproc@sha256:a67be44e530961ca7e6dc453220ebe11a6641a2003577f3c4ddb1f426555b874'
+EXT_IMAGE='quay.io/opendatahub/odh-praxis-extproc@sha256:6beb7981e3d126b038e7d5a7fb52ba16fa73aebb97cd495ba274791c053e82f7'
 RUN_EVIDENCE="$PWD/evidence/published-extproc-qualification"
 export PRAXIS_EXTPROC_REPO=/path/to/clean/praxis-extproc-at-merge-sha
 export EXTPROC_IMAGE_MODE=published EXPECTED_EXTPROC_SOURCE_SHA="$EXT_SOURCE_SHA"
