@@ -345,6 +345,90 @@ func TestRenameRewritesMetricsAuthBinding(t *testing.T) {
 	}
 }
 
+// TestRenameMetricsMonitorStripsScrapeCredentials pins the third leg of the
+// post-auth no-token invariant: the tenant ServiceMonitor targets the
+// unauthenticated post-auth metrics Service (sharedExtProcConfig disables
+// metrics_auth there), so Prometheus must not be told to send its own
+// ServiceAccount token to it. The endpoint's non-credential fields must
+// survive the rewrite.
+func TestRenameMetricsMonitorStripsScrapeCredentials(t *testing.T) {
+	in := []unstructured.Unstructured{{Object: map[string]any{
+		"apiVersion": "monitoring.coreos.com/v1",
+		"kind":       "ServiceMonitor",
+		"metadata":   map[string]any{"name": PayloadProcessingMetricsMonitorName},
+		"spec": map[string]any{
+			"endpoints": []any{
+				// Legacy file form, as shipped in the vendored overlay.
+				map[string]any{
+					"bearerTokenFile": "/var/run/secrets/kubernetes.io/serviceaccount/token",
+					"port":            "metrics",
+					"path":            "/metrics",
+					"interval":        "30s",
+					"scrapeTimeout":   "10s",
+				},
+				// The current secret- and block-based forms, so a future
+				// manifest sync cannot reintroduce a credential unnoticed.
+				map[string]any{
+					"bearerTokenSecret": map[string]any{"name": "scrape-token", "key": "token"},
+					"authorization":     map[string]any{"type": "Bearer"},
+					"basicAuth":         map[string]any{"username": map[string]any{"name": "u"}, "password": map[string]any{"name": "p"}},
+					"oauth2":            map[string]any{"tokenURL": "https://example.invalid/token"},
+					"port":              "metrics",
+				},
+			},
+		},
+	}}}
+
+	out, err := Rename(in, "redteam", "istio-system")
+	if err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+
+	wantName := PayloadProcessingMetricsMonitorNameForTenant("redteam")
+	if got := out[0].GetName(); got != wantName {
+		t.Fatalf("name = %q, want %q", got, wantName)
+	}
+	selector, _, _ := unstructured.NestedStringMap(out[0].Object, "spec", "selector", "matchLabels")
+	if selector[LabelTenantInstance] != PayloadProcessingDeploymentName("redteam") {
+		t.Fatalf("selector tenant-instance = %q, want %q",
+			selector[LabelTenantInstance], PayloadProcessingDeploymentName("redteam"))
+	}
+
+	endpoints, found, err := unstructured.NestedSlice(out[0].Object, "spec", "endpoints")
+	if err != nil || !found {
+		t.Fatalf("read spec.endpoints: found=%v err=%v", found, err)
+	}
+	if len(endpoints) != 2 {
+		t.Fatalf("endpoints = %d, want 2", len(endpoints))
+	}
+	for i, raw := range endpoints {
+		endpoint, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("endpoints[%d] is %T, want map[string]any", i, raw)
+		}
+		for _, field := range serviceMonitorCredentialFields {
+			if _, present := endpoint[field]; present {
+				t.Errorf("endpoints[%d] still carries %q: %v", i, field, endpoint[field])
+			}
+		}
+	}
+
+	first := endpoints[0].(map[string]any)
+	for field, want := range map[string]string{
+		"port":          "metrics",
+		"path":          "/metrics",
+		"interval":      "30s",
+		"scrapeTimeout": "10s",
+	} {
+		if got := first[field]; got != want {
+			t.Errorf("endpoints[0].%s = %v, want %q", field, got, want)
+		}
+	}
+	if got := endpoints[1].(map[string]any)["port"]; got != "metrics" {
+		t.Errorf("endpoints[1].port = %v, want %q", got, "metrics")
+	}
+}
+
 func TestRenameLeavesClusterRoleUnchanged(t *testing.T) {
 	in := []unstructured.Unstructured{{Object: map[string]any{
 		"apiVersion": "rbac.authorization.k8s.io/v1",
