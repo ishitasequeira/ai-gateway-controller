@@ -358,8 +358,9 @@ func TestRenameMetricsMonitorStripsScrapeCredentials(t *testing.T) {
 		"metadata":   map[string]any{"name": PayloadProcessingMetricsMonitorName},
 		"spec": map[string]any{
 			"endpoints": []any{
-				// Legacy file form, as shipped in the vendored overlay.
-				map[string]any{
+				// Legacy file form, as shipped in the vendored overlay. The
+				// value is the well-known mount path, not a credential.
+				map[string]any{ //nolint:gosec // G101: ServiceMonitor field path, not a credential.
 					"bearerTokenFile": "/var/run/secrets/kubernetes.io/serviceaccount/token",
 					"port":            "metrics",
 					"path":            "/metrics",
@@ -372,7 +373,7 @@ func TestRenameMetricsMonitorStripsScrapeCredentials(t *testing.T) {
 					"bearerTokenSecret": map[string]any{"name": "scrape-token", "key": "token"},
 					"authorization":     map[string]any{"type": "Bearer"},
 					"basicAuth":         map[string]any{"username": map[string]any{"name": "u"}, "password": map[string]any{"name": "p"}},
-					"oauth2":            map[string]any{"tokenURL": "https://example.invalid/token"},
+					"oauth2":            map[string]any{"tokenURL": "https://example.invalid/token"}, //nolint:gosec // G101: placeholder URL, not a credential.
 					"port":              "metrics",
 				},
 			},
@@ -413,7 +414,10 @@ func TestRenameMetricsMonitorStripsScrapeCredentials(t *testing.T) {
 		}
 	}
 
-	first := endpoints[0].(map[string]any)
+	first, ok := endpoints[0].(map[string]any)
+	if !ok {
+		t.Fatalf("endpoints[0] is %T, want map[string]any", endpoints[0])
+	}
 	for field, want := range map[string]string{
 		"port":          "metrics",
 		"path":          "/metrics",
@@ -424,7 +428,11 @@ func TestRenameMetricsMonitorStripsScrapeCredentials(t *testing.T) {
 			t.Errorf("endpoints[0].%s = %v, want %q", field, got, want)
 		}
 	}
-	if got := endpoints[1].(map[string]any)["port"]; got != "metrics" {
+	second, ok := endpoints[1].(map[string]any)
+	if !ok {
+		t.Fatalf("endpoints[1] is %T, want map[string]any", endpoints[1])
+	}
+	if got := second["port"]; got != "metrics" {
 		t.Errorf("endpoints[1].port = %v, want %q", got, "metrics")
 	}
 }
