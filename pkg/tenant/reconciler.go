@@ -144,8 +144,9 @@ type Reconciler struct {
 // DeployReady transitions (the apply path targets the Gateway they name, and
 // steady state returns without a requeue). Other status-only writes are
 // dropped. The MaasTenantConfig watch additionally admits changes to the
-// AnnotationPayloadProcessingType annotation, which selects the praxis vs
-// legacy-IPP backend without bumping metadata.generation.
+// AnnotationPayloadProcessingType and AnnotationExtProcResponseBodyMode
+// annotations, which select the praxis vs legacy-IPP backend and the
+// shared ExtProc response body mode without bumping metadata.generation.
 func tenantEventPredicates() map[string]predicate.Predicate {
 	aitenantUpdate := predicate.Funcs{
 		UpdateFunc: func(e event.UpdateEvent) bool {
@@ -169,14 +170,21 @@ func tenantEventPredicates() map[string]predicate.Predicate {
 				DeployReady(old) != DeployReady(current)
 		},
 	}
-	// The payload-processing backend is selected by annotation, which does
-	// not bump metadata.generation. An IPP→praxis flip on an existing
-	// MaasTenantConfig must reconcile promptly: the IPP path returns without
-	// scheduling a requeue, so the resync interval would be the only backstop.
+	// The payload-processing backend and ExtProc response body mode are
+	// selected by annotation, which does not bump metadata.generation. An
+	// IPP→praxis flip or an experimental response-mode override on an
+	// existing MaasTenantConfig must reconcile promptly: the IPP path and
+	// steady-state praxis path can return without scheduling a requeue, so
+	// the resync interval would otherwise be the only backstop.
 	maastenantconfigUpdate := predicate.Funcs{
 		UpdateFunc: func(e event.UpdateEvent) bool {
-			return e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration() ||
-				PayloadProcessingType(mustUnstructured(e.ObjectOld)) != PayloadProcessingType(mustUnstructured(e.ObjectNew))
+			if e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration() {
+				return true
+			}
+			oldObj := mustUnstructured(e.ObjectOld)
+			newObj := mustUnstructured(e.ObjectNew)
+			return PayloadProcessingType(oldObj) != PayloadProcessingType(newObj) ||
+				extProcResponseBodyModeAnnotation(oldObj) != extProcResponseBodyModeAnnotation(newObj)
 		},
 	}
 	return map[string]predicate.Predicate{
@@ -580,7 +588,9 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		return ctrl.Result{}, fmt.Errorf("read authoritative MaaS apiTranslation setting: %w", err)
 	}
 	extProcMaxBodyBytes := resolveExtProcMaxBodyBytes(mtc, log)
-	if err := configureSharedExtProc(resources, tenantID, gatewayNamespace, apiTranslation, extProcMaxBodyBytes); err != nil {
+	extProcResponseBodyMode := constrainExtProcResponseBodyMode(
+		resolveExtProcResponseBodyMode(mtc, log), apiTranslation, false, log)
+	if err := configureSharedExtProc(resources, tenantID, gatewayNamespace, apiTranslation, extProcMaxBodyBytes, extProcResponseBodyMode); err != nil {
 		return ctrl.Result{}, fmt.Errorf("configure shared ExtProc: %w", err)
 	}
 	tenantNamespace := mtc.GetNamespace()
@@ -642,6 +652,19 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		log.Error(err, "guardrail catalog is incomplete; affected checks fail closed and the rest are published")
 	}
 	r.reportNemoOutsideInfra(ctx, log, tenantNamespace, infraNamespace, pinNemoCalloutsToInfra(callouts, infraNamespace))
+	// Output-phase checks need a BUFFERED response body (Praxis StreamBuffer).
+	// pinNemoCalloutsToInfra has already replaced out-of-infra Output checks
+	// with closed request-only stand-ins, so only remaining response hooks
+	// force BUFFERED over the STREAMED default / annotation. The default stays
+	// STREAMED when no Output callouts remain.
+	if constrained := constrainExtProcResponseBodyMode(
+		extProcResponseBodyMode, false, calloutsNeedResponseBody(callouts), log,
+	); constrained != extProcResponseBodyMode {
+		extProcResponseBodyMode = constrained
+		if err := configureSharedExtProcResponseMode(resources, tenantID, extProcResponseBodyMode, apiTranslation); err != nil {
+			return ctrl.Result{}, fmt.Errorf("configure shared ExtProc response mode: %w", err)
+		}
+	}
 	reader := r.APIReader
 	if reader == nil {
 		reader = r.Client

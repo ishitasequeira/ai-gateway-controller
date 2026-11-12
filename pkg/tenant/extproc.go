@@ -52,8 +52,9 @@ const extprocConfigHashAnnotation = "ai-gateway-controller.opendatahub.io/extpro
 // authoritative MaasTenantConfig permission. The translation filters are
 // restricted to Anthropic Messages requests and do not change the dedicated
 // ExternalModel processor. maxBodyBytes bounds stream_usage_inject buffering
-// (and related translation filters when enabled).
-func configureSharedExtProc(resources []unstructured.Unstructured, tenantID, gatewayNamespace string, apiTranslation bool, maxBodyBytes int64) error {
+// (and related translation filters when enabled). responseBodyMode sets the
+// shared ipp Envoy response_body_mode (see resolveExtProcResponseBodyMode).
+func configureSharedExtProc(resources []unstructured.Unstructured, tenantID, gatewayNamespace string, apiTranslation bool, maxBodyBytes int64, responseBodyMode string) error {
 	wantCM := PayloadProcessingPluginsConfigMapForTenant(tenantID)
 	wantDeploy := PayloadProcessingDeploymentName(tenantID)
 	var configMap *unstructured.Unstructured
@@ -73,7 +74,7 @@ func configureSharedExtProc(resources []unstructured.Unstructured, tenantID, gat
 	if configMap == nil || deployment == nil {
 		return errors.New("shared ExtProc resources are missing the plugin ConfigMap or Deployment")
 	}
-	if err := configureSharedExtProcResponseMode(resources, tenantID, apiTranslation); err != nil {
+	if err := configureSharedExtProcResponseMode(resources, tenantID, responseBodyMode, apiTranslation); err != nil {
 		return err
 	}
 	data, found, err := unstructured.NestedStringMap(configMap.Object, "data")
@@ -95,15 +96,19 @@ func configureSharedExtProc(resources []unstructured.Unstructured, tenantID, gat
 	return nil
 }
 
-// configureSharedExtProcResponseMode keeps streaming scoped to tenants that
-// explicitly enable API translation. The shared inference HTTPRoutes are not
-// owned here and do not have a stable controller-provided route identity, so a
-// route-level override cannot be safely attached by this reconciler.
-func configureSharedExtProcResponseMode(resources []unstructured.Unstructured, tenantID string, apiTranslation bool) error {
-	want := "BUFFERED"
+// configureSharedExtProcResponseMode sets the shared ipp response_body_mode.
+// The shared inference HTTPRoutes are not owned here and do not have a stable
+// controller-provided route identity, so a route-level override cannot be
+// safely attached by this reconciler. responseBodyMode comes from
+// resolveExtProcResponseBodyMode (default STREAMED).
+func configureSharedExtProcResponseMode(resources []unstructured.Unstructured, tenantID, responseBodyMode string, apiTranslation bool) error {
+	want := responseBodyMode
+	if want == "" {
+		want = DefaultExtProcResponseBodyMode
+	}
 	var routeCacheAction string
 	if apiTranslation {
-		want = "STREAMED"
+		// Messages path rewrite needs route-cache retention.
 		routeCacheAction = "RETAIN"
 	}
 	filterName := PayloadProcessingEnvoyFilterName(tenantID)
@@ -165,13 +170,13 @@ func configureSharedExtProcResponseMode(resources []unstructured.Unstructured, t
 // filters; the injection runs first and does not touch the
 // Messages requests they translate.
 // This runtime render owns the effective static chain because it
-// replaces the vendored ConfigMap value during reconciliation. The tenant's
-// permission also selects the shared ipp response mode: BUFFERED by default
-// and STREAMED when translation is enabled so the Messages SSE filter can emit
-// progressive events. Retaining the route cache is also scoped to
-// translation-enabled tenants because only that shared path rewrites Messages
-// requests. The separate ipp-pre mode and ExternalModel processor are
-// unchanged.
+// replaces the vendored ConfigMap value during reconciliation. The shared
+// ipp response mode defaults to STREAMED so SSE reaches clients
+// progressively while response-path plugins (metering, Messages SSE
+// translation) still see body chunks. Retaining the route cache stays scoped
+// to translation-enabled tenants because only that shared path rewrites
+// Messages requests. The separate ipp-pre mode and ExternalModel processor
+// are unchanged.
 //
 // apiTranslation enables the Anthropic Messages translation filters.
 // maxBodyBytes bounds stream_usage_inject (and related translation buffers).
