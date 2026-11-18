@@ -27,6 +27,9 @@ on:
 permissions:
   contents: read
 
+# Two CRD globs require two provider-crd-check jobs (one glob per callee). Both
+# jobs upload the same artifact name; upload-artifact v4 merges those uploads
+# within one workflow run (see data-connect-hub for the same pattern).
 jobs:
   crd-contract-inference:
     uses: red-hat-data-services/api-contract-tests/.github/workflows/provider-crd-check.yml@d63fe27957117fd99161a693c7fdef9e20efb9d9 # v2.2.0
