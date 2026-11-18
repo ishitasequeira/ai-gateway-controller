@@ -1,0 +1,4 @@
+# API contract checks: the baseline, the pinned workflow ref,
+# and coverage exclusions define what compatibility enforcement protects.
+/.github/workflows/api-contract.yml @nerdalert @jland-redhat @ishitasequeira @chaitanya1731 @ryancham715 @aslakknutsen @pierDipi @bartoszmajsak @didierofrivia @crstrn13 @dmytro-zaharnytskyi @jrhyness
+/.rhoai/ @nerdalert @jland-redhat @ishitasequeira @chaitanya1731 @ryancham715 @aslakknutsen @pierDipi @bartoszmajsak @didierofrivia @crstrn13 @dmytro-zaharnytskyi @jrhyness

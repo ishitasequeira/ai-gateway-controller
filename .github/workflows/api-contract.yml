@@ -1,0 +1,55 @@
+name: API contract
+
+# API contract compatibility checks. Compares CRDs in a pull
+# request with an immutable baseline commit and fails on breaking changes.
+#
+# Reusable workflows: red-hat-data-services/api-contract-tests pinned by commit SHA
+# (same as the v2.2.0 / `latest` tag today). Upgrade deliberately per
+# https://github.com/red-hat-data-services/api-contract-tests/blob/main/docs/releasing.md
+#
+# Canonical CRDs: AIGuardrail (aigateway.opendatahub.io), ExternalModel and
+# ExternalProvider (inference.opendatahub.io). No OpenAPI documents are
+# checked in, so coverage runs in CRD-only mode (no .rhoai/contracts.yaml).
+#
+# Baseline: 4fde3ae0af2d21debb8bfc18b3948149ed705e57 — merge base of the
+# downstream rhoai-3.6 release line and this repository's main branch, as
+# recorded in data/release-baselines/3.6.json in api-contract-tests (generated
+# 2026-11-09). No GA release tag exists for this repository. Moving the baseline
+# forward needs approval from someone other than the author.
+#
+# Runs on every pull request to main (no path filter) so new CRD manifests are
+# picked up by the coverage job.
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  crd-contract-inference:
+    uses: red-hat-data-services/api-contract-tests/.github/workflows/provider-crd-check.yml@d63fe27957117fd99161a693c7fdef9e20efb9d9 # v2.2.0
+    with:
+      crd-glob: config/crd/bases/*.yaml
+      baseline-refs: 4fde3ae0af2d21debb8bfc18b3948149ed705e57 # RHOAI 3.6 release baseline
+      mode: enforce
+
+  crd-contract-aigateway:
+    uses: red-hat-data-services/api-contract-tests/.github/workflows/provider-crd-check.yml@d63fe27957117fd99161a693c7fdef9e20efb9d9 # v2.2.0
+    with:
+      crd-glob: config/self/crd/bases/*.yaml
+      baseline-refs: 4fde3ae0af2d21debb8bfc18b3948149ed705e57 # RHOAI 3.6 release baseline
+      mode: enforce
+
+  api-contract-coverage:
+    uses: red-hat-data-services/api-contract-tests/.github/workflows/provider-coverage-check.yml@d63fe27957117fd99161a693c7fdef9e20efb9d9 # v2.2.0
+    with:
+      crd-globs: >-
+        config/crd/bases/*.yaml
+        config/self/crd/bases/*.yaml
+      # Envtest fixtures copied from other projects — not CRDs this repository ships.
+      crd-exclude-globs: test/envtest/testdata/crds/*.yaml
+      baseline-refs: 4fde3ae0af2d21debb8bfc18b3948149ed705e57 # RHOAI 3.6 release baseline
+      yq-version: "4.45.1"
+      mode: enforce
