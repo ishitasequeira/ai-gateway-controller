@@ -11,7 +11,7 @@ name: API contract
 #
 # Canonical CRDs: AIGuardrail (aigateway.opendatahub.io), ExternalModel and
 # ExternalProvider (inference.opendatahub.io). No OpenAPI documents are
-# checked in, so coverage runs in CRD-only mode (no .rhoai/contracts.yaml).
+# checked in; coverage uses .rhoai/contracts.yaml with spec.contracts: [] (CRD-only).
 #
 # Baseline: 4fde3ae0af2d21debb8bfc18b3948149ed705e57 — merge base of the
 # downstream rhoai-3.6 release line and this repository's main branch, as
@@ -50,6 +50,7 @@ jobs:
   api-contract-coverage:
     uses: red-hat-data-services/api-contract-tests/.github/workflows/provider-coverage-check.yml@latest
     with:
+      contract-set: .rhoai/contracts.yaml
       crd-globs: >-
         config/crd/bases/*.yaml
         config/self/crd/bases/*.yaml

@@ -1,9 +1,9 @@
 # API contract metadata
 
-This repository has no checked-in OpenAPI documents. GitHub Actions runs
+This repository has no OpenAPI provider contracts. GitHub Actions runs
 [API contract CRD compatibility checks](../.github/workflows/api-contract.yml)
-in CRD-only mode (no `.rhoai/contracts.yaml`).
+in CRD-only mode.
 
-If REST or gRPC OpenAPI specs are added later, introduce a `contracts.yaml`
-descriptor here per
-[api-contract-tests onboarding](https://github.com/red-hat-data-services/api-contract-tests/blob/main/docs/onboarding/README.md).
+[`contracts.yaml`](contracts.yaml) is a CRD-only `ContractSet` (`spec.contracts: []`)
+so the working group can register the descriptor path. Add OpenAPI `spec.contracts`
+entries here when a checked-in API spec becomes a provider contract.

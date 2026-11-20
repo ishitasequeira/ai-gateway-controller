@@ -1,0 +1,11 @@
+# ContractSet for opendatahub-io/ai-gateway-controller (RHOAIENG-103145).
+#
+# This repository has no OpenAPI provider contracts. CRD compatibility and
+# coverage are enforced via .github/workflows/api-contract.yml (CRD-only mode).
+# The immutable CRD baseline is pinned in that workflow, not here.
+apiVersion: contracts.rhoai.io/v1alpha1
+kind: ContractSet
+metadata:
+  name: ai-gateway-controller
+spec:
+  contracts: []
