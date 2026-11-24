@@ -4,10 +4,13 @@ name: GitHub Actions Security Analysis (zizmor)
 # unpinned actions, excessive permissions, credential leakage) — this repo
 # uses it instead of actionlint, trading actionlint's syntax/expression
 # correctness checks for security coverage.
+#
+# Run only on PRs targeting main so main -> stable promotion PRs do not
+# re-upload SARIF for workflows already vetted at merge to main.
 
 on:
   pull_request:
-    branches: ["**"]
+    branches: [main]
 
 env:
   ZIZMOR_VERSION: 1.29.0

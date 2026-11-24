@@ -84,7 +84,7 @@ this file only covers process (PR/CI conventions), not design decisions.
 | `ci.yml` / `typos` | PR + push to `main` | `crate-ci/typos` spell check |
 | `ci.yml` / `shellcheck` | PR + push to `main` | `shellcheck` on `hack/` scripts |
 | `pr-conventions.yml` | PR events | PR title format, DCO, PR size cap — see "Pull request process" |
-| `zizmor.yml` | PR + push to `main` | Security-focused SAST on the GitHub Actions workflow files themselves (template injection, unpinned actions, excessive permissions); results go to the repo's Security tab |
+| `zizmor.yml` | PR targeting `main` | Security-focused SAST on the GitHub Actions workflow files themselves (template injection, unpinned actions, excessive permissions); results go to the repo's Security tab |
 
 **Run locally before pushing:**
 
